@@ -94,7 +94,7 @@ pub fn inspect(config: &Path, speech_config: Option<&Path>, base: &Path) -> Vec<
             // Named by the host's own configuration rather than the speech
             // one, so the relative-path rule above does not apply to it: what
             // it must be is there.
-            found.push(present("clip_names_path", &settings.clip_names, base));
+            found.push(present("library_names_path", &settings.library_names, base));
             Some(settings)
         }
         Err(error) => {
@@ -462,16 +462,15 @@ mod tests {
 
     use super::{Conclusion, conclusion_line, inspect, settled};
 
-    /// A host configuration this build reads, naming `clip_names_path`.
-    fn params(dir: &Path, clip_names: &str) -> PathBuf {
+    /// A host configuration this build reads, naming `library_names_path`.
+    fn params(dir: &Path, library_names: &str) -> PathBuf {
         let path = dir.join("host_params.textproto");
         std::fs::write(
             &path,
             format!(
                 "pod: \"fixture-reachy\"\n\
-                 stow_duration_ms: 3000\n\
                  body_cap_bytes: 8192\n\
-                 clip_names_path: \"{clip_names}\"\n",
+                 library_names_path: \"{library_names}\"\n",
             ),
         )
         .expect("a file");
@@ -479,7 +478,7 @@ mod tests {
     }
 
     /// A clip name table, at `name` inside `dir`.
-    fn clip_names(dir: &Path, name: &str) -> PathBuf {
+    fn library_names(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, "{\"names\": []}\n").expect("a file");
         path
@@ -501,8 +500,8 @@ mod tests {
     #[test]
     fn a_configuration_whose_files_are_all_there_is_one_a_run_can_start_on() {
         let dir = scratch_dir("reachy-host-check-clean");
-        let config = params(dir.as_ref(), "clip_library.names.json");
-        clip_names(dir.as_ref(), "clip_library.names.json");
+        let config = params(dir.as_ref(), "library.names.json");
+        library_names(dir.as_ref(), "library.names.json");
         let speech = speech_fixture::carrying_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -513,7 +512,7 @@ mod tests {
         assert!(settled(&found), "{found:?}");
         assert!(about(&found, "pod_psk_file").held, "{found:?}");
         assert!(about(&found, "brenn.bridge.token_file").held, "{found:?}");
-        assert!(about(&found, "clip_names_path").held, "{found:?}");
+        assert!(about(&found, "library_names_path").held, "{found:?}");
         assert_eq!(verdict(&found).kind, "checked");
     }
 
@@ -523,7 +522,7 @@ mod tests {
         // fewer file to find.
         let dir = scratch_dir("reachy-host-check-busless");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::runnable_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -557,7 +556,7 @@ mod tests {
         // expect.
         let dir = scratch_dir("reachy-host-check-models");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::modelled_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -583,7 +582,7 @@ mod tests {
     fn a_model_the_payload_does_not_carry_is_the_only_thing_that_fails() {
         let dir = scratch_dir("reachy-host-check-model-missing");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::modelled_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -618,7 +617,7 @@ mod tests {
     fn a_host_answering_to_a_name_the_speech_configuration_does_not_know_is_refused() {
         let dir = scratch_dir("reachy-host-check-addressee-mismatch");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::runnable_with_pods(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -642,7 +641,7 @@ mod tests {
     fn a_host_the_speech_configuration_names_holds() {
         let dir = scratch_dir("reachy-host-check-addressee-match");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::runnable_with_pods(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -665,7 +664,7 @@ mod tests {
     fn a_speech_configuration_with_no_pods_table_has_nothing_to_compare() {
         let dir = scratch_dir("reachy-host-check-addressee-empty");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::runnable_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -711,7 +710,7 @@ mod tests {
     fn a_key_table_that_is_not_there_is_named_and_refused() {
         let dir = scratch_dir("reachy-host-check-missing-psk");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::runnable_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -741,7 +740,7 @@ mod tests {
         // this case is the migration error exactly.
         let dir = scratch_dir("reachy-host-check-absolute");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::carrying(dir.as_ref(), speech_fixture::Events::Dropped);
 
         let found = inspect(&config, Some(&speech), dir.as_ref());
@@ -762,7 +761,7 @@ mod tests {
     fn a_run_that_records_says_where_it_records_and_under_what_cap() {
         let dir = scratch_dir("reachy-host-check-recording-on");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::carrying_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -786,7 +785,7 @@ mod tests {
     fn a_cap_that_is_not_whole_mebibytes_is_still_a_number_a_person_can_read() {
         let dir = scratch_dir("reachy-host-check-recording-caps");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         // The two figures either side of the boundary between the two
         // renderings included: a tenth of a mebibyte is where "0.0 MiB" stops
         // saying anything and the bytes themselves start.
@@ -814,7 +813,7 @@ mod tests {
     fn a_cap_too_large_to_multiply_is_read_rather_than_panicked_on() {
         let dir = scratch_dir("reachy-host-check-recording-huge-cap");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::runnable_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -833,7 +832,7 @@ mod tests {
     fn a_run_that_records_nothing_says_so_before_anybody_looks_for_the_audio() {
         let dir = scratch_dir("reachy-host-check-recording-off");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::carrying_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -852,7 +851,7 @@ mod tests {
     fn the_confidence_gate_states_the_thresholds_it_will_decline_on() {
         let dir = scratch_dir("reachy-host-check-gate");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::carrying_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -880,7 +879,7 @@ mod tests {
     fn a_configuration_that_transcribes_nothing_has_no_gate_to_state() {
         let dir = scratch_dir("reachy-host-check-gateless");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::runnable_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -903,7 +902,7 @@ mod tests {
     fn an_absolute_recording_directory_is_refused_while_recording_is_on() {
         let dir = scratch_dir("reachy-host-check-record-absolute");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::runnable_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -933,7 +932,7 @@ mod tests {
     fn a_recording_directory_that_walks_out_of_the_payload_is_refused_too() {
         let dir = scratch_dir("reachy-host-check-record-parent");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::runnable_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -963,7 +962,7 @@ mod tests {
     fn an_absolute_recording_directory_nothing_writes_to_is_not_a_finding() {
         let dir = scratch_dir("reachy-host-check-record-absolute-off");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::runnable_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -990,7 +989,7 @@ mod tests {
     fn a_recording_directory_that_does_not_exist_yet_is_not_looked_for() {
         let dir = scratch_dir("reachy-host-check-record-absent");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::runnable_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -1017,7 +1016,9 @@ mod tests {
         let found = inspect(&config, None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         assert!(
-            about(&found, "clip_names_path").says.contains("not a file"),
+            about(&found, "library_names_path")
+                .says
+                .contains("not a file"),
             "{found:?}",
         );
     }
@@ -1026,7 +1027,7 @@ mod tests {
     fn an_unknown_key_is_the_loader_s_own_refusal() {
         let dir = scratch_dir("reachy-host-check-unknown-key");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::runnable_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -1071,7 +1072,7 @@ mod tests {
     fn a_host_asked_for_no_speech_configuration_is_still_a_host() {
         let dir = scratch_dir("reachy-host-check-voiceless");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
 
         let found = inspect(&config, None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
@@ -1111,7 +1112,7 @@ mod tests {
         // is its field name and where it is, and this case is what says so.
         let dir = scratch_dir("reachy-host-check-secrets");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::carrying_named(
             dir.as_ref(),
             speech_fixture::Events::Dropped,
@@ -1136,7 +1137,7 @@ mod tests {
         // written and so resolves against this process's own directory.
         let dir = scratch_dir("reachy-host-check-cwd-base");
         let config = params(dir.as_ref(), "names.json");
-        clip_names(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
 
         let found = inspect(&config, None, Path::new(""));
         assert!(
@@ -1144,7 +1145,7 @@ mod tests {
             "the table is in the scratch directory, not this process's: {found:?}",
         );
         assert!(
-            about(&found, "clip_names_path")
+            about(&found, "library_names_path")
                 .says
                 .contains("names names.json"),
             "{found:?}",

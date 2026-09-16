@@ -30,9 +30,10 @@ use thiserror::Error;
 
 use crate::compose::{interpolate_pose, lerp};
 use crate::envelope::ClipLimits;
+use reachy_motion::asset_name::check_asset_name;
+
 use crate::format::{
     Channel, ChannelMask, Clip, ClipDoc, ClipError, DeltaFrame, FORMAT_VERSION, FrameDoc,
-    validate_name,
 };
 
 /// How far a recorded rotation block may sit from orthonormal and still be
@@ -289,7 +290,7 @@ pub fn convert(
         serde_json::from_str(json).map_err(|err| ImportError::Malformed {
             detail: err.to_string(),
         })?;
-    validate_name(name).map_err(|source| ImportError::Name {
+    check_asset_name(name).map_err(|source| ImportError::Name {
         name: name.to_owned(),
         detail: source.to_string(),
     })?;

@@ -20,13 +20,12 @@
 
 use std::process::ExitCode;
 
-use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, StepKindWire};
+use brenn_reachy__cogs__schedule_clk_rs::StepKindWire;
 use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdKindWire;
 use brenn_reachy__hardware__dynamixel__registers_clk_rs::RegIdWire;
 use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKindWire;
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
 use reachy_motion::joints::{JointRef, row};
-use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use scenario::check;
 use scenario::read::Run;
 use scenario::{cycle_at, cycle_within, drain_cycle, stow_clocks};
@@ -189,14 +188,14 @@ fn check_closing_steps(run: &Run, failures: &mut Vec<String>) {
     let Some(logged) = run.schedules.get(2) else {
         return;
     };
-    let found: Vec<(StepKindWire, PostureWire, i64, i64)> = logged
+    let found: Vec<(StepKindWire, u16, i64, i64)> = logged
         .message
         .steps()
         .iter()
         .map(|step| {
             (
                 step.kind(),
-                step.posture(),
+                step.pose_id(),
                 step.start().as_nanos(),
                 step.end().as_nanos(),
             )
@@ -205,13 +204,13 @@ fn check_closing_steps(run: &Run, failures: &mut Vec<String>) {
     let wanted = [
         (
             StepKindWire::BASE_POSTURE,
-            PostureWire::UP,
+            scenario::pose_id(scenario::NEUTRAL_POSE),
             cycle_at(closing_cycle()),
             cycle_at(stow_start_cycle()),
         ),
         (
             StepKindWire::BASE_POSTURE,
-            PostureWire::STOW,
+            scenario::pose_id(scenario::STOW_POSE),
             cycle_at(stow_start_cycle()),
             cycle_at(disengage_cycle()),
         ),
@@ -332,7 +331,7 @@ fn check_presence(run: &Run, failures: &mut Vec<String>) {
             run,
             &format!("upright {what}"),
             cycle,
-            &neutral_targets(),
+            &scenario::neutral_pose(),
             failures,
         );
     }
@@ -388,7 +387,7 @@ fn check_arrival(run: &Run, failures: &mut Vec<String>) {
         run,
         "stowed",
         disengage_cycle() - 1,
-        &stow_pose_targets(),
+        &scenario::stow_pose(),
         failures,
     );
     check::room("stow", closing_stow_cycles(), &stow_clocks(), failures);

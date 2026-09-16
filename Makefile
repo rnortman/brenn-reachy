@@ -88,7 +88,7 @@ help:
 	@echo "  make pod-overlay-on|-off|-status   link brenn-pod from the checkout next door"
 	@echo "  make setup-hooks   wire git at .githooks, check tooling (once per clone)"
 	@echo "  make scrub-tree    whole-tree secret sweep — the sweep a clean tree is declared on"
-	@echo "  make clip-config   regenerate the clip library asset from cogs/clips/"
+	@echo "  make library-config  regenerate the clip and pose library assets from their documents"
 	@echo "  make clip-import   convert the fetched vendor recording sets (EMOTIONS=, DANCES=)"
 	@echo "  make motion-host-run  run the online system here, against the simulated plant"
 	@echo ""
@@ -371,19 +371,23 @@ setup-hooks:
 scrub-tree:
 	brenn-scrub tree
 
-# Regenerate the clip library the cogs are handed, from the documents under
-# `cogs/clips/`. Not part of the gate and not a prerequisite of anything: the
-# emitted asset is committed, and the gate's own case fails when the two
-# disagree, so this is the command that answers that failure.
+# Regenerate the two libraries the cogs are handed, from the documents under
+# `cogs/clips/` and `cogs/poses/`. Not part of the gate and not a prerequisite
+# of anything: the emitted assets are committed, and the gate's own case fails
+# when they and the documents disagree, so this is the command that answers that
+# failure. One command for both libraries, because one sidecar numbers both and
+# emitting half of them would state a table with nothing behind it.
 #
 # Absolute paths, because `bazel run` runs the tool in its runfiles tree rather
 # than here.
-.PHONY: clip-config
-clip-config: require-bazel
-	bazel run //cogs:gen_clip_config -- \
+.PHONY: library-config
+library-config: require-bazel
+	bazel run //cogs:gen_library_config -- \
 	    --clips $(CURDIR)/cogs/clips \
 	    --out $(CURDIR)/cogs/clip_library.textproto \
-	    --names $(CURDIR)/cogs/clip_library.names.json
+	    --poses $(CURDIR)/cogs/poses \
+	    --poses-out $(CURDIR)/cogs/pose_library.textproto \
+	    --names $(CURDIR)/cogs/library.names.json
 
 # Convert the two vendor recording sets into library documents and regenerate
 # the asset over them. Fetches nothing: the operator downloads each dataset and
@@ -422,7 +426,7 @@ clip-import: require-bazel
 	    --prefix pollen/dances \
 	    --report $(CURDIR)/cogs/clips/pollen/dances/import-report.txt \
 	    --source "$(DANCES_SOURCE)"
-	@$(MAKE) clip-config
+	@$(MAKE) library-config
 
 # The online system, on this machine: the real control loop and the real logger,
 # with the simulated plant behind the real UDP seam, all three under the launcher
@@ -744,12 +748,26 @@ POSE_RECORDS ?= .local/pose-sessions
 # the same provisioning a speech run does; the recording session's own
 # configuration is the voice host's half, and `--record` refuses a pair that
 # would put the two on different addresses.
+# What survives the pose-record console filter: the lines a person with both
+# hands on the head acts on, plus anything that refuses. The transcript line is
+# matched by its em dash and a '.' where the utterance number's mark is: a literal
+# '#' would start a make comment here and truncate the value.
+POSE_RECORD_SIGNAL := utterance .[0-9]+ —|playback started|playback finished|connected \(conn|disconnected \(conn|"kind":"(still|moving|started|ended|refused)"|^deploy-motion\.sh:|^    |"stream":"check"|refus|REFUS|[Ee]rror|[Ff]ailed|WARN|not hold
+
 .PHONY: pose-record
 pose-record: device-host require-bazel
 	tools/deploy-motion.sh $(REACHY_HOST) --record-preflight
 	$(MAKE) speech-provision
 	$(MAKE) motion-deploy
-	tools/deploy-motion.sh $(REACHY_HOST) --record $(POSE_RECORDS)
+	@# The recorder streams a pose sample every 20ms and the voice host puts its
+	@# JSONL event stream on the same stdout as its console lines, so the tail is
+	@# ~99% machine record. This allowlist keeps what an operator acts on -- the
+	@# transcript, the read-back, the link, the segmenter's own lines -- and passes
+	@# every refusal through untouched, so a gate is never filtered away. The grep
+	@# cannot fail the recipe (it exits 1 on no match); the deploy's own status is
+	@# what pipefail then reports.
+	tools/deploy-motion.sh $(REACHY_HOST) --record $(POSE_RECORDS) | \
+		{ grep -aE --line-buffered '$(POSE_RECORD_SIGNAL)' || true; }
 
 # Bring a recording session's streams back — the session whose terminal died, or
 # whose document is wanted a second time, which is also how a threshold is tuned:

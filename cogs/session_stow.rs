@@ -23,7 +23,7 @@
 //! Nothing here reads a clock and nothing holds state of its own: the instant
 //! arrives from the caller, and the maneuver lives in the session's slot.
 
-use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, ScheduledStepWire, StepKindWire};
+use brenn_reachy__cogs__schedule_clk_rs::{ScheduledStepWire, StepKindWire};
 use brenn_reachy__cogs__session_clk_rs::{SessionPhaseWire, SessionStateWire};
 use brenn_reachy__driver__pose_clk_rs::PoseSample;
 use clockwork_rs::SyncTime;
@@ -36,7 +36,7 @@ use reachy_motion::winddown::{
     Disposition, Evidence, StowEnding, WindDown, WindDownAction, WindDownOutcome, ending,
 };
 
-use crate::session_bus::disarm_config;
+use crate::session_bus::{disarm_config, stow_pace, stow_pose_id};
 
 /// Whether a stow maneuver is running.
 ///
@@ -293,7 +293,12 @@ fn command(slot: &mut SessionStateWire, now_ns: i64, remaining_ns: i64) {
         row.set_start(SyncTime::from_nanos(now_ns));
         row.set_end(SyncTime::from_nanos(end_ns));
         row.set_kind(StepKindWire::BASE_POSTURE);
-        row.set_posture(PostureWire::STOW);
+        row.set_pose_id(stow_pose_id());
+        // The library's pace for the fold, which the session refused to start
+        // unless it fits inside the clock this maneuver runs on.
+        row.set_pace(clockwork_rs::Duration::from_nanos(
+            i64::try_from(stow_pace().as_nanos()).unwrap_or(i64::MAX),
+        ));
     }
     slot.winddown_mut().set_commanded_epoch(epoch);
 }

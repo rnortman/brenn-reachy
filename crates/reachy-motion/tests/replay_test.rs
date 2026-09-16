@@ -32,7 +32,7 @@ use reachy_motion::tick::{
 use reachy_motion::{
     ANTENNA_PHASE_SEPARATION_RAD, JointGroup, JointRef, JointTargets, JointVector, MotionCommand,
     MotionConfig, MotionSnapWire, MoveDurations, StillnessConfig, WarpKind, dry_pass_peaks,
-    floor_move_clock, judge, stow_pose_targets, stow_targets,
+    floor_move_clock, judge,
 };
 
 use reachy_motion::trace::{Run, Sample, Trace};
@@ -45,6 +45,35 @@ const TICK_HZ: f64 = reachy_motion::FLOOR_TICK_HZ;
 /// The head clock every recorded gesture was commanded over — the shipped
 /// `up_duration`.
 const UP: Duration = Duration::from_millis(800);
+
+/// Where the antennas stood in the recordings, right then left, radians.
+///
+/// The fold of the night the traces were cut, not the fold this machine now
+/// commands: the recordings speak for the pose they were taken at, and the
+/// machine's own fold is the pose library's `stow` document.
+const RECORDED_FOLD: [f64; 2] = [-3.32, 3.32];
+
+/// The whole configuration the recordings begin at: the vendor sleep head pose
+/// the stow posture was then, base square, antennas at [`RECORDED_FOLD`].
+fn recorded_stow() -> JointTargets {
+    JointTargets {
+        head_pose_body: reachy_kin::sleep_head_pose(),
+        body_yaw: 0.0,
+        antennas: RECORDED_FOLD,
+    }
+}
+
+/// The same configuration in joint space, solved through `geom`.
+fn recorded_stow_joints(geom: &reachy_kin::HeadGeometry) -> JointVector {
+    let mut angles = reachy_kin::LegAngles([0.0; 6]);
+    reachy_kin::inverse_kinematics(geom, &reachy_kin::sleep_head_pose(), &mut angles)
+        .expect("the geometry reaches the recorded fold");
+    JointVector {
+        body_yaw: 0.0,
+        legs: angles.0,
+        antennas: RECORDED_FOLD,
+    }
+}
 
 /// Degrees as radians, for a figure measured in the units the machine is
 /// measured in.
@@ -64,7 +93,7 @@ fn deg(degrees: f64) -> f64 {
 /// one the machine stood at.
 fn started_at(cfg: &MotionConfig, run: &Run) -> JointTargets {
     let present = run.samples[0].present.expect("the first period read");
-    let held = stow_targets(&cfg.geom).expect("the geometry reaches stow");
+    let held = recorded_stow_joints(&cfg.geom);
     for (leg, angle) in present.legs.iter().enumerate() {
         assert!(
             (angle - held.legs[leg]).abs() < deg(1.0),
@@ -74,7 +103,7 @@ fn started_at(cfg: &MotionConfig, run: &Run) -> JointTargets {
     }
     JointTargets {
         antennas: present.antennas,
-        ..stow_pose_targets()
+        ..recorded_stow()
     }
 }
 
@@ -1814,15 +1843,15 @@ fn the_recorded_quiet_antenna_hold_passes_the_bound() {
 /// Condition commands, which is the pose the stow angle was moved to reach.
 ///
 /// The one pose a fault response leaves the machine in, and the one this cycle
-/// changed. The reading that moved [`reachy_motion::disarm::STOW_ANTENNAS`]
-/// inboard is a hold at this angle staying inside the bound where the same rung
+/// changed. The reading that moved the fold is a hold at this angle staying
+/// inside the bound where the same rung
 /// at the same gains hunted 7–8 counts pointing straight down, so the bound
 /// passing here is what says the lean did its job. What the file guards is the
 /// bound itself: a tightened excursion limit, or a watch that judged every hold
 /// a hunt, fails on a hold the machine was accepted at. Whether the pose is
 /// *still* quiet after a gain or profile change is a probe night's reading and
-/// not this file's; the fold angle the reading was taken at is pinned in
-/// `postures.rs`.
+/// not this file's; the fold angle the reading was taken at is
+/// [`RECORDED_FOLD`].
 ///
 /// Cut from the first of the six leaned-fold probe runs
 /// (`probe-log-20260909T014542Z`), the way the two raise files are: the window

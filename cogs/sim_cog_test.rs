@@ -25,12 +25,10 @@ use brenn_reachy__motion__bus_txn_clk_rs::{AuxOpKindWire, BusTxnWire};
 use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire, JointsWire};
 use clockwork_rs::SyncTime;
 use reachy_driver::{BLIND_CYCLES_BEFORE_BUS_FAILURE, JOINT_COUNT, JOINT_MASK_ALL};
-use reachy_kin::default_geometry;
 use reachy_motion::arm::{
     DEFAULT_GAINS, DEFAULT_MIN_ARM_VOLTAGE, EXPECTED_MODELS, EXPECTED_OPERATING_MODES,
     VENDOR_HOMING_OFFSETS,
 };
-use reachy_motion::disarm::stow_targets;
 use reachy_motion::joints::{
     self, JointRef, ServoHealth, flags, rows_of, write_rows, write_vector,
 };
@@ -115,12 +113,13 @@ fn travelled(row: usize, position: f64, target: f64, cycles: i64) -> f64 {
 }
 
 /// The nine angles the machine rests at, which is where every case finds it.
+///
+/// The committed library's stow, which is what the plant seeds itself with: a
+/// case restating the fold would be asserting the plant against a second record
+/// of where folded is.
 fn stow_rows() -> [f64; JOINT_COUNT] {
     let mut slot = JointsWire::new();
-    write_vector(
-        slot.clear_valid(),
-        &stow_targets(default_geometry()).expect("the baked geometry reaches stow"),
-    );
+    write_vector(slot.clear_valid(), committed_poses::stow_joints());
     rows_of(
         slot.validate()
             .expect("a cleared vector of angles reads back"),
@@ -400,6 +399,7 @@ impl Sim {
         params.health_poll_period_ns = HEALTH_PERIOD;
         edit(params);
         cog.set_config_params(&message);
+        cog.set_config_poses(committed_poses::message());
 
         Self { cog, now: T0 }
     }
@@ -2334,6 +2334,30 @@ fn a_scenario_whose_cycle_is_not_the_bus_cycle_is_refused() {
 #[should_panic(expected = "MotorSim test wrapper: execute() failed")]
 fn a_scenario_whose_dead_man_allows_no_silence_is_refused() {
     let mut sim = Sim::with_params(|params| params.hold_timeout_ns = 0);
+    sim.step();
+}
+
+/// And a pose library the screen refuses is no library to stand a plant up on.
+///
+/// The plant starts folded, at the stow the same library states, so a library
+/// that does not screen is one whose fold this cog cannot place. Refused on the
+/// first execution rather than modelled from wherever the joints happened to
+/// be, which would be a scenario judging a machine against nothing.
+#[test]
+#[should_panic(expected = "MotorSim test wrapper: execute() failed")]
+fn a_pose_library_the_screen_refuses_is_no_plant_to_stand_up() {
+    let mut sim = Sim::new();
+    // The first pose given no time: what the screen refuses first, and not the
+    // stow's own pace, so this is about the screen and nothing downstream.
+    let mut message = committed_poses::read();
+    message
+        .validate_mut()
+        .expect("the committed pose library is a message this build reads")
+        .poses
+        .get_mut(0)
+        .expect("the committed library holds poses")
+        .duration_ns = 0;
+    sim.cog.set_config_poses(&message);
     sim.step();
 }
 

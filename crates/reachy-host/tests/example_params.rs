@@ -2,7 +2,7 @@
 //! of it on the device.
 //!
 //! A test of its own because it reads files: the example configuration and the
-//! clip name table it names both arrive through runfiles, and the environment
+//! library name table it names both arrive through runfiles, and the environment
 //! variables name them beside the `data` attribute that supplies them. What it
 //! proves is that the file an operator copies to start their own is a file this
 //! build accepts, and that the path it names is a table this build can resolve
@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use reachy_edge::{BODY_CAP_BYTES, MotionTable, STOW_DURATION_MS};
+use reachy_edge::BODY_CAP_BYTES;
 
 /// The machine the example answers for, which is no machine.
 ///
@@ -27,7 +27,7 @@ fn example() -> PathBuf {
     PathBuf::from(std::env::var("HOST_PARAMS").expect("the target names the example params"))
 }
 
-/// The clip name table the payload carries, out of the same environment.
+/// The library name table the payload carries, out of the same environment.
 fn names() -> PathBuf {
     PathBuf::from(std::env::var("CLIP_NAMES").expect("the target names the shipped name table"))
 }
@@ -38,16 +38,12 @@ fn the_example_configuration_is_one_this_build_accepts() {
     let settings = reachy_host::params::load(&path)
         .unwrap_or_else(|error| panic!("the example configuration is refused: {error}"));
     assert_eq!(settings.edge.pod(), EXAMPLE_POD);
-    // The stow budget the harness gesture is pinned against: the file drifting
-    // from the constant is a gesture whose last step no longer ends where its
-    // timeout says it does.
-    assert_eq!(settings.edge.stow_duration_ms(), STOW_DURATION_MS);
     assert_eq!(settings.edge.body_cap_bytes(), BODY_CAP_BYTES);
     assert_eq!(
-        settings.clip_names.file_name(),
-        Some(std::ffi::OsStr::new("clip_library.names.json")),
+        settings.library_names.file_name(),
+        Some(std::ffi::OsStr::new("library.names.json")),
         "the example configuration names the payload's name table: {}",
-        settings.clip_names.display(),
+        settings.library_names.display(),
     );
 }
 
@@ -61,12 +57,21 @@ fn the_name_table_the_configuration_points_at_is_one_the_edge_can_read() {
     let settings = reachy_host::params::load(&example()).expect("the example configuration");
     let table = names();
     assert_eq!(
-        settings.clip_names.file_name(),
+        settings.library_names.file_name(),
         table.file_name(),
         "the example configuration names the name table the payload carries",
     );
     let text = std::fs::read_to_string(&table)
         .unwrap_or_else(|error| panic!("reading {}: {error}", table.display()));
-    MotionTable::from_sidecar(&text)
+    let (motions, poses) = reachy_edge::parse(&text)
         .unwrap_or_else(|error| panic!("the committed name table is refused: {error}"));
+    assert!(
+        !motions.is_empty(),
+        "the payload's table numbers the motions a script can play",
+    );
+    assert!(
+        poses.stow().duration_ms > 0,
+        "and the poses a schedule can name, the stow among them, each with the pace a move to \
+         it runs on",
+    );
 }

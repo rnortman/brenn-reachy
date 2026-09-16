@@ -528,7 +528,7 @@ mod tests {
 
     use reachy_motion::joints::JointRef;
     use reachy_motion::phase::PhaseSeparation;
-    use reachy_motion::postures::{neutral_targets, stow_pose_targets};
+    use reachy_poses::{NEUTRAL_POSE, STOW_POSE};
 
     /// The separation a pair is held to here.
     const SEPARATION: f64 = 0.6;
@@ -621,8 +621,8 @@ mod tests {
     #[test]
     fn the_clocks_a_caller_reads_back_are_the_floored_ones() {
         let cfg = reachy_motion::tick::default_motion_config();
-        let from = stow_pose_targets();
-        let to = neutral_targets();
+        let from = committed_poses::targets(STOW_POSE);
+        let to = committed_poses::targets(NEUTRAL_POSE);
 
         let asked = MoveDurations::uniform(Duration::from_millis(20));
         let floored = floored_clocks(

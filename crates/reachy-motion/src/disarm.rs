@@ -54,9 +54,7 @@
 use core::f64::consts::PI;
 use core::time::Duration;
 
-use reachy_kin::{
-    HeadGeometry, IkError, LegAngles, inverse_kinematics, outside_limit, stow_head_pose, wrap_to_pi,
-};
+use reachy_kin::{outside_limit, wrap_to_pi};
 
 use crate::arm::{angle_at, confirm_write, placeable};
 use crate::cells;
@@ -73,35 +71,6 @@ pub use brenn_reachy__motion__disarm_clk_rs::{
     DisarmPhaseKind, DisarmSnap, DisarmSnapWire, ReleaseFormKind,
 };
 
-/// Where the antennas are stowed, right then left, radians.
-///
-/// Folded back against the head rather than left standing, and leaning 10.2°
-/// past straight down toward the machine's centreline rather than resting on
-/// the vertical. Straight down is the mirror of straight up: gravity puts no
-/// load across the gearbox backlash, the rod balances on the play, and the
-/// position loop hunts across the gap — the same mechanism
-/// [`crate::postures::NEUTRAL_ANTENNAS`] leans the rest pose against, at the
-/// same magnitude, which is the one lean this machine has been measured quiet
-/// at. Leaning inboard also tucks the folded pair rather than splaying it,
-/// which is the direction the *rest* pose is forbidden to lean, because a rest
-/// lean the wrong way is a lean into the other antenna's arc partway up. Down
-/// at the fold the arcs no longer face each other: each rod is past the
-/// vertical by this lean and the two stand 20.4° apart, and nothing in this
-/// stack derives the clearance — no envelope check bounds the linkage or the
-/// pair against itself. So the reading is the evidence, not the geometry: six
-/// `make motion-probe` runs at this angle held both rods here for 6.5 s and
-/// then folded the head over them, reading 0–1 encoder counts of excursion,
-/// both antennas 0.0005 rad from stow and `at_stow` true in all six
-/// (`probe-log-20260909T014542Z` and the five after it). A rod resting short
-/// against the fold or against its partner is what those figures would have
-/// shown as a deviation toward the goal's near side. The first of those runs is
-/// kept as `fixtures/traces/trace-antenna-fold-still.csv`, so the hold is
-/// replayed under `make check` and not only recorded here.
-///
-/// Not the vendor's shutdown angle. That one is 5.2° short of straight down on
-/// the *outboard* side, which is half this lean and the other way.
-pub const STOW_ANTENNAS: [f64; 2] = [-3.32, 3.32];
-
 /// How long the platform is left to settle at stow before torque comes off.
 pub const DEFAULT_STOW_DWELL: Duration = Duration::from_secs(2);
 
@@ -115,23 +84,6 @@ pub const DEFAULT_STOW_DWELL: Duration = Duration::from_secs(2);
 /// to under the head's weight at stow has not been measured — and wide enough
 /// that a machine holding as well as its gains allow is not refused.
 pub const DEFAULT_STOW_TOLERANCE: f64 = 2.0 * PI / 180.0;
-
-/// The nine angles the stow pose puts the machine at: the stow head pose solved
-/// through the linkage, the antennas folded, the body square.
-///
-/// Derived rather than transcribed, so the pose the stow motion is commanded to
-/// and the pose disarming verifies against are the same pose by construction. An
-/// `Err` means the configured geometry cannot reach stow at all, which is a
-/// question about the geometry and not about the machine in front of you.
-pub fn stow_targets(geom: &HeadGeometry) -> Result<JointVector, IkError> {
-    let mut angles = LegAngles([0.0; 6]);
-    inverse_kinematics(geom, &stow_head_pose(), &mut angles)?;
-    Ok(JointVector {
-        body_yaw: 0.0,
-        legs: angles.0,
-        antennas: STOW_ANTENNAS,
-    })
-}
 
 /// What disarming needs to know.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -711,19 +663,30 @@ mod tests {
     use crate::testutil::{Asked, ScriptedBus, asked};
     use crate::txn::AuxOpKind;
     use crate::value::Value;
-    use reachy_kin::{EnvelopeConfig, EnvelopeReport, check_envelope, neutral_head_pose};
+    use reachy_kin::{
+        HeadGeometry, LegAngles, inverse_kinematics, neutral_head_pose, sleep_head_pose,
+    };
+
+    /// Where these cases' machine folds its antennas, right then left, radians.
+    ///
+    /// A fixture and not the deployment's fold: where this machine actually
+    /// folds is the `stow` document of the pose library, which a sans-I/O crate
+    /// cannot read. What the cases below need of it is only that it is a fold —
+    /// both rods past straight down, symmetric, so a rule reaching one side is
+    /// seen to reach the other.
+    const FOLD: [f64; 2] = [-3.32, 3.32];
 
     fn config() -> DisarmConfig {
         DisarmConfig {
             ids: SERVO_IDS,
-            stow_targets: stow_targets(&HeadGeometry::default()).expect("stow is reachable"),
+            stow_targets: joints_at(&sleep_head_pose()),
             tolerance: DEFAULT_STOW_TOLERANCE,
             dwell: DEFAULT_STOW_DWELL,
         }
     }
 
-    /// The nine angles a head pose puts the machine at, antennas folded, body
-    /// square.
+    /// The nine angles a head pose puts the machine at, antennas at [`FOLD`],
+    /// body square.
     fn joints_at(pose: &nalgebra::Isometry3<f64>) -> JointVector {
         let mut angles = LegAngles([0.0; 6]);
         inverse_kinematics(&HeadGeometry::default(), pose, &mut angles)
@@ -731,7 +694,7 @@ mod tests {
         JointVector {
             body_yaw: 0.0,
             legs: angles.0,
-            antennas: STOW_ANTENNAS,
+            antennas: FOLD,
         }
     }
 
@@ -1019,7 +982,6 @@ mod tests {
     /// turn out as a release away from stow.
     #[test]
     fn an_antenna_is_judged_around_the_circle() {
-        let stow = stow_targets(&HeadGeometry::default()).expect("stow is reachable");
         let wide = DisarmConfig {
             tolerance: 25.0_f64.to_radians(),
             ..config()
@@ -1032,7 +994,7 @@ mod tests {
         for (side, row, joint) in cases {
             // 23° past the fold, away from upright, wrapped into the half turn
             // either side of it — the other side from the fold's own.
-            let fold = STOW_ANTENNAS[side];
+            let fold = FOLD[side];
             let radians = wrap_to_pi(fold + 23.0_f64.to_radians() * fold.signum());
             let mut machine = bus();
             machine.present.antennas[side] = radians;
@@ -1070,7 +1032,11 @@ mod tests {
         let summary = drive(&wide, &mut machine).expect("nothing here refuses");
         assert!(!summary.at_stow, "a turn is not zero on a leg");
         assert_eq!(summary.worst_deviation().0, JointRef::Leg0);
-        assert!((summary.present.legs[0] - stow.legs[0] - core::f64::consts::TAU).abs() < 1e-12);
+        assert!(
+            (summary.present.legs[0] - config().stow_targets.legs[0] - core::f64::consts::TAU)
+                .abs()
+                < 1e-12
+        );
     }
 
     /// A reading that is not an angle places no joint, so it is carried as
@@ -1472,47 +1438,6 @@ mod tests {
             machine.torque,
             [false, false, true, false, false, true, false, false, false]
         );
-    }
-
-    /// The stow pose disarming verifies against is a pose the envelope admits
-    /// and the servos' own travel windows contain. It is the last pose the
-    /// machine is commanded to before torque comes off, so a stow target the
-    /// envelope refused would be a stow command that faults on its first tick.
-    #[test]
-    fn the_stow_targets_are_a_pose_the_envelope_admits() {
-        let cfg = config();
-        let env = EnvelopeConfig::default();
-        let mut report = EnvelopeReport::default();
-        check_envelope(
-            &HeadGeometry::default(),
-            &env,
-            &stow_head_pose(),
-            0.0,
-            None,
-            &mut report,
-        )
-        .expect("stow is inside the envelope");
-
-        for (leg, (angle, (low, high))) in report
-            .leg_angles
-            .expect("stow is reachable")
-            .0
-            .iter()
-            .zip(env.crank_windows)
-            .enumerate()
-        {
-            assert!(
-                *angle > low && *angle < high,
-                "leg {} stows at {:.3}°, outside [{:.3}°, {:.3}°]",
-                leg + 1,
-                angle.to_degrees(),
-                low.to_degrees(),
-                high.to_degrees()
-            );
-        }
-        assert_eq!(cfg.stow_targets.antennas, STOW_ANTENNAS);
-        assert_eq!(cfg.stow_targets.legs, report.leg_angles.unwrap().0);
-        assert_eq!(cfg.stow_targets.body_yaw, 0.0);
     }
 
     /// The standalone comparison, for a caller measuring the machine somewhere

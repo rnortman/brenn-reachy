@@ -7,13 +7,13 @@
 //!
 //! What it does is the one conversion that stands between a reading and a
 //! frame: a recording holds where the machine *was*, and a clip holds what a
-//! motion *does*, so every channel comes out as a delta over the neutral base.
-//! The head is `neutral⁻¹ · pose` in the base head's own frame, the antennas
-//! are the measured angles less their neutral lean — so a hand that left them
-//! where a lift puts them extracts to zeros rather than to a pair of tenths
-//! nobody meant — and body yaw is measured less zero, which is where neutral
-//! puts it. Get any of that wrong and the composer adds the recording to the
-//! base a second time.
+//! motion *does*, so every channel comes out as a delta over the base the clip
+//! is measured against — the whole configuration the caller states in
+//! [`Draft::over`]. The head is `over⁻¹ · pose` in the base head's own frame,
+//! the antennas are the measured angles less the base's lean — so a hand that
+//! left them where a lift puts them extracts to zeros rather than to a pair of
+//! tenths nobody meant — and body yaw is measured less the base's. Get any of
+//! that wrong and the composer adds the recording to the base a second time.
 //!
 //! Pure, and no wider than that: frames in, document out. Reading the stream,
 //! choosing the stretch and writing the file belong to the caller.
@@ -27,13 +27,12 @@
 //! correct.
 
 use nalgebra::Isometry3;
-use reachy_kin::neutral_head_pose;
-use reachy_motion::{FLOOR_TICK_HZ, NEUTRAL_ANTENNAS};
+use reachy_motion::FLOOR_TICK_HZ;
+use reachy_motion::asset_name::{AssetNameError, check_asset_name};
+use reachy_motion::joints::JointTargets;
 use thiserror::Error;
 
-use crate::format::{
-    CLIP_KIND, Channel, ChannelMask, ClipDoc, FORMAT_VERSION, FrameDoc, NameError, validate_name,
-};
+use crate::format::{CLIP_KIND, Channel, ChannelMask, ClipDoc, FORMAT_VERSION, FrameDoc};
 
 /// One frame of a recording: where the machine stood, as it was read.
 ///
@@ -65,6 +64,14 @@ pub struct Draft<'a> {
     /// The channels to drive. A channel outside it is left unsaid, which is how
     /// the format spells "this clip has no opinion about that".
     pub mask: ChannelMask,
+    /// The base the deltas are measured against: the configuration the machine
+    /// was standing at when the recording began.
+    ///
+    /// A clip is recorded over the neutral pose and played over whatever
+    /// stands, so the caller reads this out of the library's `neutral` document
+    /// rather than choosing it: a base the recorder did not stand at yields a
+    /// clip that is wrong in a way nothing downstream can detect.
+    pub over: JointTargets,
 }
 
 /// Why a recorded stretch is not a clip document.
@@ -81,7 +88,7 @@ pub enum RecordError {
         /// The name as given.
         name: String,
         /// What is wrong with it.
-        source: NameError,
+        source: AssetNameError,
     },
     /// The mask names no channel, so the document would drive nothing.
     #[error("a clip drives at least one channel; this extraction names none")]
@@ -118,7 +125,7 @@ pub enum RecordError {
 /// [`RecordError`]: an unusable name, an empty mask, no frames, or a masked
 /// channel unread in some frame, named with the frame it went missing in.
 pub fn clip_doc(draft: &Draft, frames: &[RecordedFrame]) -> Result<ClipDoc, RecordError> {
-    validate_name(draft.name).map_err(|source| RecordError::Name {
+    check_asset_name(draft.name).map_err(|source| RecordError::Name {
         name: draft.name.to_owned(),
         source,
     })?;
@@ -131,7 +138,7 @@ pub fn clip_doc(draft: &Draft, frames: &[RecordedFrame]) -> Result<ClipDoc, Reco
     let track = frames
         .iter()
         .enumerate()
-        .map(|(index, frame)| delta(index, frame, draft.mask))
+        .map(|(index, frame)| delta(index, frame, draft.mask, &draft.over))
         .collect::<Result<Vec<FrameDoc>, RecordError>>()?;
     Ok(ClipDoc {
         version: FORMAT_VERSION,
@@ -151,17 +158,22 @@ pub fn clip_doc(draft: &Draft, frames: &[RecordedFrame]) -> Result<ClipDoc, Reco
 
 /// One recorded frame as the deltas the composer adds.
 ///
-/// The head's delta is taken in neutral's own frame, which is the frame the
+/// The head's delta is taken in the base's own frame, which is the frame the
 /// composition applies it in; taking it in the body frame instead would rotate
-/// every recorded translation by neutral's attitude.
-fn delta(index: usize, frame: &RecordedFrame, mask: ChannelMask) -> Result<FrameDoc, RecordError> {
+/// every recorded translation by the base's attitude.
+fn delta(
+    index: usize,
+    frame: &RecordedFrame,
+    mask: ChannelMask,
+    over: &JointTargets,
+) -> Result<FrameDoc, RecordError> {
     let unread = |channel: Channel| RecordError::Unread {
         frame: index,
         channel,
     };
     let (dt, dq) = if mask.contains(Channel::Head) {
         let pose = frame.head.ok_or_else(|| unread(Channel::Head))?;
-        let head = neutral_head_pose().inverse() * pose;
+        let head = over.head_pose_body.inverse() * pose;
         let q = head.rotation.quaternion();
         (
             Some([
@@ -178,17 +190,14 @@ fn delta(index: usize, frame: &RecordedFrame, mask: ChannelMask) -> Result<Frame
         let mut pair = [0.0; 2];
         for (side, angle) in pair.iter_mut().enumerate() {
             let measured = frame.antennas[side].ok_or_else(|| unread(Channel::Antennas))?;
-            *angle = measured - NEUTRAL_ANTENNAS[side];
+            *angle = measured - over.antennas[side];
         }
         Some(pair)
     } else {
         None
     };
     let body_yaw = if mask.contains(Channel::BodyYaw) {
-        // Neutral's yaw is zero, so the measured angle *is* the delta. Written
-        // as the subtraction it is, because the day neutral yaws is the day
-        // this line has to change and a bare pass-through would not say so.
-        Some(frame.body_yaw.ok_or_else(|| unread(Channel::BodyYaw))? - 0.0)
+        Some(frame.body_yaw.ok_or_else(|| unread(Channel::BodyYaw))? - over.body_yaw)
     } else {
         None
     };
@@ -203,11 +212,22 @@ fn delta(index: usize, frame: &RecordedFrame, mask: ChannelMask) -> Result<Frame
 #[cfg(test)]
 mod tests {
     use nalgebra::{Translation3, UnitQuaternion, Vector3};
-    use reachy_motion::neutral_targets;
+    use reachy_kin::neutral_head_pose;
 
     use super::*;
     use crate::envelope::{ClipLimits, FrameError};
     use crate::format::Clip;
+
+    /// The base every case below measures against: the neutral pose, as the
+    /// library's `neutral` document states it. Written out because this crate
+    /// reads no asset; the caller that extracts for real reads the document.
+    fn neutral() -> JointTargets {
+        JointTargets {
+            head_pose_body: neutral_head_pose(),
+            body_yaw: 0.0,
+            antennas: [-0.1745, 0.1745],
+        }
+    }
 
     /// The draft every case below varies from: all three channels, a name the
     /// library files.
@@ -216,12 +236,13 @@ mod tests {
             name,
             description: Some("session under test".to_owned()),
             mask: ChannelMask::all(),
+            over: neutral(),
         }
     }
 
     /// The frame a limp machine standing exactly at neutral would record.
     fn at_neutral() -> RecordedFrame {
-        let targets = neutral_targets();
+        let targets = neutral();
         RecordedFrame {
             head: Some(targets.head_pose_body),
             antennas: targets.antennas.map(Some),
@@ -296,8 +317,8 @@ mod tests {
         };
         let doc = clip_doc(&draft("recorded/session/s004"), &[frame]).expect("a moved frame");
         let antennas = doc.frames[0].antennas.expect("the pair is masked");
-        assert!((antennas[0] - (0.5 - NEUTRAL_ANTENNAS[0])).abs() < 1e-12);
-        assert!((antennas[1] - (-0.25 - NEUTRAL_ANTENNAS[1])).abs() < 1e-12);
+        assert!((antennas[0] - (0.5 - neutral().antennas[0])).abs() < 1e-12);
+        assert!((antennas[1] - (-0.25 - neutral().antennas[1])).abs() < 1e-12);
         assert_eq!(doc.frames[0].body_yaw, Some(0.2));
     }
 
@@ -384,7 +405,7 @@ mod tests {
             clip_doc(&draft("Recorded/Session"), &[at_neutral()]),
             Err(RecordError::Name {
                 name: "Recorded/Session".to_owned(),
-                source: NameError::BadChar { ch: 'R' },
+                source: AssetNameError::BadChar { ch: 'R' },
             })
         );
         assert_eq!(

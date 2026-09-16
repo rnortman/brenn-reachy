@@ -115,11 +115,19 @@ use reachy_host::{
     AWAITING_SPEECH_CONFIG, COMPOSED, REFUSAL_PREFIX, STARTED, UNOFFERED, UNPUBLISHED, UNSENT,
     UNSPOKEN, VOICELESS,
 };
-use reachy_motion::postures::neutral_targets;
 use run_report::{
     EVENT_HEAD, Report, audio_dir, console_dir, event, quote, recover, sibling, utterance_id,
     verdict,
 };
+
+/// Where the attending pose puts the machine, as the committed library states
+/// it.
+///
+/// The report judges a head against the pose the run was configured to reach,
+/// read out of the same asset a unit binds rather than a figure restated here.
+fn neutral_targets() -> reachy_motion::joints::JointTargets {
+    committed_poses::targets(reachy_poses::NEUTRAL_POSE)
+}
 use serde_json::Value;
 use stillness_report::{Standard, Stillness, say};
 
@@ -2614,7 +2622,7 @@ fn refusal_kinds() -> Vec<&'static str> {
             accepted: 0,
         }
         .kind(),
-        Refusal::Uncompilable(CompileError::NoPosture).kind(),
+        Refusal::Uncompilable(CompileError::NoPose).kind(),
     ]
 }
 
@@ -5399,7 +5407,7 @@ mod tests {
     /// One motion script the pipeline authored, on its own stream.
     fn authored(cause: &str) -> String {
         format!(
-            r#"{{"ts_ms":1,"event":"motion_script","cause":"{cause}","pod":"reachy00","seq":1,"steps":[{{"after_ms":0,"posture":"up"}}],"timeout_ms":30000}}"#
+            r#"{{"ts_ms":1,"event":"motion_script","cause":"{cause}","pod":"reachy00","seq":1,"steps":[{{"after_ms":0,"pose":"neutral"}}],"timeout_ms":30000}}"#
         )
     }
 

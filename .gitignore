@@ -6,6 +6,12 @@
 target/
 **/*.rs.bk
 
+# Cargo's resolved lock. Bazel never reads one, and the one `Cargo.toml` in the
+# tree exists so another repository can take that crate as a git dependency — a
+# consumer of which resolves against its own lock and never the dependency's. So
+# every lock file here is a by-product of a local `cargo` run.
+Cargo.lock
+
 # Bazel's convenience symlinks into the output base, and the per-developer flag
 # file .bazelrc imports last. MODULE.bazel.lock is deliberately *not* here: it
 # is the pinned resolution of the module graph and is tracked content.

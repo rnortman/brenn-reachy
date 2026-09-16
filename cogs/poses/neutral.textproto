@@ -1,0 +1,9 @@
+name: "neutral"
+description: "Head square and level at nominal height, body square, antennas ten degrees off vertical toward each side's outboard. Not straight up: at vertical the gearbox backlash leaves the rod balanced on the play with no load taking it up and the position loop hunts across the gap, where a small lean lets the rod's own weight hold the play to one side. Small enough that the pair still rests well inside the contact band. Written from the constants, not recorded; no session holds a neutral still."
+# Head relative to the neutral head pose: metres, unit quaternion [w, x, y, z].
+dt: [0.0, 0.0, 0.0]
+dq: [1.0, 0.0, 0.0, 0.0]
+body_yaw: 0.0
+# Right, then left; radians, a direction.
+antennas: [-0.1745, 0.1745]
+duration_ms: 800

@@ -79,11 +79,6 @@ schema MoverState
         // The kind of the last step dispatched as a move.
         #3 desired_kind: schedule::StepKind;
 
-        // The posture of that step. Together with `desired_kind` this is what a
-        // fresh schedule is compared against to decide whether the machine has
-        // somewhere new to be.
-        #4 desired_posture: schedule::Posture;
-
         // How many goal datagrams have been published, all run.
         #5 goals_published: UInt64;
 
@@ -111,7 +106,7 @@ schema MoverState
         #10 refused_state: UInt64;
 
         // How many times an epoch this cog had not answered yet was answered by
-        // a posture step, all run. An epoch stands until a posture step covers
+        // a base step, all run. An epoch stands until a base step covers
         // an instant, and one execution sees only the latest schedule, so two
         // bumps published inside one gap are one answer here: the total counts
         // epoch changes this cog observed, not epochs a session published, and
@@ -179,17 +174,35 @@ schema MoverState
         // covers; where the machine physically stands is not, so a plan over a
         // span the configured clock cannot carry is lengthened rather than
         // refused. Zero on a healthy machine is the invariant this field exists
-        // to make legible; the de-phasing every posture move asks for is
+        // to make legible; the de-phasing every base move asks for is
         // routine and is counted next door, in `base_dephased`.
         #20 base_stretched: UInt64;
 
         // How many base plans were adjusted only to de-phase the antenna pair,
         // all run: the configured separation reached by lengthening the later
         // side's clock, on clocks that each carried their own span. Two
-        // antennas sweeping between the stow and the working posture arrive
+        // antennas sweeping between the stow and the working pose arrive
         // mirrored, which is where their tips meet, so this is expected nonzero
         // on any machine that stands up or folds -- it is the evidence the
         // pair-phase guard is working, not a fault signal.
         #21 base_dephased: UInt64;
+
+        // How long the move dispatched by that step takes. Part of what a fresh
+        // schedule is compared against, with `desired_kind` and
+        // `desired_pose_id`: a step naming the pose already commanded at
+        // another pace asks for something new. Zero while nothing is
+        // dispatched, where nothing reads it.
+        #22 desired_pace: Duration;
+
+        // The pose of that step, as its index in the configured library's
+        // poses. Together with `desired_kind` this is what a fresh schedule is
+        // compared against to decide whether the machine has somewhere new to
+        // be.
+        #23 desired_pose_id: UInt16;
+    }
+    history
+    {
+        version: 2;
+        removed: [4];
     }
 }

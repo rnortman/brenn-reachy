@@ -475,7 +475,11 @@ fn run(options: &Options) -> Result<(), String> {
     let ports = Ports::bind()?;
     let stop = stop_flag()?;
 
-    let mut host = HostEdge::new(EdgeConfig::for_pod(ASK_POD), MotionTable::default());
+    let mut host = HostEdge::new(
+        EdgeConfig::for_pod(ASK_POD),
+        MotionTable::default(),
+        gesture::poses().clone(),
+    );
     let mut surface = Console;
     let mut watch = Watch::new();
     let mut buffer = vec![0u8; DATAGRAM_CAP];
@@ -679,7 +683,11 @@ fn conduct(
     surface: &mut impl Surface,
 ) -> Ending {
     let legs = tour.legs();
-    let mut host = HostEdge::new(EdgeConfig::for_pod(ASK_POD), table);
+    let mut host = HostEdge::new(
+        EdgeConfig::for_pod(ASK_POD),
+        table,
+        gesture::poses().clone(),
+    );
     let mut buffer = vec![0u8; DATAGRAM_CAP];
     let mut sent = 0usize;
     let mut watch = Watch::new();
@@ -902,10 +910,10 @@ mod tests {
 
     #[test]
     fn the_tour_names_its_sidecar() {
-        let options = parsed(&["--tour", "cogs/clip_library.names.json"]).expect("the tour");
+        let options = parsed(&["--tour", "cogs/library.names.json"]).expect("the tour");
         assert_eq!(
             options.mode,
-            Mode::Tour(PathBuf::from("cogs/clip_library.names.json")),
+            Mode::Tour(PathBuf::from("cogs/library.names.json")),
         );
         assert_eq!(
             options.resting_timeout,
@@ -936,14 +944,14 @@ mod tests {
     fn a_probe_run_names_the_one_motion_it_plays() {
         let options = parsed(&[
             "--tour",
-            "cogs/clip_library.names.json",
+            "cogs/library.names.json",
             "--motion",
             "probe/antenna-step-a",
         ])
         .expect("a probe run");
         assert_eq!(
             options.mode,
-            Mode::Tour(PathBuf::from("cogs/clip_library.names.json")),
+            Mode::Tour(PathBuf::from("cogs/library.names.json")),
         );
         assert_eq!(options.motion.as_deref(), Some("probe/antenna-step-a"));
         let table = parsed(&["--tour-table", "names.json", "--motion", "bench/nod"])

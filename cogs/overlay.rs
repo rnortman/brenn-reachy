@@ -608,8 +608,8 @@ mod tests {
     use reachy_clips::envelope::ClipLimits;
     use reachy_clips::format::{Channel as Ch, Clip, ClipDoc, FrameDoc};
     use reachy_motion::FLOOR_TICK_HZ;
-    use reachy_motion::postures::{neutral_targets, stow_pose_targets};
     use reachy_motion::traj::{MoveDurations, TrajectoryError, WarpKind};
+    use reachy_poses::{NEUTRAL_POSE, STOW_POSE};
 
     /// One nominal period: the grid a clip is authored on and the one a player is
     /// advanced by.
@@ -1098,8 +1098,8 @@ mod tests {
     /// move walks the tick's own path and holds where it ends.
     #[test]
     fn the_base_walks_the_path_it_was_handed() {
-        let start = stow_pose_targets();
-        let target = neutral_targets();
+        let start = committed_poses::targets(STOW_POSE);
+        let target = committed_poses::targets(NEUTRAL_POSE);
         let durations = MoveDurations::uniform(Duration::from_millis(100));
         let trajectory = Trajectory::new(&start, &target, durations, WarpKind::MinJerk)
             .expect("the fixture shapes");
@@ -1135,15 +1135,15 @@ mod tests {
             "an unwritten slot is the tick's"
         );
 
-        let held = Base::held(stow_pose_targets());
+        let held = Base::held(committed_poses::targets(STOW_POSE));
         write_base(&mut slot, Some(&held));
         assert_eq!(read_base(&slot), Ok(Some(held)));
 
-        let mut moving = Base::held(stow_pose_targets());
+        let mut moving = Base::held(committed_poses::targets(STOW_POSE));
         moving.retarget(
             &Trajectory::new(
-                &stow_pose_targets(),
-                &neutral_targets(),
+                &committed_poses::targets(STOW_POSE),
+                &committed_poses::targets(NEUTRAL_POSE),
                 MoveDurations::uniform(Duration::from_millis(100)),
                 WarpKind::MinJerk,
             )
@@ -1157,7 +1157,7 @@ mod tests {
         // show, because only this one leaves a path in the slot for the write
         // to clear. Read back with a path still on it, the compositor would
         // keep sampling a trajectory that ended.
-        let held_again = Base::held(neutral_targets());
+        let held_again = Base::held(committed_poses::targets(NEUTRAL_POSE));
         write_base(&mut slot, Some(&held_again));
         let read = read_base(&slot).expect("a written base reads");
         assert_eq!(read, Some(held_again));
@@ -1176,11 +1176,11 @@ mod tests {
     #[test]
     fn a_base_path_that_is_no_path_is_refused() {
         let mut slot = BaseSnapWire::new();
-        let mut moving = Base::held(stow_pose_targets());
+        let mut moving = Base::held(committed_poses::targets(STOW_POSE));
         moving.retarget(
             &Trajectory::new(
-                &stow_pose_targets(),
-                &neutral_targets(),
+                &committed_poses::targets(STOW_POSE),
+                &committed_poses::targets(NEUTRAL_POSE),
                 MoveDurations::uniform(Duration::from_millis(100)),
                 WarpKind::MinJerk,
             )
@@ -1206,11 +1206,11 @@ mod tests {
         use brenn_reachy__motion__tick_state_clk_rs::WarpKindWire;
 
         let mut slot = BaseSnapWire::new();
-        let mut moving = Base::held(stow_pose_targets());
+        let mut moving = Base::held(committed_poses::targets(STOW_POSE));
         moving.retarget(
             &Trajectory::new(
-                &stow_pose_targets(),
-                &neutral_targets(),
+                &committed_poses::targets(STOW_POSE),
+                &committed_poses::targets(NEUTRAL_POSE),
                 MoveDurations::uniform(Duration::from_millis(100)),
                 WarpKind::MinJerk,
             )
@@ -1233,7 +1233,10 @@ mod tests {
     #[test]
     fn a_base_clock_that_runs_backwards_is_refused() {
         let mut slot = BaseSnapWire::new();
-        write_base(&mut slot, Some(&Base::held(stow_pose_targets())));
+        write_base(
+            &mut slot,
+            Some(&Base::held(committed_poses::targets(STOW_POSE))),
+        );
         slot.set_elapsed(SlotDuration::from_nanos(-1));
         assert_eq!(
             read_base(&slot),

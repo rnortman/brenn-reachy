@@ -18,7 +18,9 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::format::{FORMAT_VERSION, NameError, SEQUENCE_KIND, validate_name};
+use reachy_motion::asset_name::{AssetNameError, check_asset_name};
+
+use crate::format::{FORMAT_VERSION, SEQUENCE_KIND};
 
 /// Why a sequence document cannot be loaded.
 ///
@@ -55,7 +57,7 @@ pub enum SequenceError {
         /// What the document said.
         name: String,
         /// Which rule it broke.
-        source: NameError,
+        source: AssetNameError,
     },
 
     /// An entry's `ref` is not a usable asset name.
@@ -66,7 +68,7 @@ pub enum SequenceError {
         /// What the document said.
         name: String,
         /// Which rule it broke.
-        source: NameError,
+        source: AssetNameError,
     },
 
     /// An empty `entries` list.
@@ -210,7 +212,7 @@ impl Sequence {
         if doc.kind != SEQUENCE_KIND {
             return Err(SequenceError::WrongKind { kind: doc.kind });
         }
-        validate_name(&doc.name).map_err(|source| SequenceError::Name {
+        check_asset_name(&doc.name).map_err(|source| SequenceError::Name {
             name: doc.name.clone(),
             source,
         })?;
@@ -281,7 +283,7 @@ fn validated_entry(index: usize, entry: &EntryDoc) -> Result<Entry, SequenceErro
         (Some(_), Some(_)) => Err(SequenceError::RefAndGap { entry: index }),
         (None, None) => Err(SequenceError::NeitherRefNorGap { entry: index }),
         (Some(reference), None) => {
-            validate_name(reference).map_err(|source| SequenceError::RefName {
+            check_asset_name(reference).map_err(|source| SequenceError::RefName {
                 entry: index,
                 name: reference.clone(),
                 source,
@@ -393,7 +395,7 @@ mod tests {
             Sequence::from_doc(bad),
             Err(SequenceError::Name {
                 name: "Pod/Greet".to_owned(),
-                source: NameError::BadChar { ch: 'P' },
+                source: AssetNameError::BadChar { ch: 'P' },
             })
         );
 
@@ -404,7 +406,7 @@ mod tests {
             Err(SequenceError::RefName {
                 entry: 2,
                 name: "pod/Nod".to_owned(),
-                source: NameError::BadChar { ch: 'N' },
+                source: AssetNameError::BadChar { ch: 'N' },
             })
         );
     }

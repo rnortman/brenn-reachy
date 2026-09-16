@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use reachy_motion::FLOOR_TICK_HZ;
+use reachy_motion::asset_name::{AssetNameError, check_asset_name};
 
 use crate::envelope::{ClipLimits, FrameError, check_frames};
 
@@ -35,18 +36,6 @@ use crate::envelope::{ClipLimits, FrameError, check_frames};
 /// the fields a future version adds are exactly the ones whose absence a
 /// permissive reader would silently take as a default.
 pub const FORMAT_VERSION: u32 = 1;
-
-/// The longest an asset name may be, characters.
-///
-/// Names are the join key between the wire and the library, so they travel in
-/// every script that invokes a motion; a bound keeps a script's size a function
-/// of its step count. The wire protocol defines an identical bound; charset
-/// validation is this side's alone.
-///
-/// Must equal the corresponding constant in `motion-proto`; the two crates
-/// share no dependency, so a drift guard in a downstream crate is the only
-/// enforcement.
-pub const MAX_MOTION_NAME_LEN: usize = 128;
 
 /// The default blend ramp at an overlay's entry and exit, milliseconds, for a
 /// clip that states neither.
@@ -63,7 +52,7 @@ pub const DEFAULT_BLEND_MS: u32 = 200;
 /// without reading as movement.
 ///
 /// Must equal the wire protocol's bound in `motion-proto`; that copy is
-/// authoritative.
+/// authoritative, and `cogs/edge_caps_test` holds this one to it.
 pub const MIN_SPEED: f64 = 0.25;
 
 /// The fastest an invocation may run a motion.
@@ -306,84 +295,6 @@ pub enum MaskError {
     Nothing,
 }
 
-/// Why a name cannot be used.
-///
-/// Names reach a script, a report line and a file stem, so the charset is
-/// narrow and the refusal says which character offended rather than restating
-/// the rule.
-#[derive(Clone, Copy, Debug, Error, PartialEq)]
-pub enum NameError {
-    /// The name is the empty string.
-    #[error("an asset name may not be empty")]
-    Empty,
-
-    /// The name is longer than [`MAX_MOTION_NAME_LEN`].
-    #[error("an asset name may be at most {MAX_MOTION_NAME_LEN} characters; this one is {len}")]
-    TooLong {
-        /// The name's length in characters.
-        len: usize,
-    },
-
-    /// A character outside `[a-z0-9_./-]`.
-    #[error("an asset name may only hold [a-z0-9_./-]; this one holds {ch:?}")]
-    BadChar {
-        /// The first offending character.
-        ch: char,
-    },
-
-    /// A leading `/`, a trailing `/`, or a `//`.
-    #[error("an asset name may not hold an empty path segment")]
-    EmptySegment,
-
-    /// A `.` or `..` segment.
-    #[error("an asset name may not hold a \".\" or \"..\" segment")]
-    DotSegment,
-
-    /// A leading `-`.
-    #[error("an asset name may not begin with \"-\"")]
-    LeadingDash,
-}
-
-/// Check an asset name against the charset, the length bound, and the shape a
-/// relative path may take.
-///
-/// Every asset lives in one namespace, addressed by one wire field, so one
-/// rule. The path shape belongs to that rule rather than to each consumer,
-/// because a name *becomes* a path: the importer writes a clip and its audio
-/// sidecar under it, and a name a consumer joins onto a directory is the whole
-/// of what stops a downloaded, converted document from writing outside it. So a
-/// name is a relative path with no navigation in it — no leading slash, no
-/// empty segment, no `.` or `..` — and does not open with a `-`, which reads as
-/// an option wherever a name reaches a command line.
-pub fn validate_name(name: &str) -> Result<(), NameError> {
-    if name.is_empty() {
-        return Err(NameError::Empty);
-    }
-    let len = name.chars().count();
-    if len > MAX_MOTION_NAME_LEN {
-        return Err(NameError::TooLong { len });
-    }
-    if let Some(ch) = name
-        .chars()
-        .find(|ch| !matches!(ch, 'a'..='z' | '0'..='9' | '_' | '.' | '/' | '-'))
-    {
-        return Err(NameError::BadChar { ch });
-    }
-    if name.starts_with('-') {
-        return Err(NameError::LeadingDash);
-    }
-    if name.split('/').any(str::is_empty) {
-        return Err(NameError::EmptySegment);
-    }
-    if name
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
-    {
-        return Err(NameError::DotSegment);
-    }
-    Ok(())
-}
-
 /// Why a clip document cannot be loaded.
 ///
 /// Every arm is a refusal of the whole asset. There is no partial load and no
@@ -419,7 +330,7 @@ pub enum ClipError {
         /// What the document said.
         name: String,
         /// Which rule it broke.
-        source: NameError,
+        source: AssetNameError,
     },
 
     /// A `frame_hz` other than the tick rate the whole stack is floored at.
@@ -757,7 +668,7 @@ impl Clip {
         if doc.kind != CLIP_KIND {
             return Err(ClipError::WrongKind { kind: doc.kind });
         }
-        validate_name(&doc.name).map_err(|source| ClipError::Name {
+        check_asset_name(&doc.name).map_err(|source| ClipError::Name {
             name: doc.name.clone(),
             source,
         })?;
@@ -1295,50 +1206,6 @@ mod tests {
     }
 
     #[test]
-    fn names_are_checked_against_the_charset() {
-        assert_eq!(validate_name("pod/nod-twice_2.v1"), Ok(()));
-        assert_eq!(validate_name(""), Err(NameError::Empty));
-        assert_eq!(
-            validate_name("Pollen/x"),
-            Err(NameError::BadChar { ch: 'P' })
-        );
-        assert_eq!(validate_name("a b"), Err(NameError::BadChar { ch: ' ' }));
-        let long = "a".repeat(MAX_MOTION_NAME_LEN + 1);
-        assert_eq!(
-            validate_name(&long),
-            Err(NameError::TooLong {
-                len: MAX_MOTION_NAME_LEN + 1
-            })
-        );
-        // The bound itself is admissible: the refusal starts one past it.
-        assert_eq!(validate_name(&"a".repeat(MAX_MOTION_NAME_LEN)), Ok(()));
-    }
-
-    #[test]
-    fn names_may_not_navigate_a_filesystem() {
-        // A name becomes a path — the importer writes each clip and its audio
-        // sidecar under one — so the charset alone is not the rule: everything
-        // below passes it and none of it may name a file outside the directory
-        // it was joined onto.
-        assert_eq!(validate_name("/etc/cron.d/x"), Err(NameError::EmptySegment));
-        assert_eq!(validate_name("pollen//x"), Err(NameError::EmptySegment));
-        assert_eq!(validate_name("pollen/"), Err(NameError::EmptySegment));
-        assert_eq!(
-            validate_name("../../persistent/x"),
-            Err(NameError::DotSegment)
-        );
-        assert_eq!(validate_name("pollen/../../x"), Err(NameError::DotSegment));
-        assert_eq!(validate_name("."), Err(NameError::DotSegment));
-        assert_eq!(validate_name(".."), Err(NameError::DotSegment));
-        assert_eq!(validate_name("--force"), Err(NameError::LeadingDash));
-        assert_eq!(validate_name("-x"), Err(NameError::LeadingDash));
-
-        // A dot inside a segment is still an ordinary character.
-        assert_eq!(validate_name("pollen/emotions/loving1.v2"), Ok(()));
-        assert_eq!(validate_name("...."), Ok(()));
-    }
-
-    #[test]
     fn bad_name_is_refused_by_the_clip_loader() {
         let doc = ClipDoc {
             name: "Loving1".to_owned(),
@@ -1348,7 +1215,7 @@ mod tests {
             Clip::from_doc(doc, &limits()),
             Err(ClipError::Name {
                 name: "Loving1".to_owned(),
-                source: NameError::BadChar { ch: 'L' },
+                source: AssetNameError::BadChar { ch: 'L' },
             })
         );
     }

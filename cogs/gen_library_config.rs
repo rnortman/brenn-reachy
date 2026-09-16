@@ -1,27 +1,39 @@
-//! `gen-clip-config` — clip documents in, the library configuration out.
+//! `gen-library-config` — the authored documents in, the library
+//! configurations out.
 //!
-//! An offline host-side emitter. It reads a directory of clip and sequence
-//! documents the way a host that plays them reads it — `files::documents` into
-//! `Library::load` under the machine's own `ClipLimits`, which resolves and
-//! flattens every sequence — turns what it finds into a `ClipLibraryConfigWire`
-//! message through the one mapping there is
-//! ([`reachy_clips::config::write_library`]), and prints that message as the
-//! protobuf text a box binds by path.
+//! An offline host-side emitter over two libraries, which are separate assets
+//! and separate vocabularies: the clips and motions a script layers over
+//! whatever base is standing, and the poses a base step moves the whole machine
+//! to. One tool because they share a sidecar — a script author resolves both
+//! kinds of name out of one file — and because a single command that emits
+//! everything cannot leave one of them behind.
 //!
-//! An asset's identity is its position, in two numberings: `clip_id` indexes the
-//! clips, `motion_id` indexes everything that plays — a motion per clip, plus
-//! one per sequence — and both are the order the documents' paths sort in. So a
-//! document that will not load is a **refusal of the whole emit**, not a skip
-//! the way a running host would take it: dropping one asset renumbers every one
-//! after it, and a script authored against the old numbering would then invoke
-//! the wrong motion. The name tables ride out twice for the same reason — as
-//! comments at the head of the asset, and as a JSON sidecar for whoever
-//! authors scripts.
+//! It reads each directory the way the process that uses it reads it: the clip
+//! documents through `files::documents` into `Library::load` under the
+//! machine's own `ClipLimits`, which resolves and flattens every sequence; the
+//! pose documents through [`reachy_poses::format::Pose::from_text`], which runs
+//! the envelope check on each. What it finds goes into the two messages through
+//! the one mapping each has ([`reachy_clips::config::write_library`],
+//! [`reachy_poses::config::write_library`]), and each message is printed as the
+//! protobuf text a cog's configuration dial takes by path — the clip library
+//! bound by a box today, the pose library emitted for the dials that will read
+//! it and staged with them.
 //!
-//! Nothing here decides anything about motion. The validation is the loader's,
-//! the mapping is `reachy_clips::config`'s, and the emitted asset is re-read
-//! the way a cog reads it before it is written, so this tool cannot produce a
-//! file the cogs would refuse.
+//! An asset's identity is its position, in three numberings: `clip_id` indexes
+//! the clips, `motion_id` indexes everything that plays — a motion per clip,
+//! plus one per sequence — and `pose_id` indexes the poses. All three are the
+//! order the documents' paths sort in. So a document that will not load is a
+//! **refusal of the whole emit**, not a skip the way a running host would take
+//! it: dropping one asset renumbers every one after it, and a script authored
+//! against the old numbering would then invoke the wrong motion or move to the
+//! wrong pose. The name tables ride out twice for the same reason — as comments
+//! at the head of each asset, and as a JSON sidecar for whoever authors
+//! scripts.
+//!
+//! Nothing here decides anything about motion. The validation is each loader's,
+//! the mapping is each `config` module's, and both emitted assets are re-read
+//! the way a cog reads them before they are written, so this tool cannot
+//! produce a file the cogs would refuse.
 
 #![forbid(unsafe_code)]
 
@@ -32,19 +44,22 @@ use anyhow::{Context as _, bail};
 use serde_json::json;
 
 use brenn_reachy__cogs__config_clk_rs::{
-    ClipFrame, ClipLibraryConfig, ClipLibraryConfigWire, MotionConfig,
+    ClipFrame, ClipLibraryConfig, ClipLibraryConfigWire, MotionConfig, PoseConfig,
+    PoseLibraryConfig, PoseLibraryConfigWire,
 };
 use reachy_clips::config::{FRAME_FIELDS, UnplayableAsset, ValidatedLibrary, write_library};
 use reachy_clips::envelope::ClipLimits;
-use reachy_clips::files::documents;
+use reachy_clips::files::{DOCUMENT_EXT, Descend, documents};
 use reachy_clips::format::Clip;
 use reachy_clips::library::{Library, Motion};
+use reachy_poses::config::{PACE_FIELD, POSE_FIELDS};
+use reachy_poses::format::Pose as LoadedPose;
 
 mod probe_clips;
 
-use probe_clips::PROBES;
+use probe_clips::{Folds, PROBES};
 
-/// What the emitted asset says about itself before its first clip.
+/// What the emitted clip asset says about itself before its first clip.
 ///
 /// Fixed text: the drift check compares a fresh emit against the checked-in
 /// file byte for byte, so nothing here may vary with the machine, the clock or
@@ -58,8 +73,8 @@ const HEADER: &str = "\
 # `config.clk`. A box binds it by path; the casing converts it to the message
 # the dial hands the cog.
 #
-# Generated — do not edit. Regenerate with `make clip-config` after changing a
-# document under `cogs/clips/`, and commit the three files together: this one,
+# Generated — do not edit. Regenerate with `make library-config` after changing
+# a document under `cogs/clips/`, and commit the three files together: this one,
 # its name sidecar, and the documents.
 #
 # An asset's identity is its position here, so the order is load-bearing: it is
@@ -70,22 +85,60 @@ const HEADER: &str = "\
 # clip_id  name
 ";
 
+/// What the emitted pose asset says about itself before its first pose.
+///
+/// Fixed text, for the reason [`HEADER`] is.
+const POSE_HEADER: &str = "\
+# Every base posture the machine has a name for: where the head, the body yaw
+# and the antennas stand, and how fast a move that states no pace of its own
+# goes there.
+#
+# Protobuf text of `brenn_reachy.cogs.config_clk_proto.PoseLibraryConfig`,
+# which the compiler generates from the `PoseLibraryConfig` schema in
+# `config.clk`. This is the asset a cog's configuration dial takes by path; the
+# casing converts it to the message the dial hands the cog. Every box that has
+# to agree about where a pose puts the machine binds this one file, and it
+# rides to a unit in `cogs/BUILD.bazel`'s `robot_config_files`.
+#
+# Generated — do not edit. Regenerate with `make library-config` after changing
+# a document under `cogs/poses/`, and commit the three files together: this one,
+# its name sidecar, and the documents.
+#
+# A pose's identity is its position here, so the order is load-bearing: it is
+# the order the document paths sort in, and a pose inserted in the middle
+# renumbers every one after it. The `stow` field carries the index of the pose
+# named `stow`, which is where the machine rests: what every schedule ends at,
+# what the fault ladder commands, and what the disarm sequence judges folded
+# against.
+#
+# The head is stated relative to the neutral head pose, in metres and a unit
+# quaternion; the antennas are directions in radians, right then left.
+#
+# pose_id  name
+";
+
 #[derive(Debug)]
 struct Args {
     /// The directory of clip documents.
     clips: PathBuf,
-    /// Where the protobuf text is written.
+    /// Where the clip library's protobuf text is written.
     out: PathBuf,
-    /// Where the name sidecar is written.
+    /// The directory of pose documents.
+    poses: PathBuf,
+    /// Where the pose library's protobuf text is written.
+    poses_out: PathBuf,
+    /// Where the name sidecar both libraries share is written.
     names: PathBuf,
 }
 
 fn usage() -> String {
-    "usage: gen-clip-config --clips DIR --out FILE --names FILE\n\
+    "usage: gen-library-config --clips DIR --out FILE --poses DIR --poses-out FILE --names FILE\n\
      \n\
-     \x20 --clips DIR   a directory of clip and sequence documents; *.json in it\n\
-     \x20 --out FILE    where the ClipLibraryConfig protobuf text is written\n\
-     \x20 --names FILE  where the id-to-name sidecar is written\n\
+     \x20 --clips DIR       a directory of clip and sequence documents; *.json in it\n\
+     \x20 --out FILE        where the ClipLibraryConfig protobuf text is written\n\
+     \x20 --poses DIR       a directory of pose documents; *.textproto in it\n\
+     \x20 --poses-out FILE  where the PoseLibraryConfig protobuf text is written\n\
+     \x20 --names FILE      where the id-to-name sidecar for both is written\n\
      \n\
      Every document must load. An asset's id is its index in the emitted\n\
      library, which is the order the paths sort in, so a document that will not\n\
@@ -99,7 +152,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn parse(words: impl Iterator<Item = String>) -> anyhow::Result<Args> {
-    let (mut clips, mut out, mut names) = (None, None, None);
+    let (mut clips, mut out, mut poses, mut poses_out, mut names) = (None, None, None, None, None);
     let mut words = words.peekable();
     while let Some(word) = words.next() {
         let mut value = |flag: &str| -> anyhow::Result<String> {
@@ -110,6 +163,8 @@ fn parse(words: impl Iterator<Item = String>) -> anyhow::Result<Args> {
         match word.as_str() {
             "--clips" => clips = Some(PathBuf::from(value("--clips")?)),
             "--out" => out = Some(PathBuf::from(value("--out")?)),
+            "--poses" => poses = Some(PathBuf::from(value("--poses")?)),
+            "--poses-out" => poses_out = Some(PathBuf::from(value("--poses-out")?)),
             "--names" => names = Some(PathBuf::from(value("--names")?)),
             "-h" | "--help" => {
                 println!("{}", usage());
@@ -122,23 +177,35 @@ fn parse(words: impl Iterator<Item = String>) -> anyhow::Result<Args> {
     Ok(Args {
         clips: clips.ok_or_else(|| missing("--clips"))?,
         out: out.ok_or_else(|| missing("--out"))?,
+        poses: poses.ok_or_else(|| missing("--poses"))?,
+        poses_out: poses_out.ok_or_else(|| missing("--poses-out"))?,
         names: names.ok_or_else(|| missing("--names"))?,
     })
 }
 
-/// Read the documents, emit both files, and say what was written.
+/// Read the documents, emit all three files, and say what was written.
+///
+/// The poses are read before the probes are written because the probes step
+/// between the antenna folds the pose documents author: a probe is an
+/// instrument whose poses are the machine's own, and the machine's own are now
+/// the library's.
 fn run(args: &Args, say: &mut dyn FnMut(String)) -> anyhow::Result<()> {
-    write_probes(&args.clips, say)?;
-    let texts = read_documents(&args.clips)?;
-    let emitted = emit(&texts)?;
+    let pose_texts = read_documents(&args.poses, reachy_poses::format::DOCUMENT_EXT, Descend::No)?;
+    let poses = load_poses(&pose_texts)?;
+    write_probes(&args.clips, &Folds::of(&poses)?, say)?;
+    let texts = read_documents(&args.clips, DOCUMENT_EXT, Descend::Yes)?;
+    let emitted = emit(&texts, &poses)?;
     write(&args.out, &emitted.textproto)?;
+    write(&args.poses_out, &emitted.poses_textproto)?;
     write(&args.names, &emitted.names_json())?;
     emitted.report(say);
     say(format!(
-        "{} clip(s) and {} motion(s) to {} and {}",
+        "{} clip(s), {} motion(s) and {} pose(s) to {}, {} and {}",
         emitted.clips.len(),
         emitted.motions.len(),
+        emitted.poses.len(),
         args.out.display(),
+        args.poses_out.display(),
         args.names.display()
     ));
     Ok(())
@@ -146,19 +213,19 @@ fn run(args: &Args, say: &mut dyn FnMut(String)) -> anyhow::Result<()> {
 
 /// Write every probe document from its table, before the walk reads them.
 ///
-/// The probes are instruments whose poses are the tree's own constants, so they
+/// The probes are instruments whose poses are the library's own folds, so they
 /// are authored here rather than by hand: a document holding hundreds of copies
-/// of a delta is re-transcribed whenever the constant behind it moves, and a
+/// of a delta is re-transcribed whenever the fold behind it moves, and a
 /// stale one loads and emits exactly as happily as a fresh one. The rest of the
 /// library is recorded content and arrives as documents.
 ///
 /// The write is part of the emit rather than a target of its own so that `make
-/// clip-config` is one command for both halves, and so the asset can never be
-/// regenerated from probe documents the table has moved on from.
-fn write_probes(clips: &Path, say: &mut dyn FnMut(String)) -> anyhow::Result<()> {
+/// library-config` is one command for both halves, and so the asset can never
+/// be regenerated from probe documents the table has moved on from.
+fn write_probes(clips: &Path, folds: &Folds, say: &mut dyn FnMut(String)) -> anyhow::Result<()> {
     for probe in PROBES {
         let path = probe.path(clips);
-        let document = probe.document().with_context(|| {
+        let document = probe.document(folds).with_context(|| {
             format!("{}: the probe table does not author a document", probe.name)
         })?;
         if let Some(parent) = path.parent() {
@@ -171,16 +238,26 @@ fn write_probes(clips: &Path, say: &mut dyn FnMut(String)) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Every document under `dir`, by path ascending, text and all.
+/// Every `ext` document under `dir`, by path ascending, text and all.
+///
+/// One walk for both libraries, through the rule's one home
+/// ([`reachy_clips::files`]): what differs between them is the extension and
+/// whether the walk descends — the clips are a tree that grows a subdirectory
+/// per imported set, the poses a flat handful authored one at a time — and not
+/// which entries count or the sort that fixes an id.
 ///
 /// A file that will not read fails the emit rather than being carried as its own
-/// error: the asset this writes is a numbering, and a numbering with a hole in
+/// error: each asset this writes is a numbering, and a numbering with a hole in
 /// it is worse than no asset.
-fn read_documents(dir: &Path) -> anyhow::Result<Vec<(String, String)>> {
-    let entries =
-        documents(dir).with_context(|| format!("cannot read the directory {}", dir.display()))?;
+fn read_documents(
+    dir: &Path,
+    ext: &str,
+    descend: Descend,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let entries = documents(dir, ext, descend)
+        .with_context(|| format!("cannot read the directory {}", dir.display()))?;
     if entries.is_empty() {
-        bail!("no *.json under {}", dir.display());
+        bail!("no *.{ext} under {}", dir.display());
     }
     entries
         .into_iter()
@@ -191,32 +268,72 @@ fn read_documents(dir: &Path) -> anyhow::Result<Vec<(String, String)>> {
         .collect()
 }
 
-/// What one emit produced: the asset, and the two numberings in it.
+/// The pose documents, loaded, in the order they were read.
+///
+/// Every document is run through the loader the cogs' own screen sits behind —
+/// the envelope check included — so a pose outside what the machine may be
+/// commanded to never becomes an asset. A document that will not load refuses
+/// the whole emit, as a clip document's does, and so does one whose name is not
+/// its file stem: the stem is how an author finds the document a script names,
+/// and the two disagreeing is a library nobody can navigate.
+fn load_poses(texts: &[(String, String)]) -> anyhow::Result<Vec<LoadedPose>> {
+    let mut poses = Vec::with_capacity(texts.len());
+    for (source, text) in texts {
+        let pose = LoadedPose::from_text(text)
+            .with_context(|| format!("{source} is not a pose document"))?;
+        let stem = Path::new(source)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if pose.name() != stem {
+            bail!(
+                "{source} authors the pose {:?}; a pose document's name is its file stem",
+                pose.name()
+            );
+        }
+        poses.push(pose);
+    }
+    Ok(poses)
+}
+
+/// What one emit produced: the two assets, and the three numberings in them.
 #[derive(Debug)]
 struct Emitted {
-    /// The protobuf text, ready to write.
+    /// The clip library's protobuf text, ready to write.
     textproto: String,
+    /// The pose library's protobuf text, ready to write.
+    poses_textproto: String,
     /// The clips, in clip-id order.
     clips: Numbering,
     /// The motions, in motion-id order.
     motions: Numbering,
+    /// The poses, in pose-id order.
+    poses: Numbering,
     /// What the load changed about the assets it accepted, as lines.
     notes: Vec<String>,
 }
 
-/// One asset of a numbering: the name its id is looked up by, and how many
-/// parts it carries.
+/// One asset of a numbering: the name its id is looked up by, and whatever its
+/// kind states beside the name.
 #[derive(Debug)]
 struct EmittedAsset {
     /// The library name, which is what a script or schedule author looks the id
     /// up by.
     name: String,
     /// How many parts it holds — frames for a clip, segments for a motion.
-    parts: usize,
-    /// How long invoking it occupies a timeline, for the numberings whose ids a
-    /// script can name. Clips are numbered too and no script names one, so
-    /// theirs is `None`.
-    window: Option<MotionWindow>,
+    /// `None` where the kind has no parts: a pose is one configuration.
+    parts: Option<usize>,
+    /// What its kind states beside the name, where it states anything.
+    extra: Option<Extra>,
+}
+
+/// The columns a numbering carries beside a name, by kind.
+#[derive(Clone, Copy, Debug)]
+enum Extra {
+    /// How long invoking a motion occupies a timeline.
+    Window(MotionWindow),
+    /// The pace of a move to a pose when the command states none, milliseconds.
+    Pace(u32),
 }
 
 /// How long a motion occupies a timeline, as the sidecar states it.
@@ -235,20 +352,27 @@ struct MotionWindow {
 
 /// One numbering of the emit, and the words it is stated in.
 ///
-/// Both numberings are the same thing — a name at a position with a count
-/// beside it — and they go out three times each: as a report line, as a header
-/// comment in the asset, and as a table in the sidecar. One type rendering all
-/// three is what keeps a name table from drifting from the numbering the box
-/// loads, which is a wrong-motion-invoked failure at the machine.
+/// All three numberings are the same thing — a name at a position, with
+/// whatever its kind states beside it — and each goes out three times: as a
+/// report line, as a header comment in the asset, and as a table in the
+/// sidecar. One type rendering all three is what keeps a name table from
+/// drifting from the numbering the box binds, which is a wrong-motion-invoked
+/// or wrong-pose-commanded failure at the machine. What differs between the
+/// kinds is columns, not rendering: a clip counts frames, a motion counts
+/// segments and occupies a window, a pose counts nothing and states a pace.
 #[derive(Debug)]
 struct Numbering {
-    /// What one entry is: `clip` or `motion`. The report line's word and the
-    /// sidecar's id key are both built from it.
+    /// What one entry is: `clip`, `motion` or `pose`. The report line's word
+    /// and the sidecar's id key are both built from it.
     noun: &'static str,
-    /// What an entry's parts are: `frame` or `segment`.
-    part: &'static str,
+    /// What an entry's parts are: `frame` or `segment`. `Some` exactly when the
+    /// entries carry a part count.
+    part: Option<&'static str>,
     /// The assets, in id order.
     entries: Vec<EmittedAsset>,
+    /// The id the library reserves, where it reserves one: the pose named
+    /// `stow`, which the report marks.
+    reserved: Option<u16>,
 }
 
 impl Numbering {
@@ -265,14 +389,39 @@ impl Numbering {
             .zip(parts)
             .map(|(name, parts)| EmittedAsset {
                 name: name.clone(),
-                parts,
-                window: None,
+                parts: Some(parts),
+                extra: None,
             })
             .collect();
         Self {
             noun,
-            part,
+            part: Some(part),
             entries,
+            reserved: None,
+        }
+    }
+
+    /// The numbering over the poses of an emitted library: the name each was
+    /// loaded under, the pace the message states for it, and the id the library
+    /// reserves for the stow.
+    ///
+    /// The pace comes from the written message and not from the document it was
+    /// written from, for the reason the motions' windows come off the validated
+    /// library: the sidecar states the number the edge compiles a step against,
+    /// and a second derivation of it is a second opinion.
+    fn of_poses(entries: impl IntoIterator<Item = (String, u32)>, stow: u16) -> Self {
+        Self {
+            noun: "pose",
+            part: None,
+            entries: entries
+                .into_iter()
+                .map(|(name, duration_ms)| EmittedAsset {
+                    name,
+                    parts: None,
+                    extra: Some(Extra::Pace(duration_ms)),
+                })
+                .collect(),
+            reserved: Some(stow),
         }
     }
 
@@ -293,7 +442,7 @@ impl Numbering {
             "one window per numbered asset"
         );
         for (entry, window) in self.entries.iter_mut().zip(windows) {
-            entry.window = Some(window);
+            entry.extra = Some(Extra::Window(window));
         }
         self
     }
@@ -311,10 +460,17 @@ impl Numbering {
     /// One line per asset, under the id it is invoked by.
     fn report(&self, say: &mut dyn FnMut(String)) {
         for (id, asset) in self.entries.iter().enumerate() {
-            say(format!(
-                "{} {id}  {}  {} {}(s)",
-                self.noun, asset.name, asset.parts, self.part
-            ));
+            let mut line = format!("{} {id}  {}", self.noun, asset.name);
+            if let (Some(parts), Some(part)) = (asset.parts, self.part) {
+                let _ = write!(line, "  {parts} {part}(s)");
+            }
+            if let Some(Extra::Pace(duration_ms)) = asset.extra {
+                let _ = write!(line, "  {duration_ms} ms");
+            }
+            if matches!(self.reserved, Some(reserved) if u16::try_from(id) == Ok(reserved)) {
+                line.push_str("  (the stow)");
+            }
+            say(line);
         }
     }
 
@@ -327,9 +483,15 @@ impl Numbering {
                 let mut row = serde_json::Map::new();
                 row.insert(format!("{}_id", self.noun), json!(id));
                 row.insert("name".to_owned(), json!(asset.name));
-                if let Some(window) = asset.window {
-                    row.insert("duration_ms".to_owned(), json!(window.duration_ms));
-                    row.insert("blend_out_ms".to_owned(), json!(window.blend_out_ms));
+                match asset.extra {
+                    Some(Extra::Window(window)) => {
+                        row.insert("duration_ms".to_owned(), json!(window.duration_ms));
+                        row.insert("blend_out_ms".to_owned(), json!(window.blend_out_ms));
+                    }
+                    Some(Extra::Pace(duration_ms)) => {
+                        row.insert("duration_ms".to_owned(), json!(duration_ms));
+                    }
+                    None => {}
                 }
                 serde_json::Value::Object(row)
             })
@@ -356,18 +518,24 @@ impl Emitted {
         }
         self.clips.report(say);
         self.motions.report(say);
+        self.poses.report(say);
     }
 
-    /// The name sidecar: both id-to-name tables as JSON, for the host-side
+    /// The name sidecar: all three id-to-name tables as JSON, for the host-side
     /// scripter that has to turn a name into the number the wire carries.
     ///
-    /// Two tables, each keyed by its own id space. A schedule resolves names
-    /// against the motions; the clips are there because a clip id is what a
-    /// motion's segments name. A motion row also carries its window, which is
-    /// what an edge compiling a `play` step into a timed one needs and cannot
-    /// derive: the assets are not deployed where the compile runs.
+    /// Three tables, each keyed by its own id space. A script's `play` step
+    /// resolves against the motions and its base step against the poses; the
+    /// clips are there because a clip id is what a motion's segments name. A
+    /// motion row also carries its window and a pose row its pace, which is what
+    /// an edge compiling a step into a timed one needs and cannot derive: the
+    /// assets are not deployed where the compile runs.
     fn names_json(&self) -> String {
-        let table = json!({"clips": self.clips.table(), "motions": self.motions.table()});
+        let table = json!({
+            "clips": self.clips.table(),
+            "motions": self.motions.table(),
+            "poses": self.poses.table(),
+        });
         format!(
             "{}\n",
             serde_json::to_string_pretty(&table).expect("a table of strings and numbers is JSON")
@@ -375,12 +543,12 @@ impl Emitted {
     }
 }
 
-/// Turn the documents into the asset, or refuse.
+/// Turn the documents into the two assets, or refuse.
 ///
 /// Pure: no clock, no filesystem, no environment. Everything the emitted bytes
-/// depend on arrives in `texts`, which is what lets a case compare a fresh emit
-/// against the checked-in file byte for byte.
-fn emit(texts: &[(String, String)]) -> anyhow::Result<Emitted> {
+/// depend on arrives in `texts` and `poses`, which is what lets a case compare
+/// a fresh emit against the checked-in files byte for byte.
+fn emit(texts: &[(String, String)], poses: &[LoadedPose]) -> anyhow::Result<Emitted> {
     // The geometry and envelope the loader walks every clip's frames against:
     // the machine's own, so what this accepts is what the tick can command.
     let limits = ClipLimits::default();
@@ -489,12 +657,75 @@ fn emit(texts: &[(String, String)]) -> anyhow::Result<Emitted> {
         motions.iter().map(|motion| motion.segments().len()),
     )
     .windowed(windows);
+
+    // The pose library, written and read back the same way: the mapping's, then
+    // the message's own validation, then the screen every consumer runs on the
+    // library its dial hands it. What this writes is therefore a library the
+    // session will not refuse at startup.
+    let mut pose_message = PoseLibraryConfigWire::new_boxed();
+    reachy_poses::config::write_library(poses, pose_message.clear_valid())
+        .context("the poses are not a library")?;
+    let pose_written = pose_message
+        .validate()
+        .context("the emitted pose library is not a message this build can read")?;
+    reachy_poses::config::screen(pose_written)
+        .context("the emitted pose library does not screen")?;
+    assert_eq!(
+        pose_written.poses.len(),
+        poses.len(),
+        "every pose written has a name"
+    );
+    let numbered_poses = Numbering::of_poses(
+        poses
+            .iter()
+            .zip(pose_written.poses.iter())
+            .map(|(pose, written)| (pose.name().to_owned(), pace_ms(written.duration_ns))),
+        pose_written.stow,
+    );
+
     Ok(Emitted {
         textproto: print_library(written, &clips, &motions),
+        poses_textproto: print_poses(pose_written, &numbered_poses),
         clips,
         motions,
+        poses: numbered_poses,
         notes: library.notes().iter().map(ToString::to_string).collect(),
     })
+}
+
+/// The pose message as the protobuf text a box binds.
+///
+/// Written from the message rather than from the loaded poses, so the text
+/// states what the mapping produced and not a second opinion about it. Every
+/// field is stated, zeros included, for the reason a frame's are: the generated
+/// conversion gives every field explicit presence, so an omitted zero is a
+/// configuration that will not load rather than a default.
+fn print_poses(library: &PoseLibraryConfig, poses: &Numbering) -> String {
+    let mut out = String::from(POSE_HEADER);
+    poses.header(&mut out);
+    for (pose_id, pose) in library.poses.iter().enumerate() {
+        let _ = writeln!(out, "\n# {}", poses.name(pose_id));
+        print_pose(&mut out, pose);
+    }
+    let _ = writeln!(
+        out,
+        "\n# where the machine rests: the pose named {:?}\nstow: {}",
+        poses.name(usize::from(library.stow)),
+        library.stow
+    );
+    out
+}
+
+/// One pose: every field of it, in the schema's declared order.
+///
+/// The fields are the mapping's own table, as a frame's are: a channel added to
+/// a pose is a row there and not an edit here.
+fn print_pose(out: &mut String, pose: &PoseConfig) {
+    let _ = writeln!(out, "poses {{");
+    for field in &POSE_FIELDS {
+        let _ = writeln!(out, "  {}: {}", field.key, number((field.get)(pose)));
+    }
+    let _ = writeln!(out, "  {PACE_FIELD}: {}\n}}", pose.duration_ns);
 }
 
 /// The message as the protobuf text a box binds.
@@ -581,6 +812,22 @@ fn ms_ceil(seconds: f64) -> u64 {
     (seconds * 1000.0).ceil() as u64
 }
 
+/// A pose's pace as the sidecar states it: the message's nanoseconds as whole
+/// milliseconds, rounded up.
+///
+/// Up for the reason a motion's window rounds up: the number is a duration a
+/// compile lays a step out against, and rounding a sub-millisecond remainder
+/// away would state a pace the move is still running at the end of. The message
+/// has screened, so the value is positive and minutes at most.
+///
+/// # Panics
+///
+/// If the message's pace is negative, which the screen refuses.
+fn pace_ms(duration_ns: i64) -> u32 {
+    let ns = u64::try_from(duration_ns).expect("a screened pace is positive");
+    u32::try_from(ns.div_ceil(1_000_000)).expect("a screened pace is minutes at most")
+}
+
 /// Write `text` to `path`, saying which file it was on the way out.
 fn write(path: &Path, text: &str) -> anyhow::Result<()> {
     std::fs::write(path, text).with_context(|| format!("cannot write {}", path.display()))
@@ -598,7 +845,7 @@ mod tests {
 
     use super::probe_clips::Pose;
 
-    /// The environment variable naming the committed documents' directory,
+    /// The environment variable naming the committed clip documents' directory,
     /// relative to the runfiles root, which is a test's working directory.
     ///
     /// Read rather than embedded: the library is a tree of documents that grows
@@ -606,28 +853,42 @@ mod tests {
     /// code change.
     const DOCUMENTS_ENV: &str = "CLIP_DOCUMENTS";
 
-    /// The asset those documents emit, as committed.
+    /// The environment variable naming the committed pose documents'
+    /// directory, for the reason [`DOCUMENTS_ENV`] is read rather than
+    /// embedded.
+    const POSES_ENV: &str = "POSE_DOCUMENTS";
+
+    /// The clip asset those documents emit, as committed.
     const ASSET: &str = include_str!("clip_library.textproto");
 
-    /// The name sidecar, as committed.
-    const NAMES: &str = include_str!("clip_library.names.json");
+    /// The pose asset the pose documents emit, as committed.
+    const POSE_ASSET: &str = include_str!("pose_library.textproto");
 
-    /// The directory the committed documents are in.
+    /// The name sidecar both libraries share, as committed.
+    const NAMES: &str = include_str!("library.names.json");
+
+    /// The directory a named environment variable points at.
     ///
     /// Panics rather than answers: a missing runfile is a broken test target,
     /// not a case.
-    fn documents_root() -> PathBuf {
-        let named = std::env::var(DOCUMENTS_ENV).unwrap_or_else(|_| {
+    fn root_of(variable: &str) -> PathBuf {
+        let named = std::env::var(variable).unwrap_or_else(|_| {
             panic!(
-                "{DOCUMENTS_ENV} is unset: the test target has to name the directory beside the \
-                 data attribute that supplies it"
+                "{variable} is unset: the test target has to name the directory beside the data \
+                 attribute that supplies it"
             )
         });
         PathBuf::from(named)
     }
 
-    /// Every committed document, by path ascending — the same walk the tool's
-    /// own run does, so what these cases emit is what `make clip-config` emits.
+    /// The directory the committed clip documents are in.
+    fn documents_root() -> PathBuf {
+        root_of(DOCUMENTS_ENV)
+    }
+
+    /// Every committed clip document, by path ascending — the same walk the
+    /// tool's own run does, so what these cases emit is what `make
+    /// library-config` emits.
     ///
     /// Panics below two documents: a runfiles arrangement that supplies none
     /// would otherwise emit an empty library, and comparing that against the
@@ -636,6 +897,38 @@ mod tests {
     fn texts() -> Vec<(String, String)> {
         static READ: OnceLock<Vec<(String, String)>> = OnceLock::new();
         READ.get_or_init(|| texts_under(&documents_root())).clone()
+    }
+
+    /// Every committed pose document, by path ascending, through the tool's own
+    /// walk.
+    fn pose_texts() -> Vec<(String, String)> {
+        static READ: OnceLock<Vec<(String, String)>> = OnceLock::new();
+        READ.get_or_init(|| {
+            let root = root_of(POSES_ENV);
+            let read = read_documents(&root, reachy_poses::format::DOCUMENT_EXT, Descend::No)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error:#}", root.display()));
+            assert!(
+                read.len() >= 2,
+                "{} holds {} pose document(s): the test target's data attribute is not supplying \
+                 them",
+                root.display(),
+                read.len()
+            );
+            read
+        })
+        .clone()
+    }
+
+    /// The committed pose documents, loaded, for every case that emits.
+    fn poses() -> &'static [LoadedPose] {
+        static LOADED: OnceLock<Vec<LoadedPose>> = OnceLock::new();
+        LOADED.get_or_init(|| load_poses(&pose_texts()).expect("the committed pose documents load"))
+    }
+
+    /// The folds the committed poses author, which the probe table steps
+    /// between.
+    fn folds() -> Folds {
+        Folds::of(poses()).expect("the committed library holds both reserved poses")
     }
 
     /// The emit of the committed tree, done once for every case that only reads
@@ -647,13 +940,13 @@ mod tests {
     /// mutates what this hands back.
     fn baseline() -> &'static Emitted {
         static EMITTED: OnceLock<Emitted> = OnceLock::new();
-        EMITTED.get_or_init(|| emit(&texts()).expect("the checked-in documents emit"))
+        EMITTED.get_or_init(|| emit(&texts(), poses()).expect("the checked-in documents emit"))
     }
 
     /// [`texts`] over a named directory, so the guard below has something to
     /// point at that is not the runfiles.
     fn texts_under(root: &Path) -> Vec<(String, String)> {
-        let read = documents(root)
+        let read = documents(root, DOCUMENT_EXT, Descend::Yes)
             .unwrap_or_else(|error| panic!("cannot read {}: {error}", root.display()));
         assert!(
             read.len() >= 2,
@@ -679,17 +972,17 @@ mod tests {
     /// A runfiles arrangement that supplies no documents is a broken test
     /// target and has to read as one. Without this the drift case emits an
     /// empty library, the comparison fails as staleness, and the invited
-    /// `make clip-config` writes that empty library over the real asset.
+    /// `make library-config` writes that empty library over the real asset.
     #[test]
     #[should_panic(expected = "document(s)")]
     fn a_walk_that_finds_no_tree_is_a_broken_target_rather_than_an_empty_library() {
-        let empty = scratch_dir("gen-clip-config-empty-tree");
+        let empty = scratch_dir("gen-library-config-empty-tree");
         let _ = texts_under(empty.as_ref());
     }
 
     /// The documents the cases emit are the committed tree itself, walked the
     /// way the tool walks it: the drift check is against what `make
-    /// clip-config` would read, not against a list of names in this file.
+    /// library-config` would read, not against a list of names in this file.
     #[test]
     fn the_walk_finds_the_committed_documents_in_the_tree() {
         let sources: Vec<String> = texts().into_iter().map(|(source, _)| source).collect();
@@ -709,12 +1002,16 @@ mod tests {
         let emitted = baseline();
         assert_eq!(
             emitted.textproto, ASSET,
-            "cogs/clip_library.textproto is stale; run `make clip-config`"
+            "cogs/clip_library.textproto is stale; run `make library-config`"
+        );
+        assert_eq!(
+            emitted.poses_textproto, POSE_ASSET,
+            "cogs/pose_library.textproto is stale; run `make library-config`"
         );
         assert_eq!(
             emitted.names_json(),
             NAMES,
-            "cogs/clip_library.names.json is stale; run `make clip-config`"
+            "cogs/library.names.json is stale; run `make library-config`"
         );
     }
 
@@ -739,16 +1036,10 @@ mod tests {
     fn a_note_is_said_before_the_numberings() {
         let emitted = Emitted {
             textproto: String::new(),
-            clips: Numbering {
-                noun: "clip",
-                part: "frame",
-                entries: Vec::new(),
-            },
-            motions: Numbering {
-                noun: "motion",
-                part: "segment",
-                entries: Vec::new(),
-            },
+            poses_textproto: String::new(),
+            clips: Numbering::of("clip", "frame", &[], []),
+            motions: Numbering::of("motion", "segment", &[], []),
+            poses: Numbering::of_poses([], 0),
             notes: vec!["bench/nod: the derivation changed something".to_owned()],
         };
         let mut said = Vec::new();
@@ -789,10 +1080,10 @@ mod tests {
     /// The committed probe documents are what the table authors, byte for byte.
     ///
     /// The same gate the emitted asset has, one level up: a probe's poses are
-    /// the tree's own constants, and a document holding hundreds of copies of a
-    /// delta the constant has moved off would load, emit and hold exactly as
+    /// the library's own folds, and a document holding hundreds of copies of a
+    /// delta the fold has moved off would load, emit and hold exactly as
     /// happily while reading as the instrument it no longer is. Answered by
-    /// `make clip-config`, which rewrites them.
+    /// `make library-config`, which rewrites them.
     #[test]
     fn the_committed_probe_documents_are_what_the_table_authors() {
         let texts = texts();
@@ -804,8 +1095,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} is not a committed document", probe.name));
             assert_eq!(
                 *text,
-                probe.document().expect("the table authors a document"),
-                "{source} is stale; run `make clip-config`"
+                probe
+                    .document(&folds())
+                    .expect("the table authors a document"),
+                "{source} is stale; run `make library-config`"
             );
         }
         // And nothing under `probe/` is a hand-authored document the table has
@@ -835,8 +1128,9 @@ mod tests {
     /// Every named pose is counted rather than eyeballed: the step probes hold
     /// theirs 325 frames each — 6.5 s, the watch's shortest judgeable hold and
     /// half a second — and the sweep passes through its own on the frames its
-    /// ramps hand over on. The figures are differences of the antenna constants,
-    /// so a moved fold or sideways point fails here.
+    /// ramps hand over on. The figures are differences of the library's own
+    /// folds and the antennas' outboard constant, so a moved fold or sideways
+    /// point fails here.
     ///
     /// The entry blend is pinned at zero for a related reason: it is a *weight*
     /// ramp over the whole delta a frame carries, so a probe taking the format's
@@ -851,14 +1145,14 @@ mod tests {
         let motions = sidecar["motions"].as_array().expect("a motions table");
         for probe in PROBES {
             let name = probe.name;
-            let frames = probe.antenna_frames().expect("the table chains");
+            let frames = probe.antenna_frames(&folds()).expect("the table chains");
             let clip = emitted
                 .clips
                 .entries
                 .iter()
                 .find(|clip| clip.name == name)
                 .unwrap_or_else(|| panic!("{name} is not in the library"));
-            assert_eq!(clip.parts, frames.len(), "{name}");
+            assert_eq!(clip.parts, Some(frames.len()), "{name}");
             let motion = motions
                 .iter()
                 .find(|row| row["name"] == json!(name))
@@ -876,7 +1170,7 @@ mod tests {
                 "{name}: {block:.200}"
             );
             for pose in [Pose::Up, Pose::Sides, Pose::Down, Pose::HalfDown] {
-                let angles = pose.antennas();
+                let angles = pose.antennas(&folds());
                 let printed = format!(
                     "antenna_right_d: {} antenna_left_d: {}",
                     number(angles[0]),
@@ -900,9 +1194,9 @@ mod tests {
             .iter()
             .find(|probe| probe.name == "probe/antenna-sweep")
             .expect("the sweep is in the table");
-        let frames = sweep.antenna_frames().expect("the table chains");
+        let frames = sweep.antenna_frames(&folds()).expect("the table chains");
         assert_eq!(frames.len(), 775);
-        let base = Pose::Up.antennas();
+        let base = Pose::Up.antennas(&folds());
         let tail = frames
             .iter()
             .rev()
@@ -929,7 +1223,7 @@ mod tests {
         let mut reversed = texts();
         reversed.reverse();
         let forward = baseline();
-        let backward = emit(&reversed).expect("the documents emit either way");
+        let backward = emit(&reversed, poses()).expect("the documents emit either way");
         let names = |emitted: &Emitted| -> Vec<String> {
             emitted
                 .clips
@@ -976,7 +1270,7 @@ mod tests {
         broken[1].1 = doc(&broken[1].1, |value| {
             value["frame_hz"] = json!(30.0);
         });
-        let error = emit(&broken).expect_err("a clip on another grid is refused");
+        let error = emit(&broken, poses()).expect_err("a clip on another grid is refused");
         let text = format!("{error:#}");
         assert!(text.contains("numbering is refused"), "{text}");
         assert!(text.contains("perk"), "{text}");
@@ -992,7 +1286,7 @@ mod tests {
         clashing[1].1 = doc(&clashing[1].1, |value| {
             value["name"] = json!("bench/nod");
         });
-        let error = emit(&clashing).expect_err("a duplicate name is refused");
+        let error = emit(&clashing, poses()).expect_err("a duplicate name is refused");
         let text = format!("{error:#}");
         assert!(text.contains("numbering is refused"), "{text}");
         assert!(text.contains("bench/nod"), "{text}");
@@ -1004,7 +1298,7 @@ mod tests {
     /// empty.
     #[test]
     fn documents_with_no_clip_in_them_are_refused() {
-        let error = emit(&[]).expect_err("there is no library in nothing");
+        let error = emit(&[], poses()).expect_err("there is no library in nothing");
         assert!(
             format!("{error:#}").contains("none of the documents is a clip"),
             "{error:#}"
@@ -1041,7 +1335,7 @@ mod tests {
                 ]),
             ),
         ));
-        let emitted = emit(&with_sequence).expect("a sequence emits");
+        let emitted = emit(&with_sequence, poses()).expect("a sequence emits");
 
         // The committed documents, and then this one: the numbering is the read
         // order, so the sequence written last is the last motion.
@@ -1055,7 +1349,7 @@ mod tests {
         assert_eq!(names.last(), Some(&"bench/greeting"), "{names:?}");
 
         // Two clips strung together, with the leading gap held apart from them.
-        assert_eq!(emitted.motions.entries[motion_id].parts, 2);
+        assert_eq!(emitted.motions.entries[motion_id].parts, Some(2));
         assert!(
             emitted
                 .textproto
@@ -1114,7 +1408,7 @@ mod tests {
                 .iter()
                 .find(|motion| motion.name == clip.name)
                 .unwrap_or_else(|| panic!("{} plays as a motion", clip.name));
-            assert_eq!(motion.parts, 1);
+            assert_eq!(motion.parts, Some(1));
         }
     }
 
@@ -1136,7 +1430,7 @@ mod tests {
                 sequence(&format!("bench/seq{index}"), json!([{"ref": "bench/clip"}])),
             ));
         }
-        let error = emit(&many).expect_err("thirty-three motions do not fit");
+        let error = emit(&many, poses()).expect_err("thirty-three motions do not fit");
         let text = format!("{error:#}");
         assert!(text.contains("does not fit the message"), "{text}");
         assert!(
@@ -1166,7 +1460,7 @@ mod tests {
                 sequence("bench/long", json!(entries)),
             ),
         ];
-        let error = emit(&many).expect_err("thirty-three segments do not fit");
+        let error = emit(&many, poses()).expect_err("thirty-three segments do not fit");
         let text = format!("{error:#}");
         assert!(text.contains("numbering is refused"), "{text}");
         assert!(
@@ -1187,7 +1481,7 @@ mod tests {
             "cogs/clips/zgreeting.json".to_owned(),
             sequence("bench/greeting", json!([{"ref": "bench/nope"}])),
         ));
-        let error = emit(&dangling).expect_err("a reference to nothing is refused");
+        let error = emit(&dangling, poses()).expect_err("a reference to nothing is refused");
         let text = format!("{error:#}");
         assert!(text.contains("numbering is refused"), "{text}");
         assert!(text.contains("bench/greeting"), "{text}");
@@ -1208,7 +1502,7 @@ mod tests {
                 )
             })
             .collect();
-        let error = emit(&many).expect_err("seventeen clips do not fit");
+        let error = emit(&many, poses()).expect_err("seventeen clips do not fit");
         assert!(
             format!("{error:#}").contains("does not fit the message"),
             "{error:#}"
@@ -1282,16 +1576,25 @@ mod tests {
 
     /// The arguments, and the two ways of getting them wrong.
     #[test]
-    fn the_arguments_are_all_three_or_a_refusal() {
+    fn the_arguments_are_all_five_or_a_refusal() {
         fn words(line: &str) -> impl Iterator<Item = String> + '_ {
             line.split_whitespace().map(ToOwned::to_owned)
         }
-        let args = parse(words("--clips a --out b --names c")).expect("all three are given");
+        let args = parse(words("--clips a --out b --poses c --poses-out d --names e"))
+            .expect("all five are given");
         assert_eq!(args.clips, PathBuf::from("a"));
         assert_eq!(args.out, PathBuf::from("b"));
-        assert_eq!(args.names, PathBuf::from("c"));
+        assert_eq!(args.poses, PathBuf::from("c"));
+        assert_eq!(args.poses_out, PathBuf::from("d"));
+        assert_eq!(args.names, PathBuf::from("e"));
 
-        let missing = parse(words("--clips a --out b")).expect_err("--names is required");
+        // Neither library may be emitted without the other: one sidecar numbers
+        // both, and a run that wrote it from half the documents would state a
+        // table with nothing behind it.
+        let half = parse(words("--clips a --out b --names c")).expect_err("--poses is required");
+        assert!(format!("{half:#}").contains("--poses is required"));
+        let missing = parse(words("--clips a --out b --poses c --poses-out d"))
+            .expect_err("--names is required");
         assert!(format!("{missing:#}").contains("--names is required"));
         let dangling = parse(words("--clips")).expect_err("a flag wants a value");
         assert!(format!("{dangling:#}").contains("--clips wants a value"));
@@ -1302,10 +1605,16 @@ mod tests {
     /// The whole tool over a directory, which is the one thing the pure emit
     /// cannot cover: what it reads, what it writes, and what it says.
     #[test]
-    fn the_tool_writes_both_files_and_reports_every_clip() {
-        let dir = scratch_dir("gen-clip-config-tool");
+    fn the_tool_writes_all_three_files_and_reports_every_asset() {
+        let dir = scratch_dir("gen-library-config-tool");
         let clips = dir.join("clips");
+        let pose_dir = dir.join("poses");
         std::fs::create_dir_all(&clips).expect("a temporary directory");
+        std::fs::create_dir_all(&pose_dir).expect("a temporary directory");
+        for (source, text) in pose_texts() {
+            let name = Path::new(&source).file_name().expect("a file name");
+            std::fs::write(pose_dir.join(name), text).expect("the pose document is written");
+        }
         let root = documents_root();
         for (source, text) in texts() {
             // Copied at the same relative depth: a document's id is its full
@@ -1323,13 +1632,19 @@ mod tests {
         let args = Args {
             clips,
             out: dir.join("clip_library.textproto"),
-            names: dir.join("clip_library.names.json"),
+            poses: pose_dir,
+            poses_out: dir.join("pose_library.textproto"),
+            names: dir.join("library.names.json"),
         };
         let mut said = Vec::new();
         run(&args, &mut |line| said.push(line)).expect("the tool runs");
         assert_eq!(
             std::fs::read_to_string(&args.out).expect("the asset was written"),
             ASSET
+        );
+        assert_eq!(
+            std::fs::read_to_string(&args.poses_out).expect("the pose asset was written"),
+            POSE_ASSET
         );
         assert_eq!(
             std::fs::read_to_string(&args.names).expect("the sidecar was written"),
@@ -1339,15 +1654,21 @@ mod tests {
             said.iter().any(|line| line.contains("bench/nod")),
             "{said:?}"
         );
+        assert!(
+            said.iter()
+                .any(|line| line.starts_with("pose ") && line.contains("(the stow)")),
+            "{said:?}"
+        );
         // Counted off the same walk rather than written in: the tree is
         // whatever is committed, and adding a document is not a change to this
         // case.
         let baseline = baseline();
         assert!(
             said.last().expect("a closing line").contains(&format!(
-                "{} clip(s) and {} motion(s)",
+                "{} clip(s), {} motion(s) and {} pose(s)",
                 baseline.clips.entries.len(),
-                baseline.motions.entries.len()
+                baseline.motions.entries.len(),
+                baseline.poses.entries.len()
             )),
             "{said:?}"
         );
@@ -1357,8 +1678,319 @@ mod tests {
     /// says so rather than emitting a library with no clips.
     #[test]
     fn an_empty_directory_is_refused() {
-        let dir = scratch_dir("gen-clip-config-empty");
-        let error = read_documents(dir.as_ref()).expect_err("nothing to read");
+        let dir = scratch_dir("gen-library-config-empty");
+        let error =
+            read_documents(dir.as_ref(), DOCUMENT_EXT, Descend::Yes).expect_err("nothing to read");
         assert!(format!("{error:#}").contains("no *.json"), "{error:#}");
+        let error = read_documents(
+            dir.as_ref(),
+            reachy_poses::format::DOCUMENT_EXT,
+            Descend::No,
+        )
+        .expect_err("nothing to read");
+        assert!(format!("{error:#}").contains("no *.textproto"), "{error:#}");
+    }
+
+    /// The pose documents the cases emit are the committed ones, walked the way
+    /// the tool walks them: the drift check is against what `make
+    /// library-config` would read.
+    #[test]
+    fn the_walk_finds_the_committed_pose_documents() {
+        let sources: Vec<String> = pose_texts().into_iter().map(|(source, _)| source).collect();
+        for name in ["neutral.textproto", "peek.textproto", "stow.textproto"] {
+            assert!(
+                sources.iter().any(|source| source.ends_with(name)),
+                "{name}: {sources:?}"
+            );
+        }
+        assert!(sources.windows(2).all(|pair| pair[0] < pair[1]), "sorted");
+    }
+
+    /// A pose id is the position of its document in the sort, and the `stow`
+    /// field is the index of the document named `stow` — the one reserved name
+    /// nothing that stows has to know a number for.
+    #[test]
+    fn a_pose_id_is_the_position_its_document_sorts_in() {
+        let emitted = baseline();
+        let names: Vec<&str> = emitted
+            .poses
+            .entries
+            .iter()
+            .map(|pose| pose.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["neutral", "peek", "stow"]);
+        assert_eq!(
+            usize::from(
+                emitted
+                    .poses
+                    .reserved
+                    .expect("the pose numbering names a stow")
+            ),
+            names
+                .iter()
+                .position(|name| *name == reachy_poses::STOW_POSE)
+                .expect("the library holds a stow")
+        );
+        assert!(
+            emitted.poses_textproto.contains(&format!(
+                "stow: {}",
+                emitted
+                    .poses
+                    .reserved
+                    .expect("the pose numbering names a stow")
+            )),
+            "{}",
+            emitted.poses_textproto
+        );
+    }
+
+    /// The sidecar's pose table and the asset's own comment table are one
+    /// table, and a row states the pace a move takes when the command states
+    /// none — what the edge needs and cannot derive.
+    #[test]
+    fn the_sidecar_states_every_pose_under_its_id_and_its_pace() {
+        let emitted = baseline();
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&emitted.names_json()).expect("the sidecar is JSON");
+        let listed = sidecar["poses"].as_array().expect("poses is an array");
+        assert_eq!(listed.len(), emitted.poses.len());
+        for (pose_id, pose) in emitted.poses.entries.iter().enumerate() {
+            assert_eq!(listed[pose_id]["pose_id"], json!(pose_id));
+            assert_eq!(listed[pose_id]["name"], json!(pose.name));
+            let Some(Extra::Pace(duration_ms)) = pose.extra else {
+                panic!("a pose row states a pace");
+            };
+            assert_eq!(listed[pose_id]["duration_ms"], json!(duration_ms));
+            assert!(
+                emitted
+                    .poses_textproto
+                    .contains(&format!("#   {pose_id}  {}", pose.name)),
+                "the asset's table is missing {pose_id}"
+            );
+        }
+        assert_eq!(
+            listed
+                .iter()
+                .find(|row| row["name"] == json!(reachy_poses::STOW_POSE))
+                .expect("the stow is numbered")["duration_ms"],
+            json!(2000)
+        );
+    }
+
+    /// A pose states every field, zeros included: the generated conversion
+    /// gives every field explicit presence, so an omitted zero is a
+    /// configuration that will not load rather than a default.
+    ///
+    /// Every channel carries a value of its own, so the text pins which field
+    /// each key is read from and not only the order of the keys: a row whose
+    /// key and accessor are mislabelled together round-trips through every
+    /// reader in this repo and commands a different head or the antennas on the
+    /// wrong side.
+    #[test]
+    fn a_pose_states_every_field_in_declared_order() {
+        let mut message = PoseLibraryConfigWire::new_boxed();
+        let library = message.clear_valid();
+        let slot = library.poses.try_grow().expect("the message holds a pose");
+        slot.dx = 0.1;
+        slot.dy = 0.2;
+        slot.dz = 0.3;
+        slot.qx = 0.4;
+        slot.qy = 0.5;
+        slot.qz = 0.6;
+        slot.body_yaw = 0.7;
+        slot.antenna_right = 0.8;
+        slot.antenna_left = 0.9;
+        slot.qw = 1.1;
+        slot.duration_ns = 800_000_000;
+        let mut out = String::new();
+        print_pose(&mut out, slot);
+        assert_eq!(
+            out,
+            "poses {\n  dx: 0.1\n  dy: 0.2\n  dz: 0.3\n  qw: 1.1\n  qx: 0.4\n  qy: 0.5\n  \
+             qz: 0.6\n  body_yaw: 0.7\n  antenna_right: 0.8\n  antenna_left: 0.9\n  \
+             duration_ns: 800000000\n}\n"
+        );
+    }
+
+    /// The report is what an operator reads after `make library-config`: which
+    /// id each name is invoked by, what the kind states beside it, and which
+    /// pose the machine rests at.
+    ///
+    /// Rendered here from a numbering of its own, so a marker against the wrong
+    /// row, a dropped pace column or a lost part count is this case rather than
+    /// a reading nobody takes.
+    #[test]
+    fn a_report_line_states_the_id_the_name_and_what_the_kind_carries() {
+        let mut said = Vec::new();
+        Numbering::of_poses(
+            [
+                ("neutral".to_owned(), 800),
+                ("stow".to_owned(), 2000),
+                ("peek".to_owned(), 650),
+            ],
+            1,
+        )
+        .report(&mut |line| said.push(line));
+        assert_eq!(
+            said,
+            [
+                "pose 0  neutral  800 ms",
+                "pose 1  stow  2000 ms  (the stow)",
+                "pose 2  peek  650 ms",
+            ]
+        );
+
+        let mut said = Vec::new();
+        Numbering::of(
+            "clip",
+            "frame",
+            &["bench/nod".to_owned(), "bench/tour".to_owned()],
+            [42, 85],
+        )
+        .report(&mut |line| said.push(line));
+        assert_eq!(
+            said,
+            [
+                "clip 0  bench/nod  42 frame(s)",
+                "clip 1  bench/tour  85 frame(s)"
+            ]
+        );
+    }
+
+    /// A pace is whole milliseconds and a sub-millisecond remainder rounds up:
+    /// rounding it away would state a pace the move is still running at the end
+    /// of, and the edge lays a step out against the number.
+    #[test]
+    fn a_pace_rounds_a_sub_millisecond_remainder_up() {
+        assert_eq!(pace_ms(1_000_000), 1);
+        assert_eq!(pace_ms(1_000_001), 2);
+        assert_eq!(pace_ms(1_999_999), 2);
+        assert_eq!(pace_ms(2_000_000), 2);
+    }
+
+    /// The pace read out of the message is the screen's, and the screen refuses
+    /// a negative one: the reader says so rather than casting it into a large
+    /// positive pace.
+    #[test]
+    #[should_panic(expected = "a screened pace is positive")]
+    fn a_negative_pace_is_not_one_the_screen_let_through() {
+        let _ = pace_ms(-1);
+    }
+
+    /// What the emitted pose asset says is what the loaded documents say, read
+    /// back through the reader every consumer of a bound library uses.
+    #[test]
+    fn the_emitted_pose_asset_reads_back_as_the_documents_it_came_from() {
+        let emitted = baseline();
+        let message = reachy_poses::config::parse_library(&emitted.poses_textproto)
+            .expect("the emitted asset parses");
+        let library = message.validate().expect("the asset is a message");
+        let screened = reachy_poses::config::screen(library).expect("the asset screens");
+        assert_eq!(screened.len(), poses().len());
+        for (pose_id, pose) in poses().iter().enumerate() {
+            let id = u16::try_from(pose_id).expect("a pose id fits");
+            let (targets, pace) = screened.targets(id).expect("the pose is in the library");
+            assert_eq!(targets, *pose.targets());
+            assert_eq!(pace.as_millis(), u128::from(pose.duration_ms()));
+        }
+        assert_eq!(
+            screened.stow().0,
+            emitted
+                .poses
+                .reserved
+                .expect("the pose numbering names a stow")
+        );
+    }
+
+    /// A pose document whose name is not its file stem is refused: the stem is
+    /// how an author finds the document a script names.
+    #[test]
+    fn a_pose_document_that_is_not_named_for_its_file_is_refused() {
+        let mut renamed = pose_texts();
+        renamed[0].0 = renamed[0].0.replace("neutral", "resting");
+        let error = load_poses(&renamed).expect_err("the stem and the name disagree");
+        assert!(format!("{error:#}").contains("file stem"), "{error:#}");
+    }
+
+    /// A library with no `stow` is refused: every schedule ends at it, the
+    /// fault ladder commands it, and the disarm sequence judges folded against
+    /// it.
+    #[test]
+    fn a_library_with_no_stow_refuses_the_whole_emit() {
+        let mut without = pose_texts();
+        without.retain(|(source, _)| !source.ends_with("stow.textproto"));
+        let loaded = load_poses(&without).expect("the rest still load");
+        let error = emit(&texts(), &loaded).expect_err("a library needs a stow");
+        assert!(
+            format!("{error:#}").contains("no pose named stow"),
+            "{error:#}"
+        );
+    }
+
+    /// Two documents under one name is the authoring mistake that attacks the
+    /// numbering directly, as it is for a clip.
+    #[test]
+    fn two_pose_documents_claiming_one_name_refuse_the_whole_emit() {
+        let mut clashing = pose_texts();
+        let neutral = clashing[0].1.clone();
+        clashing.push(("cogs/poses/zneutral.textproto".to_owned(), neutral));
+        // Loaded directly: the file-stem rule would refuse this first, and what
+        // is under test is the emit's own opinion of the set.
+        let loaded: Vec<LoadedPose> = clashing
+            .iter()
+            .map(|(_, text)| LoadedPose::from_text(text).expect("the document loads"))
+            .collect();
+        let error = emit(&texts(), &loaded).expect_err("two poses under one name");
+        assert!(
+            format!("{error:#}").contains("two poses named"),
+            "{error:#}"
+        );
+    }
+
+    /// A pose outside the envelope never becomes an asset: the loader runs the
+    /// check every command path runs, and the emit is refused whole.
+    #[test]
+    fn a_pose_document_outside_the_envelope_refuses_the_whole_emit() {
+        let stow = pose_texts()
+            .into_iter()
+            .find(|(source, _)| source.ends_with("stow.textproto"))
+            .expect("the stow is committed");
+        let raised = stow
+            .1
+            .lines()
+            .map(|line| {
+                if line.starts_with("dt:") {
+                    "dt: [0.0, 0.0, 0.5]\n".to_owned()
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect::<String>();
+        let error = load_poses(&[(stow.0, raised)]).expect_err("half a metre up is not reachable");
+        assert!(format!("{error:#}").contains("envelope"), "{error:#}");
+    }
+
+    /// The probe documents step between the folds the library authors, so a
+    /// stow document the author moves moves the instruments with it.
+    #[test]
+    fn the_probe_folds_are_the_library_s_own() {
+        let folds = folds();
+        let antennas = |name: &str| {
+            poses()
+                .iter()
+                .find(|pose| pose.name() == name)
+                .expect("the pose is committed")
+                .targets()
+                .antennas
+        };
+        let (neutral, stow) = (antennas("neutral"), antennas(reachy_poses::STOW_POSE));
+        assert_eq!(
+            Pose::Down.antennas(&folds),
+            [stow[0] - neutral[0], stow[1] - neutral[1]]
+        );
+        // A library without both reserved poses is not one the table can author
+        // an instrument against.
+        let without: Vec<LoadedPose> = Vec::new();
+        assert!(Folds::of(&without).is_err());
     }
 }

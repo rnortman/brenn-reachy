@@ -39,7 +39,7 @@ use reachy_bus::{
 };
 use reachy_kin::{
     EnvelopeConfig, FkOptions, HeadGeometry, below_limit, outside_limit, rest_head_pose,
-    stow_head_pose,
+    sleep_head_pose,
 };
 use reachy_motion::arm::{WINDOW_INSET_DEG, leg_windows};
 use reachy_motion::joints::{LEG_COUNT, ROW_COUNT, ROWS, group_of, leg_index};
@@ -1749,7 +1749,7 @@ impl Registry {
             &self.geom,
             &self.fk,
             &joints,
-            &[rest_head_pose(), stow_head_pose()],
+            &[rest_head_pose(), sleep_head_pose()],
         ) {
             Ok(record) => record,
             Err(error) => {

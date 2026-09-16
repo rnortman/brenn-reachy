@@ -106,6 +106,7 @@ The response is uniform and deliberate:
 | `reachy-kin` | Head kinematics for the parallel platform: inverse and forward solutions, travel envelope, clearance margins. Pure math. |
 | `reachy-motion` | Trajectory shaping, the per-tick control step, and the arm/disarm sequences. Sans-I/O. |
 | `reachy-clips` | Recorded motions as masked per-channel deltas, and how they layer over live motion. Sans-I/O. |
+| `reachy-poses` | Named base postures: the authored document, its validation, and the library a pose id resolves through. A pose is a whole configuration, where a clip is a delta over one. Sans-I/O. |
 | `reachy-driver` | A motor driver's decisions with no motors attached: the goal gate and its dead-man, the auxiliary-transaction slot, the torque-off confirmation. Sans-I/O. |
 | `reachy-bus` | The one I/O layer: serial port, transactions, error taxonomy, and the joint-to-servo map. |
 | `reachy-bench` | Bench binary: a read-only self-test registry and the bare-bus commands. It moves nothing. |
@@ -114,7 +115,7 @@ The response is uniform and deliberate:
 | `reachy-host` | The voice host process: the configuration it is built with, the running gate over `reachy-edge`, the queue both intent sources hand bodies to, and the composition of the pod platform's speech pipeline whose two motion seams that gate fills. |
 | `reachy-scratch` | Test support, linked by nothing a unit runs: a scratch directory a case writes into, removed however the case ended. |
 | `reachy-motord` | The driver process: a 20 ms grid on the real clock, the serial port, and `reachy-driver`'s decisions, meeting the cogs over UDP. |
-| `cogs/` | The Clockwork compositions that host the libraries: the `Mover`, `Pose`, `Session` and `MotorSim` cogs, their schemas, the deterministic scenario suite, the online composition and its intent-edge sockets, and the log analyzer. |
+| `cogs/` | The Clockwork compositions that host the libraries: the `Mover`, `Pose`, `Session` and `MotorSim` cogs, their schemas, the clip and pose libraries the boxes bind, the deterministic scenario suite, the online composition and its intent-edge sockets, and the log analyzer. |
 
 The edges run one way: `reachy-kin` under `reachy-motion`, and both of those
 plus `dxl-proto` under `reachy-bus`, with `reachy-bench`, `reachy-motord` and

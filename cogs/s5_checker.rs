@@ -16,8 +16,7 @@ use std::process::ExitCode;
 
 use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
 use nalgebra::Isometry3;
-use reachy_kin::{neutral_head_pose, stow_head_pose};
-use reachy_motion::postures::stow_pose_targets;
+use reachy_kin::neutral_head_pose;
 use scenario::check;
 use scenario::check::head_pose_at;
 use scenario::read::Run;
@@ -125,11 +124,8 @@ fn check_mid_move(run: &Run, failures: &mut Vec<String>) {
         failures.push(format!("no pose for cycle {at}, where the posture changed"));
         return;
     };
-    let span = apart(&neutral_head_pose(), &stow_head_pose());
-    for (what, posture) in [
-        ("upright", neutral_head_pose()),
-        ("stowed", stow_head_pose()),
-    ] {
+    let span = apart(&neutral_head_pose(), &stow_head());
+    for (what, posture) in [("upright", neutral_head_pose()), ("stowed", stow_head())] {
         let offset = apart(&found, &posture);
         if offset <= span * MID_MOVE_SHARE {
             failures.push(format!(
@@ -149,7 +145,7 @@ fn check_mid_move(run: &Run, failures: &mut Vec<String>) {
 /// through the estimator, so it is a claim about where the machine went rather
 /// than about what it was asked for.
 fn check_closing(run: &Run, failures: &mut Vec<String>) {
-    let stow = stow_head_pose();
+    let stow = stow_head();
     let from = retarget_cycle() + turnaround_cycles();
     let Some(start) = head_pose_at(run, from) else {
         failures.push(format!(
@@ -181,7 +177,7 @@ fn check_arrival(run: &Run, failures: &mut Vec<String>) {
         run,
         "stowed",
         disengage_cycle() - 1,
-        &stow_pose_targets(),
+        &scenario::stow_pose(),
         failures,
     );
     check::room(
@@ -190,6 +186,12 @@ fn check_arrival(run: &Run, failures: &mut Vec<String>) {
         &stow_clocks(),
         failures,
     );
+}
+
+/// Where the fold puts the head, as the committed library states it: the pose
+/// this run is redirected to, read from the asset the run was configured from.
+fn stow_head() -> Isometry3<f64> {
+    scenario::stow_pose().head_pose_body
 }
 
 /// How far apart two head positions are, metres.

@@ -89,7 +89,8 @@ register_toolchains("@rust_toolchains//:all")
 # for. MODULE.bazel.lock pins the resolution that comes out of them.
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 
-# f64 linear algebra for the head kinematics. reachy-kin and reachy-motion.
+# f64 linear algebra for the head kinematics. reachy-kin, reachy-motion,
+# reachy-clips and reachy-poses.
 crate.spec(
     package = "nalgebra",
     version = "0.35",
@@ -177,19 +178,21 @@ crate.spec(
     version = "1",
 )
 
-# Dynamic Protobuf messages and the Protobuf text format, so the driver's
-# configuration is parsed against the schema that generated it. `text-format`
-# because that is the format the file is authored in; `prost` alone does not
-# carry it. reachy-motord.
+# Dynamic Protobuf messages and the Protobuf text format, so a configuration or
+# an authored document is parsed against the schema that generated it.
+# `text-format` because that is the format those files are authored in; `prost`
+# alone does not carry it. reachy-motord for the driver's parameters,
+# reachy-poses for the pose documents and the emitted pose library.
 crate.spec(
     features = ["text-format"],
     package = "prost-reflect",
     version = "0.16",
 )
 
-# Pure-Rust Protobuf compilation: turns the generated `.proto` the driver embeds
+# Pure-Rust Protobuf compilation: turns the generated `.proto` a reader embeds
 # into the descriptor prost-reflect parses against. No protoc, no build-time
-# native step, so the device cross-build needs nothing new. reachy-motord.
+# native step, so the device cross-build needs nothing new. reachy-motord and
+# reachy-poses.
 crate.spec(
     package = "protox",
     version = "0.9",

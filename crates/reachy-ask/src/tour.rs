@@ -33,17 +33,20 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use motion_proto::{MotionScript, Play, Posture, Step};
-use reachy_edge::{MotionEntry, MotionTable, POLL, STOW_DURATION_MS};
+use motion_proto::{MotionScript, Play, STOW_POSE, Step};
+use reachy_edge::{MotionEntry, MotionTable, POLL};
+
+use crate::gesture::STOW_DURATION_MS;
 
 use crate::gesture::UP_AFTER_MS;
 
 /// How long the move to the upright posture is given, milliseconds.
 ///
-/// The mover's own `up_duration_ns`, restated here because the sender does not
-/// link the mover's parameters. The first motion cannot start until the raise
-/// has finished, so this is a term of the first script's play offset; a case
-/// below pins it against the number the scenarios read out of the textproto.
+/// The pose library's own pace for `neutral`, restated here because this sender
+/// states no pace of its own. The first motion cannot start until the raise has
+/// finished, so this is a term of the first script's play offset; a case below
+/// pins it against the library the payload carries.
+///
 pub const UP_DURATION_MS: u64 = 800;
 
 /// The gap between a script's base step settling and its motion starting,
@@ -304,7 +307,7 @@ fn leg(index: usize, name: &str, entry: &MotionEntry) -> Result<Leg, String> {
     let seq = index as u64 + 1;
     let (base, play_after) = if index == 0 {
         (
-            Step::new(UP_AFTER_MS, Posture::Up),
+            Step::new(UP_AFTER_MS, crate::gesture::NEUTRAL_POSE),
             UP_AFTER_MS + UP_DURATION_MS + PLAY_AFTER_MS,
         )
     } else {
@@ -319,7 +322,7 @@ fn leg(index: usize, name: &str, entry: &MotionEntry) -> Result<Leg, String> {
         vec![
             base,
             Step::play(play_after, Play::new(name)),
-            Step::new(stow_after, Posture::Stow),
+            Step::new(stow_after, STOW_POSE),
         ],
         stow_end_ms,
     )
@@ -420,8 +423,10 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use motion_proto::{Base, PlayWindow, Posture};
-    use reachy_edge::{Edge, EdgeConfig, MotionEntry, MotionTable, STOW_DURATION_MS};
+    use motion_proto::{Base, PlayWindow, STOW_POSE};
+    use reachy_edge::{Edge, EdgeConfig, MotionEntry, MotionTable};
+
+    use super::STOW_DURATION_MS;
 
     use scenario::{
         PERIOD_NS, commission_allowance_cycles, engage_allowance_cycles, release_allowance_cycles,
@@ -569,8 +574,8 @@ mod tests {
             assert_eq!(offsets, ascending, "a timeline the wire contract admits");
             assert_eq!(leg.script.steps().len(), 3, "a base, a play and a stow");
             assert_eq!(
-                leg.script.steps()[2].action.base().and_then(Base::posture),
-                Some(Posture::Stow),
+                leg.script.steps()[2].action.base().and_then(Base::pose),
+                Some(STOW_POSE),
                 "every script ends the session stowed if the next one never comes",
             );
             assert_eq!(
@@ -587,7 +592,10 @@ mod tests {
         let first = &tour.legs()[0];
         assert_eq!(
             first.script.steps()[0].action.base(),
-            Some(Base::Posture(Posture::Up)),
+            Some(&Base::Pose {
+                name: crate::gesture::NEUTRAL_POSE.to_owned(),
+                move_ms: None,
+            }),
             "the tour starts at rest, and a delta has to ride on something",
         );
         assert_eq!(first.script.steps()[0].after_ms, UP_AFTER_MS);
@@ -599,8 +607,8 @@ mod tests {
         let later = &tour.legs()[1];
         assert_eq!(
             later.script.steps()[0].action.base(),
-            Some(Base::Keep),
-            "restating `up` would retarget the base mid-hand-back",
+            Some(&Base::Keep),
+            "restating the raise pose would retarget the base mid-hand-back",
         );
         assert_eq!(later.script.steps()[0].after_ms, 0);
         assert_eq!(later.script.steps()[1].after_ms, PLAY_AFTER_MS);
@@ -628,12 +636,15 @@ mod tests {
     }
 
     #[test]
-    fn the_up_move_is_the_movers_own_clock() {
+    fn the_up_move_is_the_librarys_own_clock() {
         assert_eq!(
-            i64::try_from(UP_DURATION_MS).expect("a count of ms") * 1_000_000,
-            scenario::UP_DURATION_NS,
-            "the first motion waits out the raise, and the raise runs on the number the \
-             mover's parameters state; the scenarios pin that number against the textproto",
+            u32::try_from(UP_DURATION_MS).expect("a count of ms"),
+            crate::gesture::poses()
+                .resolve(crate::gesture::NEUTRAL_POSE)
+                .expect("the emitted library holds the raise pose")
+                .duration_ms,
+            "the first motion waits out the raise, and a script that states no pace is moved \
+             at the pace the deployed library holds for the pose",
         );
     }
 
@@ -688,7 +699,11 @@ mod tests {
     #[test]
     fn every_leg_compiles_against_the_table_it_was_built_from() {
         let table = two();
-        let mut edge = Edge::new(EdgeConfig::for_pod(ASK_POD), table.clone());
+        let mut edge = Edge::new(
+            EdgeConfig::for_pod(ASK_POD),
+            table.clone(),
+            crate::gesture::poses().clone(),
+        );
         let tour = Tour::of(&table).expect("a two-motion library");
         for (index, leg) in tour.legs().iter().enumerate() {
             let accepted = edge

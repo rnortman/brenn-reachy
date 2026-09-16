@@ -14,7 +14,6 @@
 use std::process::ExitCode;
 
 use brenn_reachy__driver__health_clk_rs::EventKind;
-use reachy_motion::postures::neutral_targets;
 use scenario::check;
 use scenario::cycle_of;
 use scenario::read::Run;
@@ -197,7 +196,7 @@ fn check_arrived_before_the_outage(run: &Run, failures: &mut Vec<String>) {
         run,
         "upright",
         outage_cycle() - 1,
-        &neutral_targets(),
+        &scenario::neutral_pose(),
         failures,
     );
     check::room(

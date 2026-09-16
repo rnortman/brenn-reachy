@@ -38,8 +38,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clockwork_rs::SyncTime;
 use reachy_edge::{
-    DATAGRAM_CAP, HostEdge, LOOPBACK, MotionTable, Origin, POLL, REPORTS_OUT_PORT, SCRIPTS_IN_PORT,
-    Surface, edge_line_with, now, origin_word,
+    DATAGRAM_CAP, HostEdge, LOOPBACK, MotionTable, Origin, POLL, PoseTable, REPORTS_OUT_PORT,
+    SCRIPTS_IN_PORT, Surface, edge_line_with, now, origin_word,
 };
 use reachy_host::check;
 use reachy_host::edge::{Console, Publishing, Speaker};
@@ -225,7 +225,7 @@ fn write_check(out: &mut impl io::Write, options: &Options, base: &Path) -> bool
 /// Read the configuration and the name table, hold the ports, run.
 fn run(options: &Options) -> Result<(), String> {
     let settings = params::load(&options.config).map_err(|error| error.to_string())?;
-    let table = names(&settings)?;
+    let (table, poses) = names(&settings)?;
 
     let reports = UdpSocket::bind((LOOPBACK, REPORTS_OUT_PORT)).map_err(|error| {
         // Only the address-in-use case names another reader. A permission
@@ -268,7 +268,7 @@ fn run(options: &Options) -> Result<(), String> {
     // voice half composes. With no speech configuration named nothing holds one
     // and the loop below narrates the session's story and asks for nothing.
     let (intents, waiting) = waking_queue(Arc::new(nudge));
-    let mut host = HostEdge::new(settings.edge.clone(), table);
+    let mut host = HostEdge::new(settings.edge.clone(), table, poses);
     let mut surface = Publishing::new(Console);
     surface.say(started_line(&settings, &options.config, now()));
 
@@ -534,14 +534,22 @@ fn follow(
     Ok(())
 }
 
-/// The clip library's name table, read once at startup.
-fn names(settings: &HostSettings) -> Result<MotionTable, String> {
-    let path: &Path = &settings.clip_names;
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("reading the clip name table at {}: {error}", path.display()))?;
-    MotionTable::from_sidecar(&text).map_err(|error| {
+/// The asset libraries' name tables, read once at startup.
+///
+/// One file, one read, both tables: the motions and the poses are numbered by
+/// one walk over the assets, and a host that read the document twice would be
+/// two opinions about which emit it is holding.
+fn names(settings: &HostSettings) -> Result<(MotionTable, PoseTable), String> {
+    let path: &Path = &settings.library_names;
+    let text = std::fs::read_to_string(path).map_err(|error| {
         format!(
-            "the clip name table at {} is not one this build can resolve names through: {error}",
+            "reading the library name table at {}: {error}",
+            path.display()
+        )
+    })?;
+    reachy_edge::parse(&text).map_err(|error| {
+        format!(
+            "the library name table at {} is not one this build can resolve names through: {error}",
             path.display()
         )
     })
@@ -593,7 +601,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use clockwork_rs::{SyncTime, blob_from_bytes};
-    use motion_proto::{MotionScript, Posture, Step};
+    use motion_proto::{MotionScript, Step};
+    use pose_fixture::{NEUTRAL_POSE, poses};
     use reachy_edge::{Alert, EdgeConfig, HostEdge, LOOPBACK, MotionTable, Origin, Surface};
     use reachy_host::intents::queue;
     use reachy_scratch::scratch_dir;
@@ -681,7 +690,7 @@ mod tests {
     /// A script body for `POD`, as the wire contract encodes one: a raise now,
     /// with the closing stow left to the compile.
     fn body(seq: u64) -> Vec<u8> {
-        MotionScript::new(POD, seq, vec![Step::new(0, Posture::Up)], 13_000)
+        MotionScript::new(POD, seq, vec![Step::new(0, NEUTRAL_POSE)], 13_000)
             .expect("a lawful script")
             .encode()
             .into_bytes()
@@ -719,7 +728,7 @@ mod tests {
                 .expect("a queue with room");
         }
         let scripts = UdpSocket::bind((LOOPBACK, 0)).expect("an ephemeral port");
-        let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default());
+        let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default(), poses());
         let mut surface = Recorded::default();
         let stop = Arc::new(AtomicBool::new(false));
         let raise = Arc::clone(&stop);
@@ -799,7 +808,7 @@ mod tests {
         let reports = reports_port();
         let scripts = UdpSocket::bind((LOOPBACK, 0)).expect("an ephemeral port");
         let (_intents, waiting) = queue();
-        let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default());
+        let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default(), poses());
         let mut surface = Recorded::default();
         let stop = AtomicBool::new(true);
         follow(
@@ -833,7 +842,7 @@ mod tests {
         let following = thread::spawn(move || {
             let scripts = UdpSocket::bind((LOOPBACK, 0)).expect("an ephemeral port");
             let (_intents, waiting) = queue();
-            let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default());
+            let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default(), poses());
             let mut surface = Recorded::default();
             let stop = AtomicBool::new(false);
             follow(
@@ -1027,12 +1036,11 @@ mod tests {
         std::fs::write(
             &path,
             "pod: \"fixture-reachy\"\n\
-             stow_duration_ms: 3000\n\
              body_cap_bytes: 8192\n\
-             clip_names_path: \"clip_library.names.json\"\n",
+             library_names_path: \"library.names.json\"\n",
         )
         .expect("a file");
-        std::fs::write(dir.join("clip_library.names.json"), "{\"names\": []}\n").expect("a file");
+        std::fs::write(dir.join("library.names.json"), "{\"names\": []}\n").expect("a file");
         path
     }
 

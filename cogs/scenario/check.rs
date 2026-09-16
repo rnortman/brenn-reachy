@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, StepKindWire};
+use brenn_reachy__cogs__schedule_clk_rs::StepKindWire;
 use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
 use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdKindWire;
 use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
@@ -30,7 +30,7 @@ use brenn_reachy__motion__faults_clk_rs::FaultKindWire;
 use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointRefWire};
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
 use log_read::Logged;
-use motion_cogs::session_bus::disarm_config;
+
 use motion_slots::joint_set;
 use nalgebra::Isometry3;
 use reachy_kin::wrap_to_pi;
@@ -1407,13 +1407,16 @@ pub fn stows_until(
             }
             continue;
         }
-        let steps: Vec<(StepKindWire, PostureWire, i64)> = schedule
+        let stow_id = crate::pose_id(crate::STOW_POSE);
+        let steps: Vec<(StepKindWire, u16, i64)> = schedule
             .steps()
             .iter()
-            .map(|step| (step.kind(), step.posture(), step.end().as_nanos()))
+            .map(|step| (step.kind(), step.pose_id(), step.end().as_nanos()))
             .collect();
         match steps.as_slice() {
-            [(StepKindWire::BASE_POSTURE, PostureWire::STOW, end)] => stows.push((at, *end)),
+            [(StepKindWire::BASE_POSTURE, pose_id, end)] if *pose_id == stow_id => {
+                stows.push((at, *end));
+            }
             other => failures.push(format!(
                 "the schedule at cycle {at} asks for {other:?}, and a machine being carried down \
                  is asked for the fold and nothing else"
@@ -2358,7 +2361,7 @@ pub fn folded_at(run: &Run, cycle: i64, why: &str, failures: &mut Vec<String>) -
     let sample = sample_at_or(run, cycle, why, failures)?;
     match sample.present().validate() {
         Ok(present) => Some(at_stow(
-            disarm_config(),
+            crate::disarm_config(),
             &reachy_motion::joints::vector_of(present),
         )),
         Err(complaint) => {

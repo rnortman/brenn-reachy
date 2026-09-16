@@ -100,9 +100,10 @@ pub const MAX_EXCURSION_RAD: f64 = 2.0 * COUNT_RAD;
 /// The allowance runs from the last *commanded* change, and the command is not
 /// the motion: the servo's own profile generator paces every move, so a joint
 /// is still travelling after its setpoint stops changing. The widest hold this
-/// stack judges follows the antennas' arc from stow to rest, 3.1377 rad at the
-/// antennas' commissioned `522 / 640` under the class's measured following lag:
-/// 25 periods — half a second — for the whole move, the ramps at either end,
+/// stack judges follows the antennas' arc from the fold to the rest lean,
+/// 3.0977 rad at the antennas' commissioned `522 / 640` under the class's
+/// measured following lag: 24 periods — just under half a second — for the
+/// whole move, the ramps at either end,
 /// the two periods of dead time and the shaft's decay onto the arrived
 /// generator included. The rod then rings down. Four seconds covers both, with
 /// about 3.5 seconds of it for the ring-down, most of the allowance now that
@@ -940,9 +941,23 @@ mod tests {
     use core::f64::consts::TAU;
 
     use super::*;
-    use crate::disarm::STOW_ANTENNAS;
     use crate::plant::GroupPlants;
-    use crate::postures::NEUTRAL_ANTENNAS;
+
+    /// Where the machine's antennas fold and where they rest, right then left,
+    /// radians.
+    ///
+    /// Transcribed from the committed pose library's `stow` and `neutral`
+    /// documents, because this crate is sans-I/O and reads no asset: the arc
+    /// between the two is the widest an antenna hold is judged over.
+    ///
+    /// A case that reads the documents holds them to these figures --
+    /// `the_antennas_are_where_the_stillness_allowance_was_sized_on`, in the
+    /// `cogs` package, which is where the committed library is readable. That
+    /// is what fails when either document moves;
+    /// [`the_allowance_covers_the_widest_hold_this_stack_judges`] below is what
+    /// then says whether the allowance still covers the travel.
+    const FOLD: [f64; 2] = [-3.459_133_736_422_664_6, 3.359_641_315_834_277_7];
+    const REST: [f64; 2] = [-0.1745, 0.1745];
 
     /// The side every case here watches, unless it says otherwise.
     const RIGHT: JointRef = JointRef::AntennaRight;
@@ -1379,10 +1394,10 @@ mod tests {
     /// the rest pose, and the allowance has to cover that whole travel and
     /// leave a ring-down after it.
     ///
-    /// Both inputs move under this crate's own hands — the fold angle is a
-    /// constant here and the antennas' profile pair is a commissioning away —
-    /// and neither of them is anywhere near
-    /// this file. Without this case an allowance that no longer covers the move
+    /// Both inputs move out from under this file — the fold is an authored pose
+    /// document and the antennas' profile pair is a commissioning away — and
+    /// neither of them is anywhere near it. Without this case an allowance
+    /// that no longer covers the move
     /// leaves the watch opening its window inside the tail of the arrival and
     /// reading a rod still travelling as one that will not stand still, with
     /// every test green.
@@ -1397,13 +1412,13 @@ mod tests {
             // The arc the pair actually sweeps between the two poses: the
             // shorter of the two ways round, which is the inboard one at this
             // fold.
-            let delta = (STOW_ANTENNAS[side] - NEUTRAL_ANTENNAS[side]).rem_euclid(TAU);
+            let delta = (FOLD[side] - REST[side]).rem_euclid(TAU);
             let arc = delta.min(TAU - delta);
             widest = widest.max(plants.antennas.travel_cycles(arc));
         }
         // The figures the allowance's comment states, so a moved fold or a
         // moved pair fails here naming both of them.
-        assert_eq!(widest, 25, "the widest judged arc takes {widest} periods");
+        assert_eq!(widest, 24, "the widest judged arc takes {widest} periods");
         let travel = DRIVER_PERIOD * u32::try_from(widest).expect("a period count fits");
         assert!(
             travel + RING_DOWN <= SETTLE,

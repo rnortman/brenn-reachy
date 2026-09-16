@@ -27,7 +27,7 @@
 #     host/host_params.textproto                        the operator's host configuration
 #     host/speech-record.toml                           a recording session's voice half
 #     bench/reachy-bench.toml                           the recorder's own configuration
-#     cogs/clip_library.names.json                      the overlay name table it reads
+#     cogs/library.names.json                           the asset name table it reads
 #     models/oww/*.onnx                                 the wake gate's two front graphs
 #     models/silero/silero_vad.onnx                     the endpointer's graph
 #     wherever `[wake] model` puts it                   the wake gate's phrase head
@@ -200,13 +200,13 @@ model_paths=(
 # source of truth whose drift is invisible until a process dies at setup on a
 # powered unit.
 #
-# The host's clip name table is named as a file rather than through a filegroup
+# The host's asset name table is named as a file rather than through a filegroup
 # because it is the one thing the host reads that the build produces: it is
 # generated beside the library it describes and belongs to the cogs. The host's
 # own configuration is not here at all -- it is a per-unit file, staged from
 # outside the tree below.
 config_targets=(
-	//cogs:clip_library.names.json
+	//cogs:library.names.json
 	//cogs:robot_config_files
 	//driver:motord_params.textproto
 )

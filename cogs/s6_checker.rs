@@ -22,7 +22,6 @@ use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
 use reachy_motion::joints::{JointRef, row};
-use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use scenario::check;
 use scenario::read::Run;
 
@@ -156,14 +155,14 @@ fn check_arrival(run: &Run, failures: &mut Vec<String>) {
         run,
         "upright",
         standing_cycle(),
-        &neutral_targets(),
+        &scenario::neutral_pose(),
         failures,
     );
     check::arrived_at(
         run,
         "stowed",
         disengage_cycle() - 1,
-        &stow_pose_targets(),
+        &scenario::stow_pose(),
         failures,
     );
     check::room("upright", up_cycles(), &up_clocks(), failures);

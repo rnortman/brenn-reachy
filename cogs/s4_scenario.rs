@@ -31,7 +31,6 @@
 use scenario::author::Step;
 use scenario::{BLIND_CYCLES_BEFORE_BUS_FAILURE, cycle_at};
 
-use brenn_reachy__cogs__schedule_clk_rs::PostureWire;
 use reachy_motion::default_motion_config;
 use reachy_motion::joints::ROW_COUNT;
 
@@ -94,7 +93,8 @@ pub fn steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(up_start_cycle()),
         end_ns: cycle_at(end_cycle()),
-        posture: Some(PostureWire::UP),
+        pose: Some(scenario::NEUTRAL_POSE),
+        move_ms: None,
     }]
 }
 

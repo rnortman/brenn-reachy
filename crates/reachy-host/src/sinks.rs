@@ -136,7 +136,8 @@ fn unoffered_line(source: &str, pod: &str, seq: u64, error: NotOffered) -> Strin
 mod tests {
     use std::sync::Mutex;
 
-    use motion_proto::{MotionScript, Posture, Step};
+    use motion_proto::{MotionScript, Step};
+    use pose_fixture::{NEUTRAL_POSE, poses};
     use reachy_edge::{EdgeConfig, HostEdge, MotionTable, Origin, Surface};
 
     use super::*;
@@ -171,7 +172,7 @@ mod tests {
 
     /// A lawful script body for `POD`, as the wire contract encodes one.
     fn body(seq: u64) -> String {
-        MotionScript::new(POD, seq, vec![Step::new(0, Posture::Up)], 13_000)
+        MotionScript::new(POD, seq, vec![Step::new(0, NEUTRAL_POSE)], 13_000)
             .expect("a lawful script")
             .encode()
     }
@@ -215,7 +216,7 @@ mod tests {
         );
         assert_eq!(queued.origin, Origin::Local, "the scripter's own decision");
 
-        let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default());
+        let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default(), poses());
         let mut surface = Narration::default();
         let accepted = host
             .offer(
@@ -238,7 +239,7 @@ mod tests {
 
         let queued = waiting.next().expect("the body the bus delivered");
         assert_eq!(queued.origin, Origin::Remote, "somebody else's script");
-        let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default());
+        let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default(), poses());
         let mut surface = Narration::default();
         assert!(
             host.offer(
@@ -263,7 +264,7 @@ mod tests {
         scripter.offer(decision(9));
         bus.deliver(&body(9)).expect("a queue with room");
 
-        let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default());
+        let mut host = HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default(), poses());
         let mut surface = Narration::default();
         let first = waiting.next().expect("the scripter's body");
         let second = waiting.next().expect("the bus's body");

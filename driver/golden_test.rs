@@ -21,7 +21,7 @@
 //! Every vector is written little-endian, which is the only byte order
 //! `clockwork_rs` compiles for.
 
-use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, StepKindWire};
+use brenn_reachy__cogs__schedule_clk_rs::StepKindWire;
 use brenn_reachy__cogs__script_clk_rs::{ScriptOverlayWire, ScriptStepWire, ScriptWire};
 use brenn_reachy__driver__goal_clk_rs::GoalSetpointWire;
 use brenn_reachy__driver__health_clk_rs::{
@@ -267,12 +267,14 @@ fn a_script_is_the_bytes_it_was() {
         up.set_after_ms(8000);
         up.set_duration_ms(2000);
         up.set_kind(StepKindWire::BASE_POSTURE);
-        up.set_posture(PostureWire::UP);
+        up.set_pose_id(5);
+        up.set_move_ms(600);
         let stow: &mut ScriptStepWire = steps.try_grow().expect("the schema holds sixteen");
         stow.set_after_ms(10_000);
         stow.set_duration_ms(3000);
         stow.set_kind(StepKindWire::BASE_POSTURE);
-        stow.set_posture(PostureWire::STOW);
+        stow.set_pose_id(9);
+        stow.set_move_ms(1500);
     }
     {
         let mut overlays = msg.overlays_mut();
@@ -287,7 +289,9 @@ fn a_script_is_the_bytes_it_was() {
     pins(
         "Script",
         blob_as_bytes(&msg),
-        "401f0000d00700000101000010270000b80b0000010000000000000000000000\
+        "401f0000d0070000580200000500010010270000b80b0000dc05000009000100\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
          0000000000000000000000000000000000000000000000000000000000000000\
          0000000000000000000000000000000000000000000000000000000000000000\
          0000000000000000000000000000000000000000000000000000000000000000\

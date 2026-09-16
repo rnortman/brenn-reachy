@@ -47,7 +47,7 @@ subject="${repo}/tools/deploy-motion.sh"
 # analyzer is judged against. Contents are nobody's business here -- both
 # readers are stubbed -- but the file has to exist, because a tour of a tree
 # that has none is a refusal before anything is pushed.
-names_table="${repo}/cogs/clip_library.names.json"
+names_table="${repo}/cogs/library.names.json"
 echo '{"motions": []}' >"$names_table"
 
 # The logger configuration as the build stages it, in the syntax the real one is
@@ -1636,7 +1636,7 @@ assert_status "a tour that ended itself and passed the analyzer succeeds" 0 \
 assert_contains "the budget is asked of the sender, over the committed table" "$toured" \
 	"bazel run -- //crates/reachy-ask:reachy_ask --tour-budget ${names_table}"
 assert_contains "the bus question, the log root's clear and the tour are one invocation" "$toured" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --tour cogs/clip_library.names.json >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask; ask_rc=\$?; exit \$(( rc != 0 ? rc : ask_rc ))"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --tour cogs/library.names.json >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask; ask_rc=\$?; exit \$(( rc != 0 ? rc : ask_rc ))"
 # The sender knows its own end, so it is given neither of the gesture's clocks:
 # a run window would be a second opinion about when the tour is over, and the
 # commissioning timeout it ships with is the one that says a unit never came up.
@@ -1794,10 +1794,10 @@ SSH_RUN_STATUS=0
 # anything is pushed or asked of the unit.
 mv -- "$names_table" "${names_table}.aside"
 result=$(deploy unit --tour "${work}/tour-notable")
-assert_status "a tree carrying no clip name table refuses the tour" 1 \
+assert_status "a tree carrying no asset name table refuses the tour" 1 \
 	"$(status_of "$result")"
 assert_contains "the refusal names the table and how to make one" \
-	"$(output_of "$result")" "make clip-config"
+	"$(output_of "$result")" "make library-config"
 assert_lacks "and the unit is not touched" "$(calls)" "simplelaunch"
 mv -- "${names_table}.aside" "$names_table"
 
@@ -1822,7 +1822,7 @@ assert_status "a probe run that ended itself and passed the analyzer succeeds" 0
 assert_contains "the backstop is the sender's over the one motion" "$probed" \
 	"reachy_ask --tour-budget ${names_table} --motion probe/antenna-step-a"
 assert_contains "the sender is told to play that motion and nothing else" "$probed" \
-	"./reachy_ask --tour cogs/clip_library.names.json --motion probe/antenna-step-a >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask; ask_rc=\$?; exit \$(( rc != 0 ? rc : ask_rc ))"
+	"./reachy_ask --tour cogs/library.names.json --motion probe/antenna-step-a >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask; ask_rc=\$?; exit \$(( rc != 0 ? rc : ask_rc ))"
 assert_contains "the records say which kind of run they came off" "$probed" \
 	"${probe_dest}/probe-log-"
 assert_contains "the table the run played names the one motion" "$probed" \

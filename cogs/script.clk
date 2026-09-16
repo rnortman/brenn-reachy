@@ -34,7 +34,8 @@ use cogs::schedule;
 // One step of a script: how long after arrival it starts, how long it lasts,
 // and what it asks for.
 //
-// The `kind` and `posture` vocabularies are the schedule's own, not restated:
+// The `kind` vocabulary and the pose numbering are the schedule's own, not
+// restated:
 // what a step asks the base to do is the same question either side of the
 // screen, and two spellings of it would be two things to keep in step.
 schema ScriptStep
@@ -54,8 +55,23 @@ schema ScriptStep
         // What the step asks for.
         #2 kind: schedule::StepKind;
 
-        // Which posture, meaningful only when `kind` is `base_posture`.
-        #3 posture: schedule::Posture;
+        // How long the move to the pose takes, milliseconds; meaningful only
+        // when `kind` is `base_posture`. Positive, which the screen checks.
+        // Spelled `move_ms` and not `duration_ms` because on this protocol that
+        // word is the step's own span, and a move's pace is not its span.
+        #4 move_ms: UInt32;
+
+        // Which pose, as its index in the configured library's poses.
+        // Meaningful only when `kind` is `base_posture`. Nothing screens it
+        // here: whether the deployed library holds that index is the mover's
+        // question, asked where the pose becomes a target, and an index it does
+        // not hold is a command refused rather than a pose substituted.
+        #5 pose_id: UInt16;
+    }
+    history
+    {
+        version: 2;
+        removed: [3];
     }
 }
 
@@ -63,7 +79,7 @@ schema ScriptStep
 // in.
 //
 // Independent of the steps, exactly as an `OverlayWindow` is: an overlay is a
-// delta composed over whatever posture the base holds, so a window may span
+// delta composed over whatever pose the base holds, so a window may span
 // several steps or none of them.
 schema ScriptOverlay
 {

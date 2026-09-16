@@ -390,6 +390,11 @@ cog Mover
         // here, and nothing writes this: clips are chosen before the run
         // starts, so they arrive the way the tick's own numbers do.
         clips: Tappy<config::ClipLibraryConfig>;
+
+        // Every named base posture, read-only. This cog reads where a move to
+        // one puts the machine; the fold it reads here is the fold the session
+        // judges a release against, which is why both bind the one file.
+        poses: Tappy<config::PoseLibraryConfig>;
     }
 
     states
@@ -624,6 +629,12 @@ cog Session
         // against the generator's trajectory, not against the loop that chases
         // it.
         gains: Tappy<config::ServoGains>;
+
+        // Every named base posture, read-only. This cog reads one of them: the
+        // stow, which is what the release judges the machine folded against and
+        // what the fault ladder commands. Where folded is arrives as an asset
+        // rather than as a constant, so nothing here derives it a second time.
+        poses: Tappy<config::PoseLibraryConfig>;
     }
 
     states
@@ -956,6 +967,17 @@ box MotionCore
         representation=Protobuf<config::ClipLibraryConfig>,
         path="cogs/clip_library.textproto");
     connect clip_library to mover.clips;
+
+    // The base postures a schedule can name. Emitted from the documents under
+    // `cogs/poses/` by the same tool that emits the clips, and read the same
+    // way. One file, bound to every cog that has to agree about where a pose
+    // puts the machine: two records of where folded is are two answers to the
+    // one question a release asks.
+    new pose_library: SerializedDataFile(
+        representation=Protobuf<config::PoseLibraryConfig>,
+        path="cogs/pose_library.textproto");
+    connect pose_library to mover.poses;
+    connect pose_library to session.poses;
 
     // The sample stream: whatever is at the driver's end publishes it, both
     // control-rate cogs run on it, and the session reads it for one thing only

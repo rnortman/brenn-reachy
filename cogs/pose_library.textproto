@@ -1,0 +1,77 @@
+# Every base posture the machine has a name for: where the head, the body yaw
+# and the antennas stand, and how fast a move that states no pace of its own
+# goes there.
+#
+# Protobuf text of `brenn_reachy.cogs.config_clk_proto.PoseLibraryConfig`,
+# which the compiler generates from the `PoseLibraryConfig` schema in
+# `config.clk`. This is the asset a cog's configuration dial takes by path; the
+# casing converts it to the message the dial hands the cog. Every box that has
+# to agree about where a pose puts the machine binds this one file, and it
+# rides to a unit in `cogs/BUILD.bazel`'s `robot_config_files`.
+#
+# Generated — do not edit. Regenerate with `make library-config` after changing
+# a document under `cogs/poses/`, and commit the three files together: this one,
+# its name sidecar, and the documents.
+#
+# A pose's identity is its position here, so the order is load-bearing: it is
+# the order the document paths sort in, and a pose inserted in the middle
+# renumbers every one after it. The `stow` field carries the index of the pose
+# named `stow`, which is where the machine rests: what every schedule ends at,
+# what the fault ladder commands, and what the disarm sequence judges folded
+# against.
+#
+# The head is stated relative to the neutral head pose, in metres and a unit
+# quaternion; the antennas are directions in radians, right then left.
+#
+# pose_id  name
+#   0  neutral
+#   1  peek
+#   2  stow
+
+# neutral
+poses {
+  dx: 0.0
+  dy: 0.0
+  dz: 0.0
+  qw: 1.0
+  qx: 0.0
+  qy: 0.0
+  qz: 0.0
+  body_yaw: 0.0
+  antenna_right: -0.1745
+  antenna_left: 0.1745
+  duration_ns: 800000000
+}
+
+# peek
+poses {
+  dx: 0.0029000738091053673
+  dy: -0.0007841804313605779
+  dz: -0.040717335989298886
+  qw: 0.9993693068598193
+  qx: -0.00197365056574904
+  qy: -0.014244382170471255
+  qz: -0.0324683043374679
+  body_yaw: 0.0
+  antenna_right: -0.28241283568967557
+  antenna_left: 0.2040194447887913
+  duration_ns: 800000000
+}
+
+# stow
+poses {
+  dx: -0.01819812459878709
+  dy: 0.004223959727784293
+  dz: -0.050066980189288124
+  qw: 0.9762970501162586
+  qx: 0.024578733243214357
+  qy: 0.21471853903293098
+  qz: -0.011657821495217886
+  body_yaw: 0.0
+  antenna_right: -3.4591337364226646
+  antenna_left: 3.3596413158342777
+  duration_ns: 2000000000
+}
+
+# where the machine rests: the pose named "stow"
+stow: 2

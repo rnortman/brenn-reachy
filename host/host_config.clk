@@ -33,23 +33,23 @@ schema HostParams
         // carried would run another machine's timeline on this head.
         #0 pod: VarString<64>;
 
-        // How long the stow at the end of a schedule takes, milliseconds. Every
-        // schedule ends stowed, either at a stow the script asked for or at one
-        // the compile appends, and this is how long that step lasts. The
-        // sender's refresh headroom has to exceed it, or a close would be
-        // refused for want of room.
-        #1 stow_duration_ms: UInt32;
-
         // The largest intent body the edge looks at, bytes. Applied to the
         // bytes before anything parses them: the cheap screen goes first,
         // because the expensive one is what an unbounded body makes expensive.
         #2 body_cap_bytes: UInt32;
 
-        // Where the clip library's name table is, as a path the host reads once
-        // at startup. Overlay steps name a motion and the session takes an
-        // index, so this file is what joins the two -- and it is deployed
-        // beside the library it describes, which is why it is a path rather
-        // than something compiled in.
-        #3 clip_names_path: VarString<256>;
+        // Where the asset libraries' name table is, as a path the host reads
+        // once at startup. A step names a motion or a pose and the machine
+        // takes an index, so this one file is what joins the two vocabularies
+        // to their numberings -- and it is deployed beside the libraries it
+        // describes, which is why it is a path rather than something compiled
+        // in.
+        #3 library_names_path: VarString<256>;
+    }
+
+    history
+    {
+        version: 2;
+        removed: [1];
     }
 }

@@ -39,7 +39,6 @@ use std::process::ExitCode;
 
 use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
 use reachy_motion::joints::Name;
-use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use scenario::check;
 use scenario::read::Run;
 
@@ -212,21 +211,21 @@ fn check_arrival(run: &Run, failures: &mut Vec<String>) {
         run,
         "upright",
         stow_start_cycle() - 1,
-        &neutral_targets(),
+        &scenario::neutral_pose(),
         failures,
     );
     check::arrived_at(
         run,
         "upright again after the reversal",
         raised_cycle(),
-        &neutral_targets(),
+        &scenario::neutral_pose(),
         failures,
     );
     check::arrived_at(
         run,
         "stowed",
         disengage_cycle() - 1,
-        &stow_pose_targets(),
+        &scenario::stow_pose(),
         failures,
     );
     if raised_cycle() >= second_stow_start_cycle() {

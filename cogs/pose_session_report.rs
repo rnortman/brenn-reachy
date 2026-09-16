@@ -48,7 +48,7 @@
 //! spoke over it. A session's words alone say what was heard and never say what
 //! the machine was saying while it was heard, which is what a leak reads as.
 //!
-//! One segment at a time then leaves as a clip draft. `--extract` writes the
+//! One segment at a time then leaves as a draft. `--extract` writes the
 //! stretch an operator names as a clip document in the format the daemon's own
 //! loader reads: every channel a delta over the neutral base, one frame per
 //! reading of a move and one frame at the mean of a hold. The conversion is
@@ -56,6 +56,15 @@
 //! with tremor in it, material for the smoothing and trimming step, and a
 //! document the loader may well refuse because a hand can hold the head where
 //! the envelope will not.
+//!
+//! `--as-pose` writes the same hold as a **pose** document instead: a whole base
+//! configuration rather than a delta, the antennas reduced to the directions
+//! they name, and the pace left at zero for the author to state. Holds only — a
+//! move has no place the machine stood. The envelope's verdict on the extracted
+//! pose is printed beside the draft, per leg and against the clearance floor,
+//! because whether a recorded rest is a pose this machine may be commanded to
+//! is the question the author is answering at that moment, and the answer is
+//! never an edited figure.
 //!
 //! The verdict is permissive in the way the speech analyzer's is. What an
 //! operator did with their hands decides what is in the stream, and this tool
@@ -81,11 +90,15 @@ use reachy_clips::format::{ChannelMask, ClipDoc};
 use reachy_clips::record::{Draft, RecordError, RecordedFrame, clip_doc};
 use reachy_kin::{FkOptions, cone_angle, default_geometry, neutral_head_pose};
 use reachy_motion::arm::ArmRecord;
+use reachy_motion::asset_name::check_asset_name;
 use reachy_motion::joints::{
-    JointGroup, JointRef, JointVector, ROW_COUNT, ROWS, flags, group_of_row, row,
+    JointGroup, JointRef, JointTargets, JointVector, ROW_COUNT, ROWS, flags, group_of_row, row,
 };
 use reachy_motion::rest_pose_seeds;
 use reachy_motion::segments::{JointSample, MotionSegmenter, Segment, SegmentConfig, SegmentKind};
+use reachy_poses::NEUTRAL_POSE;
+use reachy_poses::format::{DOCUMENT_EXT, Pose, PoseDoc};
+use reachy_poses::record::{PoseExtractError, RecordedPose, envelope_verdict, pose_doc, pose_text};
 use run_report::event::{
     LISTENING, PLAYBACK_FINISHED, PLAYBACK_FLUSHED, PLAYBACK_STARTED, UTTERANCE,
 };
@@ -1723,17 +1736,116 @@ struct Extract {
     segment: String,
     /// The library name to file the draft under, where the operator named one.
     name: Option<String>,
-    /// The channels the draft drives.
+    /// The channels the draft drives. A pose states every channel, so this is a
+    /// clip draft's alone.
     channels: ChannelMask,
+    /// Whether the draft is a pose document rather than a clip one.
+    as_pose: bool,
+    /// Where the committed pose documents are, for the base a clip draft's
+    /// deltas are measured against.
+    ///
+    /// A clip is recorded over the `neutral` pose, so the base is read out of
+    /// that document rather than restated here. There is no flag to choose
+    /// another one: a base the recorder did not stand at is a draft nothing
+    /// downstream can tell from a correct one.
+    poses: PathBuf,
 }
 
-/// A clip draft, and what to call the file it goes in.
+/// The default directory the `neutral` document is read from.
+///
+/// Relative, and resolved against the working directory the tool is started in:
+/// under `bazel run` that is this binary's runfiles root, where the target's
+/// `data` stages the committed documents under this same path.
+const POSE_DIR: &str = "cogs/poses";
+
+/// The whole configuration a clip draft's deltas are measured against.
+///
+/// # Errors
+///
+/// If the `neutral` document cannot be read, or is not one this build loads.
+fn base_pose(poses: &Path) -> Result<JointTargets, String> {
+    let file = poses.join(format!("{NEUTRAL_POSE}.{DOCUMENT_EXT}"));
+    let text = std::fs::read_to_string(&file)
+        .map_err(|error| format!("{} could not be read: {error}", file.display()))?;
+    let pose = Pose::from_text(&text)
+        .map_err(|error| format!("{} is not a pose this build loads: {error}", file.display()))?;
+    Ok(*pose.targets())
+}
+
+/// A draft, and what to call the file it goes in.
 #[derive(Debug)]
-struct Extraction {
-    /// The file name, beside the session document.
-    file: String,
-    /// The draft itself.
-    doc: ClipDoc,
+enum Extraction {
+    /// A clip: a masked delta track over the neutral base.
+    Clip {
+        /// The file name, beside the session document.
+        file: String,
+        /// The draft itself.
+        doc: ClipDoc,
+    },
+    /// A pose: a whole base configuration, with the envelope's verdict on it.
+    Pose {
+        /// The file name, beside the session document.
+        file: String,
+        /// The draft itself.
+        doc: PoseDoc,
+        /// What the envelope says about the pose, for the operator's terminal.
+        verdict: String,
+    },
+}
+
+impl Extraction {
+    /// The clip draft this is, for the cases that ask for one.
+    #[cfg(test)]
+    fn clip(&self) -> &ClipDoc {
+        match self {
+            Self::Clip { doc, .. } => doc,
+            Self::Pose { .. } => panic!("this case asked for a clip draft"),
+        }
+    }
+
+    /// The pose draft this is, and the verdict on it, for the cases that ask
+    /// for one.
+    #[cfg(test)]
+    fn pose(&self) -> (&PoseDoc, &str) {
+        match self {
+            Self::Pose { doc, verdict, .. } => (doc, verdict),
+            Self::Clip { .. } => panic!("this case asked for a pose draft"),
+        }
+    }
+
+    /// The file name the draft goes in, beside the session document.
+    fn file(&self) -> &str {
+        match self {
+            Self::Clip { file, .. } | Self::Pose { file, .. } => file,
+        }
+    }
+
+    /// The bytes to write.
+    fn body(&self) -> String {
+        match self {
+            Self::Clip { doc, .. } => {
+                let json = serde_json::to_string_pretty(doc)
+                    .expect("a clip document of numbers and strings serializes");
+                json + "\n"
+            }
+            Self::Pose { doc, .. } => pose_text(doc),
+        }
+    }
+
+    /// What the operator is told a successful write produced.
+    fn said(&self) -> String {
+        match self {
+            Self::Clip { doc, .. } => {
+                format!("{:?}, {} frame(s)", doc.name, doc.frames.len())
+            }
+            Self::Pose { doc, verdict, .. } => {
+                format!(
+                    "{:?}, a pose; set duration_ms before committing it\n{verdict}",
+                    doc.name
+                )
+            }
+        }
+    }
 }
 
 /// The default library name for a segment of a fetched session.
@@ -1839,14 +1951,18 @@ fn extract(
             .filter(|row| !samples[at].missing[*row])
             .and_then(|_| samples[at].present.get(joint))
     };
-    let frames: Vec<RecordedFrame> = if documented[index].kind == DocKind::Still {
+    let still = documented[index].kind == DocKind::Still;
+    // A hold's one frame: the segment's mean, which is the configuration it
+    // held. A clip draft of a still is that frame, and a pose is that frame's
+    // configuration, so both paths build it here and neither builds the other's.
+    let held_frame = || -> RecordedFrame {
         let counts = answered(&samples[from..until]);
         let held = |joint: JointRef| -> Option<f64> {
             row(joint)
                 .filter(|row| counts[*row] > 0)
                 .and_then(|_| segment.mean.get(joint))
         };
-        vec![RecordedFrame {
+        RecordedFrame {
             head: mean_pose(
                 solved,
                 segment,
@@ -1858,7 +1974,50 @@ fn extract(
             ),
             antennas: [JointRef::AntennaRight, JointRef::AntennaLeft].map(held),
             body_yaw: held(JointRef::BodyYaw),
-        }]
+        }
+    };
+    let name = ask
+        .name
+        .clone()
+        .unwrap_or_else(|| drafted_name(records, &ask.segment));
+    let description = format!("Extracted recorded segment {}.", ask.segment);
+    if ask.as_pose {
+        // Above the clip frames deliberately: a pose has no playback and no
+        // frame grid, so the move branch's grid refusal is not a thing a pose
+        // extraction can be answered with. A move is refused as `NotStill`, the
+        // refusal whose remedy is the operator's actual one.
+        let read = if still {
+            let frame = held_frame();
+            RecordedPose {
+                head: frame.head,
+                body_yaw: frame.body_yaw,
+                antennas: frame.antennas,
+            }
+        } else {
+            RecordedPose::default()
+        };
+        let doc = pose_doc(&name, description, still, &read).map_err(|error| match error {
+            // The fix is a different segment, or a tighter one under other
+            // thresholds; neither is worth spelling out per arm.
+            PoseExtractError::NotStill | PoseExtractError::Unread { .. } => {
+                format!("{} cannot be extracted as a pose: {error}", ask.segment)
+            }
+        })?;
+        // An unusable name is the one refusal a pose document shares with a
+        // clip one, and it is refused here rather than at the loader for the
+        // same reason: a name costs an argument, not a session's extraction.
+        check_asset_name(&doc.name).map_err(|error| {
+            format!("pose name {name:?} is unusable: {error}. Name the draft yourself with --name")
+        })?;
+        let verdict = envelope_verdict(&doc);
+        return Ok(Extraction::Pose {
+            file: format!("pose-{}.textproto", ask.segment),
+            doc,
+            verdict,
+        });
+    }
+    let frames: Vec<RecordedFrame> = if still {
+        vec![held_frame()]
     } else {
         let kept: Vec<usize> = (from..until)
             .filter(|at| samples[*at].missing.iter().any(|absent| !*absent))
@@ -1883,18 +2042,11 @@ fn extract(
             })
             .collect()
     };
-    let name = ask
-        .name
-        .clone()
-        .unwrap_or_else(|| drafted_name(records, &ask.segment));
     let draft = Draft {
         name: &name,
-        description: Some(format!(
-            "{} of {}, extracted from the recorded pose stream",
-            ask.segment,
-            records.display()
-        )),
+        description: Some(description),
         mask: ask.channels,
+        over: base_pose(&ask.poses)?,
     };
     let doc = clip_doc(&draft, &frames).map_err(|error| match error {
         RecordError::Name { .. } => {
@@ -1905,7 +2057,7 @@ fn extract(
         // thresholds, or a mask without the channel that went unread.
         other => format!("{} cannot be extracted: {other}", ask.segment),
     })?;
-    Ok(Extraction {
+    Ok(Extraction::Clip {
         file: format!("clip-{}.json", ask.segment),
         doc,
     })
@@ -2261,7 +2413,7 @@ struct Invocation {
     out: PathBuf,
     /// The segmentation the analyzer runs.
     cfg: SegmentConfig,
-    /// The clip draft to write beside the document, where one was asked for.
+    /// The draft to write beside the document, where one was asked for.
     extract: Option<Extract>,
 }
 
@@ -2274,7 +2426,8 @@ struct Invocation {
 fn invocation(args: impl Iterator<Item = String>) -> Result<Invocation, String> {
     const USAGE: &str = "usage: pose_session_report <records> --out <dir> \
 [--speed-window-ms MS] [--still-rad-s RAD_S] [--moving-rad-s RAD_S] [--min-still-ms MS] \
-[--extract <segment-id> [--name <clip name>] [--channels head,antennas,body_yaw]]";
+[--extract <segment-id> [--name <asset name>] [--channels head,antennas,body_yaw] [--as-pose] \
+[--poses <dir>]]";
     let mut args = args.peekable();
     let records = args
         .next_if(|word| !word.starts_with("--"))
@@ -2284,7 +2437,14 @@ fn invocation(args: impl Iterator<Item = String>) -> Result<Invocation, String> 
     let mut segment: Option<String> = None;
     let mut name: Option<String> = None;
     let mut channels: Option<ChannelMask> = None;
+    let mut as_pose = false;
+    let mut poses: Option<String> = None;
     while let Some(flag) = args.next() {
+        // No value argument: consumed before the next arm demands one.
+        if flag == "--as-pose" {
+            as_pose = true;
+            continue;
+        }
         let value = args
             .next()
             .ok_or_else(|| format!("{flag} takes a value\n{USAGE}"))?;
@@ -2296,6 +2456,7 @@ fn invocation(args: impl Iterator<Item = String>) -> Result<Invocation, String> 
             "--moving-rad-s" => cfg.moving_rad_per_s = number(&flag, &value)?,
             "--extract" => segment = Some(value),
             "--name" => name = Some(value),
+            "--poses" => poses = Some(value),
             // The channel spellings are the format's own, parsed by the format:
             // a tool with its own list parser is a tool that disagrees with the
             // document it writes.
@@ -2316,8 +2477,18 @@ fn invocation(args: impl Iterator<Item = String>) -> Result<Invocation, String> 
     // A draft's name and its mask mean nothing without a segment to cut, and a
     // run that quietly ignored them would write a session document the operator
     // then reads as a failed extraction.
-    if segment.is_none() && (name.is_some() || channels.is_some()) {
-        return Err(format!("--name and --channels are --extract's\n{USAGE}"));
+    if segment.is_none() && (name.is_some() || channels.is_some() || as_pose || poses.is_some()) {
+        return Err(format!(
+            "--name, --channels, --as-pose and --poses are --extract's\n{USAGE}"
+        ));
+    }
+    // A pose states every channel, so a mask is not something it can carry: a
+    // run that took one and ignored it would write a document the operator
+    // reads as masked.
+    if as_pose && channels.is_some() {
+        return Err(format!(
+            "--channels is a clip draft's; a pose states every channel\n{USAGE}"
+        ));
     }
     Ok(Invocation {
         records: PathBuf::from(records),
@@ -2329,6 +2500,8 @@ fn invocation(args: impl Iterator<Item = String>) -> Result<Invocation, String> 
             // Every channel by default: what a recording holds is where all
             // three stood, and dropping one is the operator's own act.
             channels: channels.unwrap_or_else(ChannelMask::all),
+            as_pose,
+            poses: poses.map_or_else(|| PathBuf::from(POSE_DIR), PathBuf::from),
         }),
     })
 }
@@ -2362,19 +2535,17 @@ fn write_out(out: &Path, document: &Document) -> std::io::Result<()> {
     std::fs::write(out.join("timeline.txt"), timeline(document))
 }
 
-/// Write one clip draft into `out`.
+/// Write one draft into `out`.
 ///
-/// The library's own extension, so a draft the operator is happy with is copied
-/// into a library directory as it stands.
+/// The library's own extension for its kind, so a draft the operator is happy
+/// with is copied into a library directory as it stands.
 ///
 /// # Errors
 ///
 /// If the file cannot be written.
 fn write_draft(out: &Path, extraction: &Extraction) -> std::io::Result<()> {
     std::fs::create_dir_all(out)?;
-    let json = serde_json::to_string_pretty(&extraction.doc)
-        .expect("a clip document of numbers and strings serializes");
-    std::fs::write(out.join(&extraction.file), json + "\n")
+    std::fs::write(out.join(extraction.file()), extraction.body())
 }
 
 fn main() -> ExitCode {
@@ -2443,15 +2614,14 @@ fn run(invocation: &Invocation) -> bool {
             if let Err(error) = write_draft(&invocation.out, extraction) {
                 eprintln!(
                     "pose_session_report: {} could not be written: {error}",
-                    invocation.out.join(&extraction.file).display()
+                    invocation.out.join(extraction.file()).display()
                 );
                 asked = false;
             } else {
                 eprintln!(
-                    "pose_session_report: wrote {} as {:?}, {} frame(s)",
-                    invocation.out.join(&extraction.file).display(),
-                    extraction.doc.name,
-                    extraction.doc.frames.len()
+                    "pose_session_report: wrote {} as {}",
+                    invocation.out.join(extraction.file()).display(),
+                    extraction.said()
                 );
             }
         }
@@ -2491,10 +2661,9 @@ mod tests {
     };
     use reachy_clips::format::Channel;
     use reachy_kin::{
-        LegAngles, default_geometry, inverse_kinematics, neutral_head_pose, stow_head_pose,
+        LegAngles, default_geometry, inverse_kinematics, neutral_head_pose, sleep_head_pose,
     };
     use reachy_motion::joints::{JointVector, ROWS};
-    use reachy_motion::neutral_targets;
     use reachy_motion::segments::SegmentConfig;
     use reachy_scratch::{Scratch, scratch_dir};
     use run_report::{audio_dir, console_dir, sibling};
@@ -2503,9 +2672,21 @@ mod tests {
 
     use super::{
         Analysis, ChannelMask, DocKind, Document, Endpointer, Extract, Extraction, Hole,
-        Invocation, PERIOD_MS, ROW_COUNT, Sample, Stream, Voice, analyze, hole_in, holes,
-        invocation, off_grid_frame, run, stamp, timeline, write_draft, write_out,
+        Invocation, PERIOD_MS, POSE_DIR, ROW_COUNT, Sample, Stream, Voice, analyze, base_pose,
+        hole_in, holes, invocation, off_grid_frame, run, stamp, timeline, write_draft, write_out,
     };
+
+    /// Where the committed pose documents are for a test run: the directory
+    /// Bazel stages them in, or the workspace one when a case runs outside it.
+    fn pose_dir() -> PathBuf {
+        PathBuf::from(std::env::var("POSE_DOCUMENTS").unwrap_or_else(|_| POSE_DIR.to_owned()))
+    }
+
+    /// The neutral pose, read out of the committed document the way the tool
+    /// reads it.
+    fn neutral_targets() -> reachy_motion::joints::JointTargets {
+        base_pose(&pose_dir()).expect("the committed neutral document loads")
+    }
 
     /// Radians to the counts the recorder writes.
     fn counts_of(radians: f64) -> i32 {
@@ -2740,7 +2921,7 @@ mod tests {
 
     /// The two poses the fixture holds: stow, and stow lifted [`LIFT_M`].
     fn fixture_poses() -> (JointVector, JointVector) {
-        let held = stow_head_pose();
+        let held = sleep_head_pose();
         let lifted = Isometry3::from_parts(
             (held.translation.vector + nalgebra::Vector3::new(0.0, 0.0, LIFT_M)).into(),
             held.rotation,
@@ -2769,6 +2950,25 @@ mod tests {
                 segment: segment.to_owned(),
                 name: None,
                 channels: ChannelMask::all(),
+                as_pose: false,
+                poses: pose_dir(),
+            }),
+        )
+        .extraction
+        .expect("an extraction was asked for")
+    }
+
+    /// The pose extraction of `segment` from a fixture session.
+    fn as_pose(records: &Path, segment: &str, name: Option<&str>) -> Result<Extraction, String> {
+        judge_extracting(
+            records,
+            SegmentConfig::default(),
+            Some(&Extract {
+                segment: segment.to_owned(),
+                name: name.map(ToOwned::to_owned),
+                channels: ChannelMask::all(),
+                as_pose: true,
+                poses: pose_dir(),
             }),
         )
         .extraction
@@ -2937,7 +3137,7 @@ mod tests {
         let at = scratch_dir("pose-session-fk");
         let document = read(&at, SegmentConfig::default());
         let first = document.segments[0].pose.as_ref().expect("a solved hold");
-        let stow = super::PoseFigures::of(&stow_head_pose());
+        let stow = super::PoseFigures::of(&sleep_head_pose());
         assert!(
             (first.height_mm - stow.height_mm).abs() < 0.5,
             "{first:?} against {stow:?}"
@@ -4028,6 +4228,7 @@ mod tests {
         assert_eq!(ask.segment, "S002");
         assert_eq!(ask.name, None);
         assert_eq!(ask.channels, ChannelMask::all());
+        assert_eq!(ask.poses, Path::new(POSE_DIR), "the committed documents");
 
         let named = invocation(
             [
@@ -4040,6 +4241,8 @@ mod tests {
                 "recorded/wake/raise",
                 "--channels",
                 "head,antennas",
+                "--poses",
+                "elsewhere/poses",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -4047,6 +4250,7 @@ mod tests {
         .expect("a well-formed command line");
         let ask = named.extract.expect("a draft was asked for");
         assert_eq!(ask.name.as_deref(), Some("recorded/wake/raise"));
+        assert_eq!(ask.poses, Path::new("elsewhere/poses"));
         assert_eq!(
             ask.channels,
             ChannelMask::of(Channel::Head).union(ChannelMask::of(Channel::Antennas))
@@ -4066,7 +4270,28 @@ mod tests {
             (vec!["--out", "somewhere"], "usage: pose_session_report"),
             (
                 vec!["records", "--out", "somewhere", "--name", "a/clip"],
-                "--name and --channels are --extract's",
+                "--name, --channels, --as-pose and --poses are --extract's",
+            ),
+            (
+                vec!["records", "--out", "somewhere", "--as-pose"],
+                "--name, --channels, --as-pose and --poses are --extract's",
+            ),
+            (
+                vec!["records", "--out", "somewhere", "--poses", "cogs/poses"],
+                "--name, --channels, --as-pose and --poses are --extract's",
+            ),
+            (
+                vec![
+                    "records",
+                    "--out",
+                    "somewhere",
+                    "--extract",
+                    "S001",
+                    "--as-pose",
+                    "--channels",
+                    "head",
+                ],
+                "--channels is a clip draft's; a pose states every channel",
             ),
             (
                 vec![
@@ -4702,16 +4927,22 @@ mod tests {
     /// it has deltas an arithmetic error would show up in — every channel sits
     /// at the base the extraction subtracts.
     fn neutral_session(at: &Path) {
-        let held = neutral_reading();
+        session_holding(at, &neutral_head_pose(), Extras::default());
+    }
+
+    /// A fixture session whose hold stands at `head` and whose move lowers it
+    /// by [`DRAFT_TRAVEL_M`], with the antennas and the yaw at their neutral
+    /// reading throughout.
+    fn session_holding(at: &Path, head: &Isometry3<f64>, extras: Extras) {
+        let mut held = neutral_reading();
+        held.legs = cranks_at(head).legs;
         let lowered = Isometry3::from_parts(
-            (neutral_head_pose().translation.vector
-                + nalgebra::Vector3::new(0.0, 0.0, DRAFT_TRAVEL_M))
-            .into(),
-            neutral_head_pose().rotation,
+            (head.translation.vector + nalgebra::Vector3::new(0.0, 0.0, DRAFT_TRAVEL_M)).into(),
+            head.rotation,
         );
         let mut moved = held;
         moved.legs = cranks_at(&lowered).legs;
-        fixture(at, &held, &moved);
+        fixture_with(at, &held, &moved, extras);
     }
 
     /// A hold extracts as the one frame the head stood at, and a machine left
@@ -4729,15 +4960,15 @@ mod tests {
         neutral_session(&records);
         let drafted = drafted(&records, "S001").expect("the first hold extracts");
 
-        assert_eq!(drafted.file, "clip-S001.json");
-        assert_eq!(drafted.doc.name, "recorded/session/s001");
-        assert_eq!(drafted.doc.frames.len(), 1, "a pose is one frame");
+        assert_eq!(drafted.file(), "clip-S001.json");
+        assert_eq!(drafted.clip().name, "recorded/session/s001");
+        assert_eq!(drafted.clip().frames.len(), 1, "a pose is one frame");
         assert_eq!(
-            drafted.doc.channels,
+            drafted.clip().channels,
             vec![Channel::Head, Channel::BodyYaw, Channel::Antennas],
             "every channel, in document order"
         );
-        let frame = &drafted.doc.frames[0];
+        let frame = &drafted.clip().frames[0];
         let antennas = frame.antennas.expect("the pair is masked");
         for (side, delta) in antennas.into_iter().enumerate() {
             assert!(
@@ -4764,10 +4995,149 @@ mod tests {
             rotation.angle().to_degrees()
         );
         reachy_clips::format::Clip::from_doc(
-            drafted.doc,
+            drafted.clip().clone(),
             &reachy_clips::envelope::ClipLimits::default(),
         )
         .expect("a draft of no motion loads");
+    }
+
+    /// The pose draft of a hold: a whole base configuration rather than a
+    /// delta, in the format the library emitter reads back, with the pace left
+    /// for the author. The fixture stands at neutral, so every figure is
+    /// neutral's own — a body-frame head delta or an unreduced antenna would
+    /// show up here as a pose nobody held.
+    #[test]
+    fn a_hold_extracts_as_the_pose_document_it_stood_at() {
+        let at = scratch_dir("pose-session-draft-pose");
+        let records = at.join("session");
+        neutral_session(&records);
+        let drafted = as_pose(&records, "S001", Some("stow")).expect("the first hold extracts");
+        let (doc, verdict) = drafted.pose();
+
+        assert_eq!(drafted.file(), "pose-S001.textproto");
+        assert_eq!(doc.name, "stow");
+        assert_eq!(doc.description, "Extracted recorded segment S001.");
+
+        for axis in doc.dt {
+            assert!(axis.abs() < 1e-3, "the head drafted at {:?}", doc.dt);
+        }
+        assert!((doc.dq[0].abs() - 1.0).abs() < 1e-4, "{:?}", doc.dq);
+        assert!(doc.body_yaw.abs() < COUNT_RAD, "yaw {}", doc.body_yaw);
+        let neutral = neutral_targets().antennas;
+        for (side, angle) in doc.antennas.into_iter().enumerate() {
+            assert!(
+                (angle - neutral[side]).abs() < COUNT_RAD,
+                "antenna {side} drafted at {angle}, the lean is {}",
+                neutral[side]
+            );
+        }
+        assert_eq!(doc.duration_ms, 0, "the author states the pace");
+
+        // The verdict is the loader's own check, reported: neutral clears the
+        // envelope by a wide margin and the draft says so.
+        assert!(verdict.contains("envelope: ok"), "{verdict}");
+        assert!(verdict.contains("toggle margins"), "{verdict}");
+
+        let out = at.join("out");
+        write_draft(&out, &drafted).expect("a writable output directory");
+        let written =
+            std::fs::read_to_string(out.join(drafted.file())).expect("the draft is there");
+        assert_eq!(
+            reachy_poses::format::parse_document(&written).expect("the draft parses"),
+            *doc
+        );
+        // Until the author states a pace, the loader refuses it: a draft
+        // nobody edited cannot be committed as an asset.
+        assert!(reachy_poses::format::Pose::from_text(&written).is_err());
+
+        let unnamed = as_pose(&records, "S001", None).expect("the first hold extracts");
+        assert_eq!(unnamed.pose().0.name, "recorded/session/s001");
+    }
+
+    /// A pose outside the envelope is still drafted, with the violation printed
+    /// beside it. The numbers of a pose that cannot be an asset are what tell
+    /// an author whether the recording or the limit is the thing to look at, so
+    /// the verdict reports and does not gate.
+    #[test]
+    fn a_hold_outside_the_envelope_drafts_with_its_violation() {
+        let at = scratch_dir("pose-session-draft-pose-refused");
+        let records = at.join("session");
+        // Near the top of vertical travel, where the linkage's clearance falls
+        // under the floor a document is held to: reachable, and not a pose this
+        // machine may be commanded to.
+        let tight = Isometry3::translation(0.0, 0.0, 0.2000);
+        session_holding(&records, &tight, Extras::default());
+
+        let drafted =
+            as_pose(&records, "S001", Some("tight")).expect("a refused pose still drafts");
+        let (doc, verdict) = drafted.pose();
+        assert!(
+            verdict.contains("clearance") || verdict.contains("margin"),
+            "the verdict names the violation: {verdict}"
+        );
+        assert!(!verdict.contains("envelope: ok"), "{verdict}");
+        let margin = reachy_kin::ik::min_pose_margin(default_geometry(), &doc.head_pose_body());
+        assert!(
+            verdict.contains(&format!("smallest {:.2} mm", margin * 1e3)),
+            "the printed minimum is the pose's own clearance: {verdict}"
+        );
+
+        let out = at.join("out");
+        write_draft(&out, &drafted).expect("a writable output directory");
+        let written =
+            std::fs::read_to_string(out.join(drafted.file())).expect("the draft is there");
+        assert_eq!(
+            reachy_poses::format::parse_document(&written).expect("the draft parses"),
+            *doc
+        );
+        let mut paced = doc.clone();
+        paced.duration_ms = 800;
+        assert!(matches!(
+            reachy_poses::format::Pose::from_doc(paced),
+            Err(reachy_poses::format::PoseDocError::Envelope(_))
+        ));
+    }
+
+    /// A pose states every channel, so a hold the recording read one antenna
+    /// through is refused rather than drafted with a number nobody measured.
+    #[test]
+    fn a_hold_with_an_antenna_unread_is_refused_as_a_pose() {
+        let at = scratch_dir("pose-session-draft-pose-unread");
+        let records = at.join("session");
+        session_holding(
+            &records,
+            &neutral_head_pose(),
+            Extras {
+                silent: Some((&[ROW_COUNT - 1], 0)),
+                ..Extras::default()
+            },
+        );
+        let refused = as_pose(&records, "S001", Some("stow")).expect_err("a channel went unread");
+        assert!(
+            refused.contains("S001 cannot be extracted as a pose")
+                && refused.contains("carries no reading of the left antenna"),
+            "{refused:?}"
+        );
+    }
+
+    /// A move has no pose, and a name the library would not file is refused
+    /// for a pose draft as it is for a clip one.
+    #[test]
+    fn a_move_and_an_unusable_name_are_refused_as_poses() {
+        let at = scratch_dir("pose-session-draft-pose-refusals");
+        let records = at.join("session");
+        neutral_session(&records);
+        let refused = as_pose(&records, "S002", None).expect_err("a move is not a pose");
+        assert!(
+            refused.contains("S002 cannot be extracted as a pose")
+                && refused.contains("this stretch is a move"),
+            "{refused:?}"
+        );
+        let refused = as_pose(&records, "S001", Some("Stow")).expect_err("a name with a capital");
+        assert!(
+            refused.contains("pose name \"Stow\" is unusable") && refused.contains("--name"),
+            "{refused:?}"
+        );
     }
 
     /// A move extracts as one frame per reading of it, in order, and the file
@@ -4785,6 +5155,8 @@ mod tests {
                 segment: "S002".to_owned(),
                 name: Some("recorded/wake/raise".to_owned()),
                 channels: ChannelMask::all(),
+                as_pose: false,
+                poses: pose_dir(),
             }),
         );
         let drafted = analysis
@@ -4799,25 +5171,25 @@ mod tests {
             .expect("the second segment");
         assert_eq!(moved.kind, DocKind::Motion);
         assert_eq!(
-            drafted.doc.frames.len(),
+            drafted.clip().frames.len(),
             moved.frames,
             "one frame per reading of the move"
         );
-        assert_eq!(drafted.doc.name, "recorded/wake/raise", "--name is used");
+        assert_eq!(drafted.clip().name, "recorded/wake/raise", "--name is used");
         assert!(
             drafted
-                .doc
+                .clip()
                 .description
                 .as_deref()
                 .is_some_and(|said| said.contains("S002")),
             "{:?}",
-            drafted.doc.description
+            drafted.clip().description
         );
         // The travel is in the frames: the last one is 30 mm below the first.
         let height =
             |frame: &reachy_clips::format::FrameDoc| frame.dt.expect("the head is masked")[2];
-        let travelled = height(drafted.doc.frames.last().expect("a last frame"))
-            - height(&drafted.doc.frames[0]);
+        let travelled = height(drafted.clip().frames.last().expect("a last frame"))
+            - height(&drafted.clip().frames[0]);
         assert!(
             (travelled - DRAFT_TRAVEL_M).abs() < 5e-3,
             "the draft travels {travelled} m, expected {DRAFT_TRAVEL_M}"
@@ -4825,10 +5197,11 @@ mod tests {
 
         let out = at.join("out");
         write_draft(&out, &drafted).expect("a writable output directory");
-        let written = std::fs::read_to_string(out.join(&drafted.file)).expect("the draft is there");
+        let written =
+            std::fs::read_to_string(out.join(drafted.file())).expect("the draft is there");
         let parsed: reachy_clips::format::ClipDoc =
             serde_json::from_str(&written).expect("the file is the document it was built from");
-        assert_eq!(parsed, drafted.doc);
+        assert_eq!(&parsed, drafted.clip());
     }
 
     /// A stretch of a move the solver could not follow refuses the draft, by
@@ -4866,19 +5239,87 @@ mod tests {
                 segment: "S002".to_owned(),
                 name: None,
                 channels: ChannelMask::of(Channel::Antennas),
+                as_pose: false,
+                poses: pose_dir(),
             }),
         )
         .extraction
         .expect("an extraction was asked for")
         .expect("the antennas were read throughout");
-        assert_eq!(without_head.doc.channels, vec![Channel::Antennas]);
+        assert_eq!(without_head.clip().channels, vec![Channel::Antennas]);
         assert!(
             without_head
-                .doc
+                .clip()
                 .frames
                 .iter()
                 .all(|frame| frame.dt.is_none())
         );
+    }
+
+    /// A base a clip's deltas could not be measured against is refused by what
+    /// is wrong with it, at the file it was looked for in.
+    ///
+    /// `--poses` is the one flag whose wrong value would otherwise change what a
+    /// draft *means* -- every delta is a difference from the base it names -- so
+    /// its two failures are the ones an operator most needs spelled out: a
+    /// directory holding no `neutral` document, and one holding a document this
+    /// build does not read.
+    #[test]
+    fn a_base_the_extractor_cannot_read_is_refused_at_the_file_it_looked_in() {
+        let at = scratch_dir("pose-session-base-unreadable");
+        let records = at.join("session");
+        neutral_session(&records);
+
+        let empty = scratch_dir("pose-session-base-empty");
+        let missing = judge_extracting(
+            &records,
+            SegmentConfig::default(),
+            Some(&Extract {
+                segment: "S001".to_owned(),
+                name: None,
+                channels: ChannelMask::all(),
+                as_pose: false,
+                poses: empty.as_ref().to_path_buf(),
+            }),
+        )
+        .extraction
+        .expect("an extraction was asked for")
+        .expect_err("no neutral document is there to measure against");
+        assert!(
+            missing.contains("neutral") && missing.contains("could not be read"),
+            "{missing:?}"
+        );
+
+        let garbled = scratch_dir("pose-session-base-garbled");
+        std::fs::write(garbled.join("neutral.textproto"), "not a pose at all\n")
+            .expect("a scratch directory this test can write into");
+        let refused = judge_extracting(
+            &records,
+            SegmentConfig::default(),
+            Some(&Extract {
+                segment: "S001".to_owned(),
+                name: None,
+                channels: ChannelMask::all(),
+                as_pose: false,
+                poses: garbled.as_ref().to_path_buf(),
+            }),
+        )
+        .extraction
+        .expect("an extraction was asked for")
+        .expect_err("a document this build does not read");
+        assert!(
+            refused.contains("neutral") && refused.contains("is not a pose this build loads"),
+            "{refused:?}"
+        );
+    }
+
+    /// And the default directory is one the tool can actually read the base out
+    /// of: a relative path, resolved against the working directory a run starts
+    /// in, which under `bazel run` is the runfiles root this target's `data`
+    /// stages the committed documents into.
+    #[test]
+    fn the_default_pose_directory_holds_the_base_a_draft_is_measured_against() {
+        base_pose(Path::new(POSE_DIR)).expect("the default directory holds the neutral document");
     }
 
     /// A segment id this session does not hold, and a name the library would
@@ -4902,6 +5343,8 @@ mod tests {
                 segment: "S001".to_owned(),
                 name: Some("Wake/Raise".to_owned()),
                 channels: ChannelMask::all(),
+                as_pose: false,
+                poses: pose_dir(),
             }),
         )
         .extraction
@@ -5823,6 +6266,8 @@ mod tests {
                 segment: segment.to_owned(),
                 name: None,
                 channels: ChannelMask::all(),
+                as_pose: false,
+                poses: pose_dir(),
             }),
         };
 

@@ -348,7 +348,7 @@ pub fn forward_kinematics(
 mod tests {
     use super::*;
     use crate::baked;
-    use crate::geometry::{neutral_head_pose, rest_head_pose, stow_head_pose};
+    use crate::geometry::{neutral_head_pose, rest_head_pose, sleep_head_pose};
     use crate::ik::{inverse_kinematics, min_pose_margin};
     use crate::testutil::Rng;
     use nalgebra::{Translation3, UnitQuaternion};
@@ -554,7 +554,7 @@ mod tests {
         forward_kinematics(
             &geom,
             &candidate_b_angles(),
-            &stow_head_pose(),
+            &sleep_head_pose(),
             &FkOptions::default(),
             &mut out,
         )
@@ -582,7 +582,7 @@ mod tests {
             "clearance from the pose record {from_pose} m"
         );
 
-        let (seed_metres, _) = pose_gap(&stow_head_pose(), &recorded);
+        let (seed_metres, _) = pose_gap(&sleep_head_pose(), &recorded);
         assert!(
             seed_metres > 0.006,
             "seed was already there ({seed_metres} m)"
@@ -855,10 +855,10 @@ mod tests {
         let opts = FkOptions::default();
 
         let mut first = Isometry3::identity();
-        let a = forward_kinematics(&geom, &angles, &stow_head_pose(), &opts, &mut first)
+        let a = forward_kinematics(&geom, &angles, &sleep_head_pose(), &opts, &mut first)
             .expect("converges");
         let mut second = Isometry3::identity();
-        let b = forward_kinematics(&geom, &angles, &stow_head_pose(), &opts, &mut second)
+        let b = forward_kinematics(&geom, &angles, &sleep_head_pose(), &opts, &mut second)
             .expect("converges");
 
         assert_eq!(a, b);
@@ -874,7 +874,7 @@ mod tests {
         let angles = candidate_b_angles();
 
         let mut out = Isometry3::identity();
-        let stats = forward_kinematics(&geom, &angles, &stow_head_pose(), &opts, &mut out)
+        let stats = forward_kinematics(&geom, &angles, &sleep_head_pose(), &opts, &mut out)
             .expect("converges");
 
         let recomputed = evaluate(&geom, &crank_tips(&geom, &angles), &out).worst();

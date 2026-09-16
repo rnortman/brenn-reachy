@@ -57,7 +57,7 @@ payload="${repo}/target/motion-arm64/release"
 # The paths are the ones the compositions spell, because the point of the layout
 # case below is that these paths and the payload's paths are the same paths.
 config_files=(
-	cogs/clip_library.names.json
+	cogs/library.names.json
 	cogs/clip_library.textproto
 	cogs/mover_params.textproto
 	cogs/robot_logger.textproto
@@ -740,7 +740,7 @@ assert_contains "the build builds the deployables the gate names" "$(calls)" \
 assert_contains "one cquery names every built output" "$(calls)" \
 	"//crates/reachy-motord:reachy_motord + //crates/reachy-host:reachy_host + //crates/reachy-ask:reachy_ask + //crates/reachy-bench:reachy_bench + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:robotcpu_harness.textproto + //cogs:robotcpu_record.textproto + //cogs:clockwork_prelaunch_sh"
 assert_contains "one cquery names the configuration" "$(calls)" \
-	"//cogs:clip_library.names.json + //cogs:robot_config_files + //driver:motord_params.textproto"
+	"//cogs:library.names.json + //cogs:robot_config_files + //driver:motord_params.textproto"
 assert_lacks "and does not name the host's own configuration, which Bazel does not supply" \
 	"$(calls)" "//host:host_params.textproto"
 # Four, not one per file: the shared object and the model set each need one of
@@ -2763,14 +2763,14 @@ done
 # ---------------------------------------------------------------------------
 #
 # `reachy_host` is a launcher app, started from the payload root, so its
-# default `--config` and the `clip_names_path` inside that configuration are both
+# default `--config` and the `library_names_path` inside that configuration are both
 # resolved there. Two things put a file at one of those paths: `config_targets`,
 # whose members are staged at their repo-relative paths, and `host_params_path`,
 # where the subject installs the operator's own configuration -- the host's
 # default `--config` is deliberately not a Bazel-supplied file, which is why it
 # has to be unioned in below. Nothing else joins the two strings to that set:
 # `crates/reachy-host/tests/example_params.rs` compares a file name and the
-# cases above stage stubs of this test's own making, so a `clip_names_path`
+# cases above stage stubs of this test's own making, so a `library_names_path`
 # shortened to a bare file name, or a payload path that moved on one side only,
 # would pass every gate and die at setup on a powered unit.
 
@@ -2792,15 +2792,15 @@ else
 	staged_configs=$(printf '%s\n%s\n' "$staged_configs" "$operator_params" | sort)
 fi
 
-names_path=$(sed -n 's/^clip_names_path: "\([^"]*\)"$/\1/p' \
+names_path=$(sed -n 's/^library_names_path: "\([^"]*\)"$/\1/p' \
 	-- "${real_repo}/host/host_params.example.textproto")
 default_config=$(sed -n 's/^const DEFAULT_CONFIG: &str = "\([^"]*\)";$/\1/p' \
 	-- "${real_repo}/crates/reachy-host/src/main.rs")
 if [ -z "$names_path" ] || [ -z "$default_config" ]; then
 	fail "the host's two payload-relative paths are readable" \
-		"read clip_names_path='${names_path}' DEFAULT_CONFIG='${default_config}'"
+		"read library_names_path='${names_path}' DEFAULT_CONFIG='${default_config}'"
 else
-	assert_eq "the example host config names a clip table the payload stages" \
+	assert_eq "the example host config names a library table the payload stages" \
 		yes "$(member_of "$names_path" "$staged_configs")"
 	assert_eq "and the host's default --config is a file the payload stages" \
 		yes "$(member_of "$default_config" "$staged_configs")"

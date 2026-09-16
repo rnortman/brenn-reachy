@@ -61,7 +61,7 @@ body_yaw_d: 0
 #   the motor's measured ceiling to the shipped floor, and halving the
 #   deceleration four times moved the arrival by seconds and the excursion by
 #   nothing. Gravity loads no side of the gearbox backlash at a vertical, which
-#   is why the fold now leans (`disarm.rs`' STOW_ANTENNAS) as the raised pose
+#   is why the fold leans (the pose library's `stow` document) as the raised pose
 #   already did: at the leaned fold the same rung is quiet in six of six runs,
 #   with the cycle still visible in the arrival's settle allowance and gone from
 #   the judged hold.

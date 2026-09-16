@@ -218,6 +218,28 @@ Nothing has been released, and nothing here has driven a motor.
   ceiling, a composed setpoint is not step-guarded, and the per-tick step bound
   guards only the moves this repo plans for itself.
 
+- **Poses are a library asset, named on the wire and resolved at command time.**
+  The two hard-coded base postures (Up and Stow) become textproto documents
+  under `cogs/poses/`, emitted into a pose library the daemon binds at startup
+  and a sidecar the host and the edge resolve names against. A new crate
+  (`reachy-poses`) owns the document format, its validation --- every pose runs
+  the envelope check before it becomes an asset --- and the screened library the
+  mover, the session and the simulated plant all read. Three poses ship: `stow`
+  (recorded from the physical head, intentionally asymmetric), `neutral` (the
+  previous Up pose, transcribed from code), and `peek` (a new lower posture for
+  wake-word acknowledgement). A script step now names a pose by its library
+  name rather than choosing from a two-value enum; a name the library does not
+  hold is a typed refusal at the edge, and an index the mover cannot resolve is
+  a fault the ladder answers with its own stow. Move durations are per-pose in
+  the document and per-step on the wire, replacing the two global duration
+  parameters. `docs/pose-authoring.md` is the end-to-end procedure: record,
+  extract, emit, bind, deploy.
+
+- **The pose recorder extracts pose documents from recordings.** `--extract
+  <segment> --as-pose --name <name>` on the pose session report writes a
+  textproto draft from a still segment's mean position, with antenna readings
+  reduced to directions and the envelope verdict printed for the author.
+
 ### Fixed
 
 - **A payload built against a brenn-pod working tree gets built.** The
@@ -239,6 +261,30 @@ Nothing has been released, and nothing here has driven a motor.
   side carries the consumer changes and the pin bump.
 
 ### Changed
+
+- **The voice host's name table carries the poses, and the stow clock is no
+  longer a host parameter.** `host_params.textproto` renames `clip_names_path`
+  to `library_names_path` --- one sidecar numbers both libraries, and the host
+  reads it once for both tables --- and drops `stow_duration_ms`: how long the
+  schedule's closing stow takes is the pose library's own pace for the stow,
+  emitted beside the numbering. **A site's `host_params.textproto` needs both
+  edits before this build is deployed**: the host refuses a configuration that
+  still names the removed field, and one that names no `library_names_path` at
+  all. The edge now also refuses a script naming a pose the deployed library
+  does not hold, by the name the sidecar gives it.
+
+- **The vendor's sleep pose is no longer the machine's stow.**
+  `reachy_kin::stow_head_pose()` is renamed `sleep_head_pose()` and kept only
+  as an FK seed and bench kinematics subject. The machine's fold is the
+  committed `stow` document --- lower, intentionally asymmetric, and derived
+  from a recording on the physical head rather than the vendor's published
+  coordinates. The clip and pose generators, the clip library sidecar, and one
+  make target are renamed to reflect the merged library
+  (`gen_library_config`, `library.names.json`, `make library-config`).
+
+- **The head's envelope clearance floor is tighter.** The minimum toggle margin
+  drops from 3 mm to 1.5 mm, half the worst rest settle measured on this unit.
+  The recorded stow clears at 2.66 mm.
 
 - **The voice host barges in on the wake word, and wants the phrase written
   out.** `BRENN_POD_REV` moves to a host whose default barge-in rule cuts an

@@ -38,10 +38,12 @@
 use crate::session_bus::{self, Datagram, Delivery, Entered, Timing};
 use crate::session_ladder::{self, Budgets};
 use crate::session_stow;
-use brenn_reachy__cogs__config_clk_rs::{ServoGains, ServoProfile, SessionParams};
+use brenn_reachy__cogs__config_clk_rs::{
+    PoseLibraryConfig, ServoGains, ServoProfile, SessionParams,
+};
 use brenn_reachy__cogs__motion_clk_rs::{SessionDial, SessionSignals};
 use brenn_reachy__cogs__schedule_clk_rs::{
-    OverlayWindowWire, PostureWire, ScheduledStepWire, SessionScheduleWire, StepKindWire,
+    OverlayWindowWire, ScheduledStepWire, SessionScheduleWire, StepKind, StepKindWire,
 };
 use brenn_reachy__cogs__script_clk_rs::Script;
 use brenn_reachy__cogs__session_clk_rs::{SessionPhase, SessionPhaseWire, SessionStateWire};
@@ -55,7 +57,7 @@ use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire, JointRefWi
 use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKind, ReportKindWire};
 use brenn_reachy__motion__seq_clk_rs::SeqFailureKindWire;
 use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, WindDownOutcomeWire};
-use clockwork_rs::{Clear as _, SyncTime};
+use clockwork_rs::{Clear as _, Duration as SlotDuration, SyncTime};
 use motion_slots::{MS_NS, configured, counters};
 use reachy_motion::arm::{ProfileConfig, row_of_id};
 use reachy_motion::fault::{self, FaultKind};
@@ -65,6 +67,7 @@ use reachy_motion::tick::ResponseKind;
 use reachy_motion::value;
 use reachy_motion::verdict::{self, VerdictError};
 use reachy_motion::winddown::{Disposition, Maneuver, ending, maneuver_of};
+use reachy_poses::config::screen;
 use session_slots::{clear_timeline, held_reports, push_report, report_row};
 
 /// How many motions a library can hold: `cogs/config.clk`'s capacity for them,
@@ -197,6 +200,20 @@ pub fn execute_session(dial: &mut SessionDial<'_>) {
             bus_watchdog: params.bus_watchdog,
         },
     );
+
+    // Where folded is, and how long the machine's own move there takes. Both
+    // come off the pose library, screened here and nowhere else in this
+    // process: a library this screen refuses is a payload whose stow cannot be
+    // solved, and a session that armed on one would be judging arrival against
+    // a pose it could not compute. The record is taken on the first execution
+    // and fixed for the process, like the commissioned one above; the budget
+    // check runs on every execution, because the budget is a parameter this
+    // execution read.
+    let poses: &PoseLibraryConfig = configured(dial.configs.poses, "the session's pose library");
+    let library = screen(poses).unwrap_or_else(|error| {
+        panic!("the session's pose library is not one a machine can be stowed by: {error}")
+    });
+    session_bus::init_disarm_config(&library, params.stow_budget_ns);
 
     // The slot is this cog's own memory and nothing else writes it, so bytes it
     // cannot read are memory gone wrong rather than another writer's opinion.
@@ -711,7 +728,20 @@ fn plan_of(script: &Script) -> Result<SessionScheduleWire, RefusalReasonWire> {
             // The script and the schedule share the step vocabulary, so what a
             // step asks for crosses the screen without being reinterpreted.
             row.set_kind(StepKindWire::from(step.kind));
-            row.set_posture(PostureWire::from(step.posture));
+            row.set_pose_id(step.pose_id);
+            // A base step's pace crosses the same way, and is screened the same
+            // way a span is: a move given no time is not a move, so a base step
+            // that states none is a script this session does not run.
+            if step.kind == StepKind::BasePosture {
+                if step.move_ms == 0 {
+                    return Err(RefusalReasonWire::BAD_TIMES);
+                }
+                row.set_pace(SlotDuration::from_nanos(
+                    i64::from(step.move_ms)
+                        .checked_mul(MS_NS)
+                        .ok_or(RefusalReasonWire::BAD_TIMES)?,
+                ));
+            }
         }
     }
 

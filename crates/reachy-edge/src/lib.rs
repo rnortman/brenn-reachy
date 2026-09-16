@@ -23,9 +23,9 @@
 //! to fit, repairs a step to make it lawful, or retries anything: a script that
 //! does not compile is a script the sender got wrong, and the sender's next
 //! refresh — not this crate — is what recovers. Nor does it touch a pose
-//! number. Postures and library indices are the whole of its vocabulary; every
-//! commanded value is still the mover's to check, and nothing here is a path
-//! around that.
+//! number. Asset names in, library indices out: that is the whole of its
+//! vocabulary; every commanded value is still the mover's to check, and nothing
+//! here is a path around that.
 //!
 //! Three screens and a compile, in order ([`Edge::accept`]):
 //!
@@ -57,6 +57,8 @@
 pub mod alerts;
 pub mod compile;
 pub mod config;
+#[cfg(test)]
+pub mod fixture;
 pub mod intake;
 pub mod names;
 pub mod narrate;
@@ -66,9 +68,11 @@ pub mod story;
 
 pub use alerts::{Alert, Alerts, STALE_ALERT_RUN, Severity};
 pub use compile::{CompileError, compile};
-pub use config::{BODY_CAP_BYTES, ConfigError, EdgeConfig, MIN_BODY_CAP_BYTES, STOW_DURATION_MS};
+pub use config::{BODY_CAP_BYTES, ConfigError, EdgeConfig, MIN_BODY_CAP_BYTES};
 pub use intake::{Accepted, Edge, Origin, Refusal};
-pub use names::{MAX_MOTIONS, MotionEntry, MotionTable, SidecarError};
+pub use names::{
+    MAX_MOTIONS, MAX_POSES, MotionEntry, MotionTable, PoseEntry, PoseTable, SidecarError, parse,
+};
 pub use narrate::{
     UNKNOWN_KIND_PREFIX, edge_line, edge_line_with, lost_line, origin_word, refusal_line,
     restart_line, row_says, row_word, severity_word, timeline_line,

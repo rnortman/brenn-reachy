@@ -338,7 +338,7 @@ pub fn closest(
 mod tests {
     use nalgebra::{Isometry3, UnitQuaternion, Vector3};
     use reachy_motion::joints::JointTargets;
-    use reachy_motion::postures::neutral_targets;
+    use reachy_poses::NEUTRAL_POSE;
     use run_report::Report;
 
     use super::{
@@ -357,7 +357,7 @@ mod tests {
     /// A machine that never moved has no excursion, whatever pose it sat at.
     #[test]
     fn a_still_run_has_no_excursion() {
-        let held = neutral_targets().head_pose_body;
+        let held = committed_poses::targets(NEUTRAL_POSE).head_pose_body;
         let poses = vec![(1, held), (2, held), (3, held)];
         let excursion = excursion(&poses);
         assert_eq!(excursion.offset_m, 0.0);
@@ -378,7 +378,7 @@ mod tests {
     /// first sample rather than from any posture.
     #[test]
     fn one_displaced_sample_is_the_excursion() {
-        let held = neutral_targets().head_pose_body;
+        let held = committed_poses::targets(NEUTRAL_POSE).head_pose_body;
         let poses = vec![(1, held), (2, moved(&held, 0.04, 0.0)), (3, held)];
         let excursion = excursion(&poses);
         assert!(
@@ -395,7 +395,7 @@ mod tests {
     /// hidden by the other sample's score.
     #[test]
     fn the_two_components_are_independent_maxima() {
-        let held = neutral_targets().head_pose_body;
+        let held = committed_poses::targets(NEUTRAL_POSE).head_pose_body;
         let poses = vec![
             (1, held),
             (2, moved(&held, 0.04, 0.0)),
@@ -410,7 +410,7 @@ mod tests {
     /// the sample that arrived.
     #[test]
     fn a_sample_within_both_tolerances_has_arrived() {
-        let wanted = neutral_targets();
+        let wanted = committed_poses::targets(NEUTRAL_POSE);
         let near = moved(
             &wanted.head_pose_body,
             ARRIVAL_OFFSET_M / 2.0,
@@ -434,7 +434,7 @@ mod tests {
     /// says by how much it missed.
     #[test]
     fn a_well_placed_badly_turned_sample_has_not_arrived() {
-        let wanted = neutral_targets();
+        let wanted = committed_poses::targets(NEUTRAL_POSE);
         let askew = moved(&wanted.head_pose_body, 0.0, ARRIVAL_TURN_RAD * 4.0);
         let mut report = Report::default();
         closest(&[(7, askew)], 0, "upright", &wanted, &mut report);
@@ -450,7 +450,7 @@ mod tests {
     /// that only prints how near it got.
     #[test]
     fn an_approach_that_missed_is_numbers_rather_than_a_verdict() {
-        let wanted = neutral_targets();
+        let wanted = committed_poses::targets(NEUTRAL_POSE);
         let askew = moved(&wanted.head_pose_body, 0.0, ARRIVAL_TURN_RAD * 4.0);
         let near = approach(&[(7, askew)], 0, &wanted).expect("one sample is an approach");
         assert_eq!(near.at, 7);
@@ -477,7 +477,7 @@ mod tests {
     /// the samples, not because they are allowed to disagree.
     #[test]
     fn the_fold_answers_what_the_slice_functions_do() {
-        let wanted = neutral_targets();
+        let wanted = committed_poses::targets(NEUTRAL_POSE);
         let held = wanted.head_pose_body;
         let poses = vec![
             (1, held),
@@ -499,7 +499,7 @@ mod tests {
     /// reader a channel carried samples nobody could read.
     #[test]
     fn an_unsolved_estimate_is_counted_and_not_measured() {
-        let wanted = neutral_targets();
+        let wanted = committed_poses::targets(NEUTRAL_POSE);
         let mut motion = Motion::towards(&wanted);
         motion.estimate(4, &PoseEstimateWire::new());
         assert_eq!(motion.seen(), 1);
@@ -513,7 +513,7 @@ mod tests {
     /// still holding the head must not be read as this step's.
     #[test]
     fn samples_before_from_are_not_read() {
-        let wanted = neutral_targets();
+        let wanted = committed_poses::targets(NEUTRAL_POSE);
         let arrived = wanted.head_pose_body;
         let askew = moved(&wanted.head_pose_body, 0.0, ARRIVAL_TURN_RAD * 4.0);
 
@@ -538,7 +538,7 @@ mod tests {
     /// a gesture began at comes off a log, and a log is free to end before it.
     #[test]
     fn a_from_past_the_end_is_no_approach() {
-        let wanted = neutral_targets();
+        let wanted = committed_poses::targets(NEUTRAL_POSE);
         let poses = vec![(1, wanted.head_pose_body)];
         assert_eq!(approach(&poses, 9, &wanted), None);
         assert_eq!(approach(&[], 9, &wanted), None);

@@ -27,7 +27,6 @@
 //! deterministic runner puts every sample on the grid exactly and a scenario
 //! written in milliseconds would be asserting against arithmetic it did not do.
 
-use brenn_reachy__cogs__schedule_clk_rs::PostureWire;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use reachy_motion::joints::{JointRef, ROW_COUNT, flags};
 use scenario::author::Step;
@@ -103,6 +102,7 @@ pub fn steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(script_sent_cycle()),
         end_ns: cycle_at(end_cycle()),
-        posture: Some(PostureWire::UP),
+        pose: Some(scenario::NEUTRAL_POSE),
+        move_ms: None,
     }]
 }

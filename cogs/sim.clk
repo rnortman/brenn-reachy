@@ -108,6 +108,12 @@ cog MotorSim
         // sets the two apart is telling the plant that its cycle is longer or
         // shorter than the one it is woken on.
         params: Tappy<config::SimParams>;
+
+        // Every named base posture, read-only. This cog reads one of them: the
+        // stow, which is where a machine this process has just met is standing
+        // -- a plant that starts anywhere else starts somewhere no real machine
+        // rests.
+        poses: Tappy<config::PoseLibraryConfig>;
     }
 
     states
@@ -333,6 +339,14 @@ box SimBox
         representation=Protobuf<config::SimParams>,
         path="cogs/sim_params.textproto");
     connect sim_params to motor_sim.params;
+
+    // The base postures, so the modelled machine starts folded where the
+    // session judges folded to be. The core binds the same file for its own
+    // readers.
+    new sim_pose_library: SerializedDataFile(
+        representation=Protobuf<config::PoseLibraryConfig>,
+        path="cogs/pose_library.textproto");
+    connect sim_pose_library to motor_sim.poses;
 
     // The sample stream: the driver publishes it, the core's two control-rate
     // cogs run on it, and the driver reads its own last one back for the wire

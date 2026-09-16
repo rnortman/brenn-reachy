@@ -577,10 +577,10 @@ run_seconds=36
 # One file in both places by construction — the payload's copy is built from
 # this one — so a tour whose plan and whose verdict came from the workstation
 # still describes the run the unit performed, and a payload staged before the
-# last `make clip-config` is the freshness refusal's business rather than this
+# last `make library-config` is the freshness refusal's business rather than this
 # script's.
-tour_names="${repo_root}/cogs/clip_library.names.json"
-tour_names_staged=cogs/clip_library.names.json
+tour_names="${repo_root}/cogs/library.names.json"
+tour_names_staged=cogs/library.names.json
 
 # What the table this run was asked for is called inside the fetched run
 # directory.
@@ -1411,8 +1411,8 @@ tour_budget() {
 # refusal comes before anything is pushed or started.
 require_tour_names() {
 	[ -f "$tour_names" ] || die \
-		"no clip name table at ${tour_names}, so the tour has no library to play." \
-		"It is generated beside the library it describes: make clip-config"
+		"no asset name table at ${tour_names}, so the tour has no library to play." \
+		"It is generated beside the library it describes: make library-config"
 }
 
 # Write the table this run was asked for into the fetched run directory.

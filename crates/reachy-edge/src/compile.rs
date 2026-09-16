@@ -7,7 +7,8 @@
 //! play step names a motion and a speed; the wire carries an index and a
 //! window, so the name resolves through the sidecar and the window is
 //! `PlayWindow`'s own span — the motion's clock scaled by the speed, plus a
-//! blend-out that is not.
+//! blend-out that is not. A base step names a pose, and the pose resolves the
+//! same way a motion does: to the number the schedule carries, or to a refusal.
 //!
 //! Two rules are this crate's own, and both are about how a schedule ends.
 //!
@@ -44,14 +45,13 @@
 //! exist so that nothing sent to the session can be refused for *size* — the
 //! one refusal that would be this edge's own fault.
 
-use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, StepKindWire};
+use brenn_reachy__cogs__schedule_clk_rs::StepKindWire;
 use brenn_reachy__cogs__script_clk_rs::{ScriptOverlayWire, ScriptStepWire, ScriptWire};
 use clockwork_rs::{Clear as _, SyncTime};
-use motion_proto::{Base, MotionScript, Posture};
+use motion_proto::{MotionScript, STOW_POSE};
 use thiserror::Error;
 
-use crate::config::EdgeConfig;
-use crate::names::MotionTable;
+use crate::names::{MotionTable, PoseTable};
 
 /// How many steps the schedule holds, and so how many the compile may produce.
 ///
@@ -76,17 +76,25 @@ const FULL_GAIN: f64 = 1.0;
 /// sends part of a timeline.
 #[derive(Clone, Debug, PartialEq, Error)]
 pub enum CompileError {
-    /// The timeline commands no posture: no steps at all, or nothing but
-    /// `keep`.
+    /// The timeline commands no pose: no steps at all, or nothing but `keep`.
     ///
     /// `keep` holds a base the machine is already commanding, and a machine at
-    /// rest has none — so a posture-free script means nothing at rest and this
+    /// rest has none — so a pose-free script means nothing at rest and this
     /// edge cannot tell rest from engagement: the phase it holds is narration
     /// the session published, possibly stale, and never an input to a screen.
     /// Compiled and forwarded, this shape would torque a resting head through a
     /// pointless stow-hold cycle. No publisher emits one today.
-    #[error("the script commands no posture; `keep` alone moves nothing")]
-    NoPosture,
+    #[error("the script commands no pose; `keep` alone moves nothing")]
+    NoPose,
+
+    /// A base step names a pose the deployed library does not hold. Refused
+    /// rather than substituted: a head that stands up because a name did not
+    /// resolve is a machine moving on a guess.
+    #[error("the script names the pose `{name}`, which the library does not hold")]
+    UnknownPose {
+        /// The name that did not resolve.
+        name: String,
+    },
 
     /// A step that owns no time. Unreachable as things stand and kept as the
     /// guard it is: the wire contract's ascending offsets rule out every case
@@ -114,7 +122,7 @@ pub enum CompileError {
         /// The last base step of the timeline.
         after_ms: u64,
         /// How long the stow takes.
-        stow_duration_ms: u32,
+        stow_duration_ms: u64,
         /// The ceiling it had to end inside.
         timeout_ms: u64,
     },
@@ -200,7 +208,11 @@ pub enum CompileError {
 struct Row {
     after_ms: u64,
     duration_ms: u64,
-    posture: Option<Posture>,
+    /// Which pose, as the deployed library numbers it. `None` on a row that
+    /// keeps whatever base is commanded.
+    pose: Option<u16>,
+    /// How long the move to `pose` takes. Zero on a row that names none.
+    move_ms: u64,
 }
 
 /// `script` as the request the session screens, stamped `arrival` and numbered
@@ -221,17 +233,17 @@ pub fn compile(
     script: &MotionScript,
     arrival: SyncTime,
     script_id: u32,
-    config: &EdgeConfig,
     table: &MotionTable,
+    poses: &PoseTable,
 ) -> Result<ScriptWire, CompileError> {
-    let rows = base_rows(script, config)?;
+    let rows = base_rows(script, poses)?;
     if rows.len() > MAX_STEPS {
         return Err(CompileError::TooManySteps { steps: rows.len() });
     }
     let horizon_ms = rows
         .last()
         .map(|row| row.after_ms + row.duration_ms)
-        .expect("a timeline that commands a posture");
+        .expect("a timeline that commands a base; `base_rows` refuses one that does not");
     let overlays = overlay_rows(script, table, horizon_ms)?;
     if overlays.len() > MAX_OVERLAYS {
         return Err(CompileError::TooManyOverlays {
@@ -251,10 +263,11 @@ pub fn compile(
             let step: &mut ScriptStepWire = steps.try_grow().expect("a screened row count");
             step.set_after_ms(field(row.after_ms));
             step.set_duration_ms(field(row.duration_ms));
-            match row.posture {
-                Some(posture) => {
+            match row.pose {
+                Some(pose_id) => {
                     step.set_kind(StepKindWire::BASE_POSTURE);
-                    step.set_posture(posture_wire(posture));
+                    step.set_pose_id(pose_id);
+                    step.set_move_ms(field(row.move_ms));
                 }
                 None => step.set_kind(StepKindWire::BASE_KEEP),
             }
@@ -274,34 +287,70 @@ pub fn compile(
     Ok(message)
 }
 
+/// One base step of the script, resolved: which pose the schedule carries and
+/// how fast the machine goes there, with the name kept for the decisions that
+/// are about the name.
+#[derive(Clone, Copy)]
+struct Base<'a> {
+    pose_id: u16,
+    name: &'a str,
+    pace: u64,
+}
+
 /// The base timeline as intervals, closing stow included.
-fn base_rows(script: &MotionScript, config: &EdgeConfig) -> Result<Vec<Row>, CompileError> {
-    let bases: Vec<(u64, Base)> = script
+fn base_rows(script: &MotionScript, poses: &PoseTable) -> Result<Vec<Row>, CompileError> {
+    // Every pose name resolves before anything else is decided, so a name the
+    // deployed library does not hold is refused wherever in the timeline it sits
+    // rather than only when it happens to be the closing one.
+    let bases: Vec<(u64, Option<Base<'_>>)> = script
         .steps()
         .iter()
         .filter_map(|step| step.action.base().map(|base| (step.after_ms, base)))
-        .collect();
-    if !bases.iter().any(|(_, base)| base.posture().is_some()) {
-        return Err(CompileError::NoPosture);
-    }
-
-    let timeout_ms = script.timeout_ms();
-    let stow_ms = u64::from(config.stow_duration_ms());
-    let (last_after, _) = *bases.last().expect("a timeline that commands a posture");
-    // Which posture closes the timeline is a question about the last step that
+        .map(|(after_ms, base)| match base.pose() {
+            Some(name) => resolve_pose(name, base.move_ms(), poses).map(|(pose_id, pace)| {
+                (
+                    after_ms,
+                    Some(Base {
+                        pose_id,
+                        name,
+                        pace,
+                    }),
+                )
+            }),
+            None => Ok((after_ms, None)),
+        })
+        .collect::<Result<_, _>>()?;
+    // Which pose closes the timeline is a question about the last step that
     // states one, not about the last step: a `keep` states none, and a keep
-    // standing after a stow holds that stow rather than ending it.
-    let (posture_index, closing_posture) = bases
+    // standing after a stow holds that stow rather than ending it. That last
+    // stating step is also the one whose absence means the timeline commands no
+    // pose at all, so both come off this one search.
+    let closing = bases
         .iter()
         .enumerate()
-        .filter_map(|(index, (_, base))| base.posture().map(|posture| (index, posture)))
-        .next_back()
-        .expect("a timeline that commands a posture");
-    let stow_terminal = closing_posture == Posture::Stow;
-    if stow_terminal && posture_index + 1 < bases.len() {
+        .filter_map(|(index, (_, base))| base.map(|base| (index, base)))
+        .next_back();
+    let Some((pose_index, closing)) = closing else {
+        return Err(CompileError::NoPose);
+    };
+
+    let timeout_ms = script.timeout_ms();
+    let stow_terminal = closing.name == STOW_POSE;
+    // How long the fold that ends this timeline takes. A script closing at the
+    // stow itself states the pace, or takes the library's for it; one that does
+    // not is given the stow this compile appends, which runs at the library's
+    // pace and nobody else's. Either way the room the timeline has to leave is
+    // measured against the pace actually used.
+    let stow_ms = if stow_terminal {
+        closing.pace
+    } else {
+        u64::from(poses.stow().duration_ms)
+    };
+    let (last_after, _) = bases[bases.len() - 1];
+    if stow_terminal && pose_index + 1 < bases.len() {
         return Err(CompileError::KeepAfterStow {
-            after_ms: bases[posture_index + 1].0,
-            stow_after_ms: bases[posture_index].0,
+            after_ms: bases[pose_index + 1].0,
+            stow_after_ms: bases[pose_index].0,
         });
     }
     // Where the last of the script's own base steps ends. A closing stow ends
@@ -320,7 +369,7 @@ fn base_rows(script: &MotionScript, config: &EdgeConfig) -> Result<Vec<Row>, Com
     if no_room {
         return Err(CompileError::NoRoomForStow {
             after_ms: last_after,
-            stow_duration_ms: config.stow_duration_ms(),
+            stow_duration_ms: stow_ms,
             timeout_ms,
         });
     }
@@ -338,14 +387,16 @@ fn base_rows(script: &MotionScript, config: &EdgeConfig) -> Result<Vec<Row>, Com
         rows.push(Row {
             after_ms: *after_ms,
             duration_ms: end - *after_ms,
-            posture: base.posture(),
+            pose: base.map(|base| base.pose_id),
+            move_ms: base.map_or(0, |base| base.pace),
         });
     }
     if !stow_terminal {
         rows.push(Row {
             after_ms: last_end,
             duration_ms: stow_ms,
-            posture: Some(Posture::Stow),
+            pose: Some(poses.stow().pose_id),
+            move_ms: stow_ms,
         });
     }
     Ok(rows)
@@ -415,23 +466,42 @@ fn field(ms: u64) -> u32 {
     u32::try_from(ms).expect("a millisecond offset bounded by the script's own timeout ceiling")
 }
 
-/// The posture as the schedule's own vocabulary spells it.
-fn posture_wire(posture: Posture) -> PostureWire {
-    match posture {
-        Posture::Up => PostureWire::UP,
-        Posture::Stow => PostureWire::STOW,
-    }
+/// The number the deployed library gives the pose `name`, and the pace the move
+/// to it runs at.
+///
+/// Identity on the schedule is position in the library, so this is the whole of
+/// the translation: the sidecar numbered the poses the box binds, and a name it
+/// does not hold is refused rather than approximated — a head that moves
+/// somewhere because a name did not resolve is a machine moving on a guess.
+///
+/// The pace comes back with it, because a name and how fast the machine goes
+/// there are answered from the same row: the step's own `move_ms` when it states
+/// one, and otherwise the pace the deployed library holds for that pose.
+fn resolve_pose(
+    name: &str,
+    move_ms: Option<u64>,
+    poses: &PoseTable,
+) -> Result<(u16, u64), CompileError> {
+    let Some(entry) = poses.resolve(name) else {
+        return Err(CompileError::UnknownPose {
+            name: name.to_owned(),
+        });
+    };
+    Ok((
+        entry.pose_id,
+        move_ms.unwrap_or_else(|| u64::from(entry.duration_ms)),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, StepKindWire};
+    use brenn_reachy__cogs__schedule_clk_rs::StepKindWire;
     use brenn_reachy__cogs__script_clk_rs::ScriptWire;
     use clockwork_rs::SyncTime;
-    use motion_proto::{MotionScript, Play, PlayWindow, Posture, Step};
+    use motion_proto::{MotionScript, Play, PlayWindow, STOW_POSE, Step};
 
     use super::{CompileError, MAX_OVERLAYS, MAX_STEPS, compile};
-    use crate::config::EdgeConfig;
+    use crate::fixture::{NEUTRAL_ID, NEUTRAL_POSE as NEUTRAL, PEEK_ID, PEEK_POSE, STOW_ID, poses};
     use crate::names::{MotionEntry, MotionTable};
 
     /// A round instant, so a number read out of the wrong side of the stamping
@@ -440,11 +510,6 @@ mod tests {
 
     /// The id every case here compiles under.
     const SCRIPT_ID: u32 = 7;
-
-    /// The shipped configuration for the machine these cases are about.
-    fn config() -> EdgeConfig {
-        EdgeConfig::for_pod("reachy00")
-    }
 
     /// A two-motion library: one short, one long, at indices a truncation would
     /// show up in.
@@ -484,8 +549,8 @@ mod tests {
             &script(steps, timeout_ms),
             SyncTime::from_nanos(ARRIVAL_NS),
             SCRIPT_ID,
-            &config(),
             &table(),
+            &poses(),
         )
     }
 
@@ -495,7 +560,8 @@ mod tests {
         after_ms: u32,
         duration_ms: u32,
         kind: StepKindWire,
-        posture: PostureWire,
+        pose_id: u16,
+        move_ms: u32,
     }
 
     /// The steps of `message`, in order.
@@ -507,25 +573,29 @@ mod tests {
                 after_ms: step.after_ms(),
                 duration_ms: step.duration_ms(),
                 kind: step.kind(),
-                posture: step.posture(),
+                pose_id: step.pose_id(),
+                move_ms: step.move_ms(),
             })
             .collect()
     }
 
     fn up(after_ms: u64) -> Step {
-        Step::new(after_ms, Posture::Up)
+        Step::new(after_ms, NEUTRAL)
     }
 
     fn stow(after_ms: u64) -> Step {
-        Step::new(after_ms, Posture::Stow)
+        Step::new(after_ms, STOW_POSE)
     }
 
-    fn base_row(after_ms: u32, duration_ms: u32, posture: PostureWire) -> Row {
+    /// The pace is the fixture library's for that pose, which is what a step
+    /// that states none is given.
+    fn base_row(after_ms: u32, duration_ms: u32, pose_id: u16) -> Row {
         Row {
             after_ms,
             duration_ms,
             kind: StepKindWire::BASE_POSTURE,
-            posture,
+            pose_id,
+            move_ms: if pose_id == STOW_ID { 3000 } else { 800 },
         }
     }
 
@@ -537,14 +607,15 @@ mod tests {
         assert_eq!(
             rows(&message),
             vec![
-                base_row(0, 1000, PostureWire::UP),
+                base_row(0, 1000, NEUTRAL_ID),
                 Row {
                     after_ms: 1000,
                     duration_ms: 6000,
                     kind: StepKindWire::BASE_KEEP,
-                    posture: PostureWire::STOW,
+                    pose_id: 0,
+                    move_ms: 0,
                 },
-                base_row(7000, 3000, PostureWire::STOW),
+                base_row(7000, 3000, STOW_ID),
             ],
             "the keep runs to the synthesized stow, which ends at the timeout",
         );
@@ -555,7 +626,7 @@ mod tests {
         let message = compiled(vec![up(500)], 20_000).expect("a lawful script");
         let rows = rows(&message);
         let last = rows.last().expect("a schedule of at least the stow");
-        assert_eq!(last.posture, PostureWire::STOW);
+        assert_eq!(last.pose_id, STOW_ID);
         assert_eq!(
             u64::from(last.after_ms) + u64::from(last.duration_ms),
             20_000,
@@ -568,10 +639,7 @@ mod tests {
         let message = compiled(vec![up(0), stow(2000)], 13_000).expect("a lawful script");
         assert_eq!(
             rows(&message),
-            vec![
-                base_row(0, 2000, PostureWire::UP),
-                base_row(2000, 3000, PostureWire::STOW),
-            ],
+            vec![base_row(0, 2000, NEUTRAL_ID), base_row(2000, 3000, STOW_ID),],
             "the horizon is the stow's end; holding the machine stowed under torque \
              to the timeout is the one pinch hazard",
         );
@@ -648,10 +716,10 @@ mod tests {
         assert_eq!(
             rows(&message),
             vec![
-                base_row(0, 1000, PostureWire::UP),
-                base_row(1000, 1000, PostureWire::STOW),
-                base_row(2000, 15_000, PostureWire::UP),
-                base_row(17_000, 3000, PostureWire::STOW),
+                base_row(0, 1000, NEUTRAL_ID),
+                base_row(1000, 1000, STOW_ID),
+                base_row(2000, 15_000, NEUTRAL_ID),
+                base_row(17_000, 3000, STOW_ID),
             ],
             "the middle stow gets the 1000 ms the next step leaves it; only the closing \
              stow is the configured one",
@@ -668,14 +736,15 @@ mod tests {
         assert_eq!(
             rows(&message),
             vec![
-                base_row(0, 1, PostureWire::UP),
+                base_row(0, 1, NEUTRAL_ID),
                 Row {
                     after_ms: 1,
                     duration_ms: 1,
                     kind: StepKindWire::BASE_KEEP,
-                    posture: PostureWire::STOW,
+                    pose_id: 0,
+                    move_ms: 0,
                 },
-                base_row(2, 3000, PostureWire::STOW),
+                base_row(2, 3000, STOW_ID),
             ],
         );
         assert!(
@@ -689,13 +758,120 @@ mod tests {
     }
 
     #[test]
-    fn a_script_that_commands_no_posture_is_dropped() {
-        assert_eq!(compiled(vec![], 5000), Err(CompileError::NoPosture));
+    fn a_script_that_commands_no_pose_is_dropped() {
+        assert_eq!(compiled(vec![], 5000), Err(CompileError::NoPose));
         assert_eq!(
             compiled(vec![Step::keep(0), Step::keep(1000)], 5000),
-            Err(CompileError::NoPosture),
+            Err(CompileError::NoPose),
             "`keep` alone would torque a resting head through a pointless cycle",
         );
+    }
+
+    #[test]
+    fn a_pose_name_resolves_to_the_number_the_deployed_library_gave_it() {
+        let message = compiled(vec![up(0), Step::new(1000, PEEK_POSE), stow(2000)], 13_000)
+            .expect("a lawful script");
+        assert_eq!(
+            rows(&message)
+                .iter()
+                .map(|row| row.pose_id)
+                .collect::<Vec<_>>(),
+            vec![NEUTRAL_ID, PEEK_ID, STOW_ID],
+            "every pose the sidecar numbers is one the schedule carries, by that number",
+        );
+    }
+
+    #[test]
+    fn a_pose_the_library_does_not_hold_is_dropped() {
+        // Names of legal length, since a name no wire could carry never reaches
+        // the compile: the decode refuses it. None of these is in the sidecar
+        // the fixture library came out of.
+        for name in ["crouch", "up", "Neutral"] {
+            assert_eq!(
+                compiled(vec![Step::new(0, name)], 20_000),
+                Err(CompileError::UnknownPose {
+                    name: name.to_owned()
+                }),
+                "a head that stands up on an unresolved name moves on a guess",
+            );
+        }
+
+        // Anywhere in the timeline, not only where it closes: a name refused
+        // late would have compiled the steps before it.
+        assert_eq!(
+            compiled(vec![up(0), Step::new(1000, "crouch"), stow(2000)], 20_000),
+            Err(CompileError::UnknownPose {
+                name: "crouch".to_owned()
+            }),
+        );
+    }
+
+    /// A step that states its own pace is moved at it, and one that does not
+    /// is moved at the pace the deployed library holds for the pose.
+    ///
+    /// Two different facts on one row: how fast the commander wants the head to
+    /// go there, and how fast this machine goes there when nobody says.
+    #[test]
+    fn a_stated_pace_is_the_rows_and_an_unstated_one_is_the_librarys() {
+        let script = compiled(vec![Step::timed(0, NEUTRAL, 600), stow(4000)], 20_000)
+            .expect("a script whose raise states a pace");
+        let paced = rows(&script);
+        assert_eq!(paced[0].move_ms, 600, "the raise moves at the stated pace");
+        assert_eq!(
+            paced[1].move_ms, 3000,
+            "the appended stow moves at the library's own pace",
+        );
+        let plain = compiled(vec![up(0), stow(4000)], 20_000).expect("a script that states none");
+        assert_eq!(
+            rows(&plain)[0].move_ms,
+            800,
+            "an unstated pace is the library's for that pose",
+        );
+    }
+
+    /// A closing stow that states a pace is given it, span and all: the horizon
+    /// of a stow-terminal script is the fold's own end, so the pace the
+    /// commander stated is what the last step lasts.
+    #[test]
+    fn a_stated_pace_sets_the_closing_stows_span() {
+        let script = compiled(vec![up(0), Step::timed(2000, STOW_POSE, 1500)], 20_000)
+            .expect("a stow-terminal script that paces its own fold");
+        let last = rows(&script).pop().expect("a stow");
+        assert_eq!(
+            last.duration_ms, 1500,
+            "the fold spans the pace it was given"
+        );
+        assert_eq!(last.move_ms, 1500);
+    }
+
+    /// And the room is measured against the pace actually used, so the refusal
+    /// names the fold the sender asked for rather than the library's.
+    #[test]
+    fn no_room_for_the_stow_names_the_pace_it_measured() {
+        assert_eq!(
+            compiled(vec![up(0), Step::timed(2000, STOW_POSE, 9000)], 10_000),
+            Err(CompileError::NoRoomForStow {
+                after_ms: 2000,
+                stow_duration_ms: 9000,
+                timeout_ms: 10_000,
+            }),
+        );
+    }
+
+    #[test]
+    fn a_stow_terminal_script_is_recognised_by_the_reserved_name() {
+        // The reserved name is what makes the horizon fall on the stow rather
+        // than on the timeout, so it is the spelling under test and not `stow`
+        // as a literal here.
+        let closing = compiled(vec![up(0), Step::new(2000, STOW_POSE)], 13_000)
+            .expect("a stow-terminal script");
+        let last = rows(&closing).pop().expect("a stow");
+        assert_eq!(
+            u64::from(last.after_ms) + u64::from(last.duration_ms),
+            5000,
+            "the horizon is the closing stow's end",
+        );
+        assert_eq!(rows(&closing).len(), 2, "nothing is appended");
     }
 
     #[test]
@@ -750,8 +926,8 @@ mod tests {
                 &script,
                 SyncTime::from_nanos(ARRIVAL_NS),
                 SCRIPT_ID,
-                &config(),
                 &absurd,
+                &poses(),
             ),
             Err(CompileError::WindowUnrepresentable {
                 name: "bench/absurd".to_owned(),

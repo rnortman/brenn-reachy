@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 
 use reachy_clips::envelope::ClipLimits;
-use reachy_clips::files::document_paths;
+use reachy_clips::files::{DOCUMENT_EXT, Descend, document_paths};
 use reachy_clips::format::ChannelMask;
 use reachy_clips::vendor::{Import, ImportError, ImportOptions, ROTATION_DRIFT_NOTED, convert};
 
@@ -330,8 +330,8 @@ fn converted_line(name: &str, import: &Import) -> String {
 /// but they would not read is a clip that goes missing between the batch and
 /// the machine.
 fn recordings(input: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let paths =
-        document_paths(input).with_context(|| format!("cannot read {}", input.display()))?;
+    let paths = document_paths(input, DOCUMENT_EXT, Descend::Yes)
+        .with_context(|| format!("cannot read {}", input.display()))?;
     Ok(paths.into_iter().filter(|path| path.is_file()).collect())
 }
 

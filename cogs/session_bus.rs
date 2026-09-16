@@ -67,14 +67,13 @@ use reachy_motion::arm::{
 use reachy_motion::cells::{self, RailRecord};
 use reachy_motion::disarm::{
     DEFAULT_STOW_DWELL, DEFAULT_STOW_TOLERANCE, DisarmConfig, DisarmSequencer, DisarmSummary,
-    stow_targets,
 };
 use reachy_motion::joints::{self, JointGroup, JointRef, ROW_COUNT, ROWS, ServoHealth, flags};
 use reachy_motion::plant::ClassProfile;
 use reachy_motion::seq::{BusResult, SeqAction, Sequencer};
 use reachy_motion::snap::{duration_from_nanos, duration_nanos};
-use reachy_motion::tick::default_motion_config;
 use reachy_motion::{txn, value};
+use reachy_poses::library::PoseLibrary;
 
 /// Build the record of the machine this session commissions, if nothing has.
 ///
@@ -175,34 +174,150 @@ fn arm_config() -> &'static ArmConfig {
 /// The record itself, built once for the life of the process.
 static CONFIGURED: std::sync::OnceLock<ArmConfig> = std::sync::OnceLock::new();
 
+/// Build the record the release is judged against, if nothing has.
+///
+/// Where folded is comes from the pose library, which is an asset rather than a
+/// constant: the screened library holds the stow solved once, in joint space,
+/// against the same geometry the stow *move* is planned against, and this
+/// record carries that solution. The tolerance and the settle are the motion
+/// library's stated defaults and no configuration key, for [`arm_config`]'s
+/// reason -- a second copy of the stow pose is two records able to disagree
+/// about where folded is.
+///
+/// The settle is why the keep-alive rule covers the release phase: two seconds
+/// pass with the machine holding torque and nothing streaming to it, which is
+/// an order of magnitude past the driver's hold timeout.
+///
+/// Called at the top of the cog body on every execution, like
+/// [`init_arm_config`]: the record is taken on the first call and fixed for the
+/// life of the process, and the assertion below is re-run on each so that a
+/// budget this execution's parameters state is the budget compared against.
+///
+/// The three cells are per-process and fixed at first call. The library payload
+/// carries stow pose and pace together, so a unit's cells cannot disagree with
+/// each other; a test binary
+/// where one case binds a library of its own and another reads the pace back is
+/// the one place they can, and the cells go to whichever case ran first.
+///
+/// # Panics
+///
+/// If the library's stow pace is not strictly shorter than `stow_budget_ns`,
+/// naming both numbers and both files. The fault ladder's controlled stow runs
+/// inside that one budget, opened once and never restarted, so a stow paced at
+/// or past it is a controlled stow that can never arrive: the machine would
+/// still reach the Minimum Risk Condition, by the immediate torque-off, with
+/// the controlled half silently dead. Refusing here stops the process at
+/// start-up with the machine de-torqued and nothing commanded, rather than
+/// commissioning a machine whose fault response is configured not to work. A
+/// budget that is no length of time keeps its own answer -- the ladder lets go
+/// of the machine rather than running a maneuver nobody can bound -- so it is
+/// not compared here.
+pub fn init_disarm_config(library: &PoseLibrary<'_>, stow_budget_ns: i64) {
+    let (stow_id, _, pace) = library.stow();
+    if let Ok(budget) = duration_from_nanos(stow_budget_ns) {
+        assert!(
+            pace < budget,
+            "the pose library stows in {} ms and the session's stow budget is {} ms: the \
+             controlled stow the fault ladder commands could never arrive inside the one clock \
+             that bounds it. Lengthen stow_budget_ns in cogs/session_params.textproto or quicken \
+             cogs/poses/stow.textproto",
+            pace.as_millis(),
+            budget.as_millis(),
+        );
+    }
+    let _ = DISARM.get_or_init(|| release_record(library));
+    let _ = STOW_PACE.get_or_init(|| pace);
+    let _ = STOW_POSE_ID.get_or_init(|| stow_id);
+}
+
+/// The record a release is judged against, built from a screened library.
+///
+/// The construction and nothing else: no process state, no first-call rule.
+/// [`init_disarm_config`] holds the answer for the life of a session process
+/// and a checker reading a log builds its own from the committed library, and
+/// the two must agree field for field -- a checker judging a fold against a
+/// record built differently from the one the run used is a green suite over a
+/// machine nobody checked.
+///
+/// The ids are the arm's, and the tolerance and the settle are the motion
+/// library's stated defaults rather than a configuration key, for the reason
+/// [`arm_config`] gives: a second copy of the stow pose is two records able to
+/// disagree about where folded is.
+///
+/// # Panics
+///
+/// If the library's stow does not solve through the linkage, which is a payload
+/// nobody built: the generator's envelope check solved it before the library
+/// was written.
+#[must_use]
+pub fn release_record(library: &PoseLibrary<'_>) -> DisarmConfig {
+    DisarmConfig {
+        ids: SERVO_IDS,
+        stow_targets: library.stow_joints().unwrap_or_else(|error| {
+            panic!("the pose library's stow is not a pose the machine can be folded into: {error}")
+        }),
+        tolerance: DEFAULT_STOW_TOLERANCE,
+        dwell: DEFAULT_STOW_DWELL,
+    }
+}
+
+/// Which pose the fault ladder's controlled stow commands, as the deployed
+/// library numbers it.
+///
+/// The library's own stow and nothing of the ladder's, for the reason
+/// [`stow_pace`] gives: id, target and pace all come off one screened library,
+/// so the fold the ladder commands cannot be a different pose from the fold it
+/// waits for.
+///
+/// # Panics
+///
+/// As [`disarm_config`] does, and for the same reason.
+pub fn stow_pose_id() -> u16 {
+    *STOW_POSE_ID
+        .get()
+        .expect("the stow's id, taken from the pose library at the top of the execution")
+}
+
+static STOW_POSE_ID: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
+/// How long the stow the fault ladder commands takes.
+///
+/// The library's own pace for the stow and nothing of the ladder's: the ladder
+/// carries the machine down at the speed the machine folds at, and a pace stated
+/// by whoever published a script is that script's business and not this
+/// maneuver's.
+///
+/// # Panics
+///
+/// As [`disarm_config`] does, and for the same reason.
+pub fn stow_pace() -> Duration {
+    *STOW_PACE
+        .get()
+        .expect("the stow's pace, taken from the pose library at the top of the execution")
+}
+
+/// The pace itself, taken once for the life of the process.
+static STOW_PACE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
 /// The release this session runs, and what it judges the machine against.
-///
-/// Every value is the motion library's own: the nine ids, the stow pose derived
-/// from the same geometry the stow *move* is planned against, and the tolerance
-/// and settle the library states as its defaults. Nothing here is a
-/// configuration key, for [`arm_config`]'s reason -- a second copy of the stow
-/// pose is two records able to disagree about where folded is.
-///
-/// The settle is why the keep-alive rule covers this phase: two seconds pass
-/// with the machine holding torque and nothing streaming to it, which is an
-/// order of magnitude past the driver's hold timeout.
 ///
 /// Public because the stow maneuvers judge a machine folded against this same
 /// record: where the release verifies stow and where a wind-down decides it is
 /// over must be one pose.
+///
+/// # Panics
+///
+/// If nothing initialised it. Unreachable in the cog: the body's first acts are
+/// [`init_arm_config`] and [`init_disarm_config`], before a single byte of the
+/// slot is read.
 pub fn disarm_config() -> &'static DisarmConfig {
-    static CONFIGURED: std::sync::OnceLock<DisarmConfig> = std::sync::OnceLock::new();
-    CONFIGURED.get_or_init(|| DisarmConfig {
-        ids: SERVO_IDS,
-        // The geometry is a constant of the library and stow is inside its
-        // envelope, so a machine whose geometry cannot fold is a build that
-        // could never have stowed anything.
-        stow_targets: stow_targets(&default_motion_config().geom)
-            .expect("the configured geometry reaches stow"),
-        tolerance: DEFAULT_STOW_TOLERANCE,
-        dwell: DEFAULT_STOW_DWELL,
-    })
+    DISARM
+        .get()
+        .expect("the release record, taken from the pose library at the top of the execution")
 }
+
+/// The record itself, built once for the life of the process.
+static DISARM: std::sync::OnceLock<DisarmConfig> = std::sync::OnceLock::new();
 
 /// What a commissioning sweep checks each servo's provisioned registers against.
 ///

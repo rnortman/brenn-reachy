@@ -67,6 +67,9 @@ rust_test(
     env = {"REACHY_MOTION_TRACE_FIXTURES": "crates/reachy-motion/fixtures/traces"},
     deps = [
         ":reachy_motion",
+        # The head pose the recordings were made at, and the solver that places
+        # the cranks holding it.
+        "//crates/reachy-kin:reachy_kin",
         "//motion:joints_clk_rs",
     ],
 )

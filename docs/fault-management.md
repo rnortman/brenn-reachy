@@ -293,7 +293,13 @@ fall-through-class failure ends the maneuver at `immediate_all_torque_off`
 regardless. A defeated stow therefore ends at the release on the wake that
 steps it, not at the budget: the clock left in hand is what tells the two
 endings apart in the record. Mask expansion therefore strengthens the termination guarantee
-rather than weakening it — nothing in the ladder gates a de-torque.
+rather than weakening it — nothing in the ladder gates a de-torque. The pace of
+the fold the ladder commands is the pose library's own, and the session refuses
+to start unless it is strictly shorter than the full stow budget: a pace the
+clock could never hold even from its opening is a refusal at deploy rather than
+a fault response that quietly does less than it says. That check makes no claim
+about a stow re-commanded inside a running clock — that one gets the remainder,
+which is the rule above.
 
 **Disposition is the sticky maximum.** A fall-through keeps the wind-down's
 own disposition; a servo dropping out during a stow that was heading for rest

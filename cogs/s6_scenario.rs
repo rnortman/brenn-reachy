@@ -27,8 +27,6 @@
 use scenario::author::{Overlay, Step};
 use scenario::{TAIL_CYCLES, UP_DURATION_NS, cycle_at, cycles_for, run_end_cycle};
 
-use brenn_reachy__cogs__schedule_clk_rs::PostureWire;
-
 // The shape of an ordinary run, stated once for every scenario: where a run
 // begins, the cycle a script may first be taken on, and the cycle the machine
 // is armed and holding by.
@@ -208,12 +206,14 @@ pub fn steps() -> [Step; 2] {
         Step {
             start_ns: cycle_at(up_start_cycle()),
             end_ns: cycle_at(stow_start_cycle()),
-            posture: Some(PostureWire::UP),
+            pose: Some(scenario::NEUTRAL_POSE),
+            move_ms: None,
         },
         Step {
             start_ns: cycle_at(stow_start_cycle()),
             end_ns: cycle_at(disengage_cycle()),
-            posture: Some(PostureWire::STOW),
+            pose: Some(scenario::STOW_POSE),
+            move_ms: None,
         },
     ]
 }
@@ -241,6 +241,7 @@ pub fn second_steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(second_script_cycle() + 5),
         end_ns: cycle_at(second_script_cycle() + 55),
-        posture: Some(PostureWire::UP),
+        pose: Some(scenario::NEUTRAL_POSE),
+        move_ms: None,
     }]
 }

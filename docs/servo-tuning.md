@@ -40,6 +40,8 @@ names a directory. At `--push`, every file under it is overlaid onto the staged
 payload at its payload-relative path — `<dir>/cogs/servo_profile.textproto`
 replaces the payload's. Only those three paths are accepted; anything else
 refuses the push. Each overlaid file is named on the console with its sha256.
+The head's move durations are not among the knobs here: they are the pose
+documents' and the scripter's (`docs/pose-authoring.md`).
 
 **Every push**, overlay or not, copies those three files into the run's log root
 as `config/<payload-relative path>`, and `provenance.txt` gains a
@@ -270,10 +272,11 @@ Two consequences worth knowing before an experiment:
   clip's. One 6.5 s hold on the base closes it, so the probe standard's rule
   that a probe run holding nothing judgeable has failed to stimulate anything is
   satisfied by construction.
-- **The probe documents are generated from the constants they step between.**
+- **The probe documents are generated from the poses they step between.**
   `cogs/probe_clips.rs` holds a table — per probe, a name, a description, a
-  channel and a list of hold and ramp segments over the tree's own named poses —
-  and `make clip-config` writes every `cogs/clips/probe/<name>.json` from it
+  channel and a list of hold and ramp segments over the pose library's own
+  antenna folds — and `make library-config` writes every
+  `cogs/clips/probe/<name>.json` from it
   before it emits the library, so both halves are one command. A gate test holds
   the committed documents byte-equal to what the table authors, in both
   directions: a table row with no document and a document with no row each fail.
@@ -301,7 +304,7 @@ each log's `config/` — that is what those runs ran on. Two figures came out th
 nothing had measured before:
 
 **A kept tour is judged against the name table of the commit that recorded it**
-— `git show <commit>:cogs/clip_library.names.json` — for the same reason its
+— `git show <commit>:cogs/library.names.json` — for the same reason its
 `config/` is staged from that commit. A
 motion id is the table's own numbering over the library's sources, so adding an
 instrument to the library renumbers everything that sorts after it: the two
@@ -396,7 +399,7 @@ pose hunts at `400`, with the cycle's amplitude growing with P at both.
 **The answer was the pose.** Straight down is the mirror of straight up —
 gravity loads no side of the gearbox play and the loop hunts across it — and the
 rest pose has leaned ten degrees against that mechanism since it was tuned.
-`STOW_ANTENNAS` now leans by the same magnitude, 10.2°, and inboard, which also
+The fold leans by the same magnitude, 10.2°, and inboard, which also
 tucks the pair; at the leaned fold the same rung is quiet in six of six.
 
 The bound is never widened, and a hunt this procedure cannot quieten is not
@@ -1261,8 +1264,8 @@ probe-run standard **[A]**. The head stands bit-for-bit at the raised base
 through every probe hold, so every hold below is head-still and judged. The four
 holds of a probe run are the engagement hold (where the driver took hold at
 arm-on; nothing drove the joint there) and the clip's three poses — sides at
-`ANTENNA_OUTBOARD`, down at `STOW_ANTENNAS`, up at `NEUTRAL_ANTENNAS` — each
-reached by a one-frame goal step and held 6.5 s.
+`ANTENNA_OUTBOARD`, down at the library's `stow` fold, up at its `neutral`
+lean — each reached by a one-frame goal step and held 6.5 s.
 
 | rung | overlay | antennas | verdict |
 |---|---|---|---|
@@ -1353,7 +1356,7 @@ with P at both poses that hunt. A downward P rung was not walked: it trades the
 one visible cost on record, the parking error, which scales as `1/P`, for a hunt
 that has been accepted.
 
-**What answered the hunt was the pose, not a gain.** `STOW_ANTENNAS` now leans
+**What answered the hunt was the pose, not a gain.** The fold leans
 10.2° inboard of straight down instead of 5.2° outboard of it, on the same
 mechanism the rest pose's lean was chosen against. Six `make motion-probe` runs
 at the leaned fold, payload `edc1cc8`, under A0's own overlay

@@ -1,0 +1,9 @@
+name: "peek"
+description: "recorded 2026-09-16, session record-log-20260916T002036Z S003, an 18 s hold on the de-torqued head. Head just below neutral and turned a few degrees, antennas near their rest lean: the acknowledgement that the machine is listening, distinct from the neutral it answers at."
+# Head relative to the neutral head pose: metres, unit quaternion [w, x, y, z].
+dt: [0.0029000738091053673, -0.0007841804313605779, -0.040717335989298886]
+dq: [0.9993693068598715, -0.001973650565749143, -0.014244382170471998, -0.03246830433746959]
+body_yaw: 0.0
+# Right, then left; radians, a direction.
+antennas: [-0.28241283568967557, 0.2040194447887913]
+duration_ms: 800

@@ -22,7 +22,6 @@ use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKindWire;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use brenn_reachy__motion__reports_clk_rs::RefusalReasonWire;
 use reachy_motion::joints::ROW_COUNT;
-use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use scenario::check;
 use scenario::read::Run;
 
@@ -147,28 +146,28 @@ fn check_arrival(run: &Run, failures: &mut Vec<String>) {
         run,
         "upright",
         stow_start_cycle() - 1,
-        &neutral_targets(),
+        &scenario::neutral_pose(),
         failures,
     );
     check::arrived_at(
         run,
         "stowed",
         disengage_cycle() - 1,
-        &stow_pose_targets(),
+        &scenario::stow_pose(),
         failures,
     );
     check::arrived_at(
         run,
         "upright again",
         second_stow_start_cycle() - 1,
-        &neutral_targets(),
+        &scenario::neutral_pose(),
         failures,
     );
     check::arrived_at(
         run,
         "stowed again",
         second_disengage_cycle() - 1,
-        &stow_pose_targets(),
+        &scenario::stow_pose(),
         failures,
     );
 }

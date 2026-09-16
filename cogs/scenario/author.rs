@@ -18,7 +18,7 @@ use reachy_motion::joints::flags;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, StepKindWire};
+use brenn_reachy__cogs__schedule_clk_rs::StepKindWire;
 use brenn_reachy__cogs__script_clk_rs::{ScriptOverlayWire, ScriptStepWire, ScriptWire};
 use brenn_reachy__cogs__sim_state_clk_rs::{SimCmdWire, SimOpWire};
 use brenn_reachy__hardware__dynamixel__registers_clk_rs::RegIdWire;
@@ -80,9 +80,20 @@ pub struct Step {
     pub start_ns: i64,
     /// When it ends, exclusive.
     pub end_ns: i64,
-    /// The posture it asks for, or `None` for a step that keeps whatever the
-    /// machine was last sent to.
-    pub posture: Option<PostureWire>,
+    /// The pose it asks for, named as the emitted library names it, or `None`
+    /// for a step that keeps whatever the machine was last sent to.
+    ///
+    /// A name and not the number the schedule carries: a scenario is authored
+    /// against the library's vocabulary, and the number is looked up from the
+    /// committed sidecar where the script is written.
+    pub pose: Option<&'static str>,
+    /// How long the move to that pose takes, milliseconds, or `None` for the
+    /// pace the suite states for that pose by default.
+    ///
+    /// A step states its own pace on the wire, so a scenario states one too: the
+    /// two scenarios that lay a hand on the raise want a slower one than the
+    /// rest, and every other scenario wants the suite's.
+    pub move_ms: Option<u32>,
 }
 
 /// One overlay window of a script, as a scenario states it.
@@ -178,8 +189,8 @@ impl InputLog {
         self.playing(at_ns, script_id, steps, &[])
     }
 
-    /// Ask the machine to run a script that also plays motions over its
-    /// postures, sent at `at_ns`.
+    /// Ask the machine to run a script that also plays motions over its base
+    /// poses, sent at `at_ns`.
     ///
     /// The same request as [`Self::script`] with the overlay half filled in: a
     /// script is one message, so a scenario asking for a composition asks for it
@@ -212,10 +223,11 @@ impl InputLog {
                     .expect("a script of no more steps than the schema holds");
                 row.set_after_ms(offset_ms(at_ns, step.start_ns));
                 row.set_duration_ms(offset_ms(step.start_ns, step.end_ns));
-                match step.posture {
-                    Some(posture) => {
+                match step.pose {
+                    Some(pose) => {
                         row.set_kind(StepKindWire::BASE_POSTURE);
-                        row.set_posture(posture);
+                        row.set_pose_id(crate::pose_id(pose));
+                        row.set_move_ms(step.move_ms.unwrap_or_else(|| crate::pace_ms(pose)));
                     }
                     None => row.set_kind(StepKindWire::BASE_KEEP),
                 }

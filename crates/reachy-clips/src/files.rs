@@ -1,12 +1,22 @@
-//! What counts as a motion document on disk, and how a directory of them is
+//! What counts as an asset document on disk, and how a directory of them is
 //! read.
 //!
-//! The one place the rule lives. A library directory is not only motions: the
+//! The one place the rule lives. A library directory is not only documents: the
 //! importer copies each recording's sound sidecar in beside the clip it belongs
-//! to, so a walk selects rather than takes everything. It is also a tree — an
-//! imported set gets its own subdirectory — so the walk descends. And two
-//! documents claiming one name have to be decided by something nobody has to
-//! guess at, so the order is the full path's and not the filesystem's.
+//! to, so a walk selects rather than takes everything. A clip library is also a
+//! tree — an imported set gets its own subdirectory — so the walk descends where
+//! the caller says to. And two documents claiming one name have to be decided by
+//! something nobody has to guess at, so the order is the full path's and not the
+//! filesystem's.
+//!
+//! **Both libraries walk through here.** The extension and the descent are the
+//! caller's — a clip library is `json` and a tree, a pose library is
+//! `textproto` and flat — because what changes between them is those two facts
+//! and nothing about the rule: which entries count, and the sort that decides
+//! an asset's id. Two walks would be two answers to that, and an emitter whose
+//! two libraries were numbered by different rules renumbers one of them against
+//! the sidecar that indexes both. This module sitting in the clip crate is the
+//! same seam `TODO(clips-authoring-split)` names.
 //!
 //! The only host-side I/O in the crate besides the importer binary. It is here
 //! rather than in each consumer because the daemon, the bench and the importer
@@ -23,47 +33,62 @@ use std::path::{Path, PathBuf};
 /// The extension a motion document carries.
 pub const DOCUMENT_EXT: &str = "json";
 
-/// Every motion document under `dir` at any depth, by full path, ascending.
+/// Whether a walk goes into the subdirectories it finds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Descend {
+    /// Into every subdirectory, at any depth: a library that grows a set at a
+    /// time.
+    Yes,
+    /// The named directory only: a library whose documents are authored one at
+    /// a time and all live together.
+    No,
+}
+
+/// Every `ext` document under `dir`, by full path, ascending.
 ///
-/// A library is a tree: an imported set lives in its own subdirectory so two
-/// sets can carry the same stem, and the hand-written documents stay at the
-/// top. The order is the full path's, so where a document sits decides its id
-/// and adding a subdirectory does not renumber what sorts before it.
+/// The order is the full path's, so where a document sits decides its id and
+/// adding a subdirectory does not renumber what sorts before it. With
+/// [`Descend::Yes`] an imported set can live in its own subdirectory so two sets
+/// carry the same stem, and the hand-written documents stay at the top.
 ///
 /// An unreadable directory is the error; an unreadable *file* is not this
-/// function's business, since it has not read one. An entry named `x.json` is a
-/// document whatever it is on disk — a directory so named comes back as a path
-/// that will not read, rather than being descended into.
-pub fn document_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
+/// function's business, since it has not read one. An entry whose name carries
+/// `ext` is a document whatever it is on disk — a directory so named comes back
+/// as a path that will not read, rather than being descended into.
+pub fn document_paths(dir: &Path, ext: &str, descend: Descend) -> io::Result<Vec<PathBuf>> {
     let mut paths: Vec<PathBuf> = Vec::new();
-    collect(dir, &mut paths)?;
+    collect(dir, ext, descend, &mut paths)?;
     paths.sort();
     Ok(paths)
 }
 
-/// Append the documents under `dir` to `paths`, descending into subdirectories.
-fn collect(dir: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
+/// Append the documents under `dir` to `paths`.
+fn collect(dir: &Path, ext: &str, descend: Descend, paths: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == DOCUMENT_EXT) {
+        if path.extension().is_some_and(|found| found == ext) {
             paths.push(path);
-        } else if entry.file_type()?.is_dir() {
-            collect(&path, paths)?;
+        } else if descend == Descend::Yes && entry.file_type()?.is_dir() {
+            collect(&path, ext, descend, paths)?;
         }
     }
     Ok(())
 }
 
-/// Every motion document in `dir` as `(path, text-or-why-not)`, ascending.
+/// Every `ext` document in `dir` as `(path, text-or-why-not)`, ascending.
 ///
 /// One file that will not read is carried as its own error rather than failing
 /// the walk: that is a skip like a document that will not validate, and a
 /// library missing one motion is worth more than no library at all. A directory
 /// that will not read is the error, because that is the caller's own
 /// configuration being wrong.
-pub fn documents(dir: &Path) -> io::Result<Vec<(String, io::Result<String>)>> {
-    Ok(document_paths(dir)?
+pub fn documents(
+    dir: &Path,
+    ext: &str,
+    descend: Descend,
+) -> io::Result<Vec<(String, io::Result<String>)>> {
+    Ok(document_paths(dir, ext, descend)?
         .into_iter()
         .map(|path| {
             let text = fs::read_to_string(&path);
@@ -85,7 +110,8 @@ mod tests {
         for name in ["b.json", "a.json", "a.wav", "notes.txt"] {
             fs::write(dir.join(name), "{}").expect("written");
         }
-        let paths = document_paths(dir.as_ref()).expect("the directory reads");
+        let paths =
+            document_paths(dir.as_ref(), DOCUMENT_EXT, Descend::Yes).expect("the directory reads");
         let names: Vec<String> = paths
             .iter()
             .map(|path| path.file_name().expect("a name").to_string_lossy().into())
@@ -111,7 +137,8 @@ mod tests {
         ] {
             fs::write(path, "{}").expect("written");
         }
-        let found = document_paths(dir.as_ref()).expect("the directory reads");
+        let found =
+            document_paths(dir.as_ref(), DOCUMENT_EXT, Descend::Yes).expect("the directory reads");
         let relative: Vec<String> = found
             .iter()
             .map(|path| {
@@ -132,6 +159,33 @@ mod tests {
         );
     }
 
+    /// A flat walk takes the named directory and nothing under it, and the
+    /// extension is the caller's: the pose library is authored that way.
+    #[test]
+    fn a_flat_walk_stays_in_the_directory_it_was_given() {
+        let dir = scratch_dir("reachy-clips-files-flat");
+        let nested = dir.join("drafts");
+        fs::create_dir_all(&nested).expect("a subdirectory");
+        for path in [
+            dir.join("stow.textproto"),
+            dir.join("neutral.textproto"),
+            dir.join("notes.txt"),
+            nested.join("peek.textproto"),
+        ] {
+            fs::write(path, "name: \"x\"").expect("written");
+        }
+        let found = document_paths(dir.as_ref(), "textproto", Descend::No).expect("it reads");
+        let names: Vec<String> = found
+            .iter()
+            .map(|path| path.file_name().expect("a name").to_string_lossy().into())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["neutral.textproto".to_owned(), "stow.textproto".to_owned()],
+            "the subdirectory's document and the note are not this library's"
+        );
+    }
+
     /// A file that will not read is carried, not fatal; a directory that will
     /// not read is fatal.
     #[test]
@@ -142,12 +196,13 @@ mod tests {
         // is the error shape a caller reports as a skip.
         fs::create_dir_all(dir.join("bad.json")).expect("created");
 
-        let read = documents(dir.as_ref()).expect("the directory reads");
+        let read =
+            documents(dir.as_ref(), DOCUMENT_EXT, Descend::Yes).expect("the directory reads");
         assert_eq!(read.len(), 2);
         assert!(read[0].0.ends_with("bad.json"), "{:?}", read[0].0);
         assert!(read[0].1.is_err(), "a directory does not read as a file");
         assert_eq!(read[1].1.as_deref().expect("read"), "{\"kind\": \"clip\"}");
 
-        assert!(documents(&dir.join("nowhere")).is_err());
+        assert!(documents(&dir.join("nowhere"), DOCUMENT_EXT, Descend::Yes).is_err());
     }
 }

@@ -3,7 +3,7 @@
 //!
 //! Provenance for everything in this module is the Apache-2.0 `reachy_mini`
 //! distribution: the link lengths, crank transforms and platform anchors come
-//! from its `assets/kinematics_data.json`, and the stow pose from the sleep
+//! from its `assets/kinematics_data.json`, and the sleep pose from the sleep
 //! head pose in its daemon backend. A copy of the JSON is vendored under
 //! `tests/fixtures/` and [`tests`] parses it and compares the numbers taken
 //! from it — the two link lengths, the head offset, the six crank transforms
@@ -15,7 +15,7 @@
 //! the JSON's per-motor `limits` field: that field is written as a hard-coded
 //! ±π by the generator that produces the file and describes nothing about the
 //! hardware. Having no fixture, the windows are pinned by the travel sweep in
-//! [`crate::ik`], which asserts where each of them binds; the stow pose is
+//! [`crate::ik`], which asserts where each of them binds; the sleep pose is
 //! pinned only by the crank angles it produces there.
 
 use crate::geometry::BranchSign;
@@ -236,24 +236,24 @@ pub const CRANK_WINDOWS_DEG: [(f64, f64); 6] = [
     (-80.0, 48.0),
 ];
 
-/// Stow head translation in the base frame, metres: the vendor's sleep head
+/// Sleep head translation in the base frame, metres: the vendor's sleep head
 /// pose translation with [`HEAD_Z_OFFSET`] added to reach the base frame.
-pub const STOW_TRANSLATION: [f64; 3] = [-0.021, 0.001, HEAD_Z_OFFSET - 0.044];
+pub const SLEEP_TRANSLATION: [f64; 3] = [-0.021, 0.001, HEAD_Z_OFFSET - 0.044];
 
-/// Stow head pitch, radians (+24.387°).
+/// Sleep head pitch, radians (+24.387°).
 ///
 /// The vendor states the sleep orientation as a rotation matrix rounded to three
 /// decimals, which is not orthonormal; this is the pitch its first column
-/// implies, and the stow pose is rebuilt as an exact rotation about the head y
+/// implies, and the pose is rebuilt as an exact rotation about the head y
 /// axis. The reconstruction moves the resulting crank angles by at most 0.3°
 /// against the rounded matrix.
-pub const STOW_PITCH: f64 = 0.425_634_609_124_168_34;
+pub const SLEEP_PITCH: f64 = 0.425_634_609_124_168_34;
 
 /// Head translation of the tight resting configuration, base frame, metres.
 ///
 /// A recorded observation, not a derivation: this is the configuration the
 /// vendor's simulated backends start from, and it sits 0.141 mm from a singular
-/// configuration of the linkage — a twentieth of the clearance floor commands are
+/// configuration of the linkage — a tenth of the clearance floor commands are
 /// held to. It is the configuration the clearance baseline exists for, so it is
 /// baked here once rather than retyped by each test that needs a rest tighter
 /// than the floor.

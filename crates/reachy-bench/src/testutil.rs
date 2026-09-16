@@ -20,7 +20,7 @@ use dxl_proto::frame::{
 };
 use dxl_proto::{Reg, crc16, rad_to_counts};
 use reachy_bus::{BusPort, BusTiming, ServoMap, named_reg};
-use reachy_kin::{HeadGeometry, LegAngles, inverse_kinematics, rest_head_pose, stow_head_pose};
+use reachy_kin::{HeadGeometry, LegAngles, inverse_kinematics, rest_head_pose, sleep_head_pose};
 use reachy_motion::reg;
 use reachy_motion::{EXPECTED_MODELS, ProvisionExpect, ProvisionTable, RegId};
 
@@ -929,7 +929,7 @@ pub(crate) fn machine_at(cfg: &BenchConfig, legs: &[f64; 6]) -> FakeMachine {
 /// The six crank angles the stow pose holds.
 pub(crate) fn stow_legs() -> [f64; 6] {
     let mut angles = LegAngles([0.0; 6]);
-    inverse_kinematics(&HeadGeometry::default(), &stow_head_pose(), &mut angles)
+    inverse_kinematics(&HeadGeometry::default(), &sleep_head_pose(), &mut angles)
         .expect("the stow pose is reachable");
     angles.0
 }

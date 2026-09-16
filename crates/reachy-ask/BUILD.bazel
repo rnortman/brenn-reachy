@@ -9,6 +9,12 @@
 # A binary and no library: everything it holds is about this one run, and
 # `rust_test(crate = ...)` over a binary is how its own modules are tested.
 #
+# The emitted names sidecar is a compile-time input: the harness stands its edge
+# up without being handed a library, so the numbering its scripts carry is the
+# numbering of the assets it was built beside -- library, sidecar and binary
+# reach a unit as one payload. `$(execpath)` is what `include_str!` needs for a
+# generated file in another package.
+#
 # The target name is the binary's name underscored: rules_rust derives the crate
 # name from the target, and `reachy-ask` is not a Rust identifier.
 
@@ -17,7 +23,11 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 rust_binary(
     name = "reachy_ask",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = ["//cogs:library.names.json"],
     edition = "2024",
+    rustc_env = {
+        "ASK_LIBRARY_NAMES": "$(execpath //cogs:library.names.json)",
+    },
     visibility = ["//visibility:public"],
     deps = [
         "//cogs:schedule_clk_rs",

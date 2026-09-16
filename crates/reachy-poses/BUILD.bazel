@@ -1,0 +1,54 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# Named base postures for the Reachy Mini: the document format, its validation,
+# and the library a pose id resolves through. A pose is a whole base
+# configuration, not a delta over one, which is what makes it a different asset
+# from a clip rather than a one-frame one. Nothing here is a safety gate -- a
+# document it accepts still meets the envelope check on every tick that commands
+# it.
+#
+# The generated Protobuf rendering of the cogs' configuration schemas is a
+# compile-time input: the document reader embeds it and parses every document
+# against a descriptor compiled from it, so the schema a tool enforces is the
+# schema it was built with. `$(execpath)` is enough here: rules_rust renders it
+# absolute at the rustc invocation, which is what `include_str!` needs -- it
+# resolves a relative path against the invoking source file's directory, and that
+# is not where a cross-package generated file sits.
+#
+# The target name is the crate name, underscored: rules_rust derives the crate
+# name from the target, and `reachy-poses` is not a Rust identifier.
+rust_library(
+    name = "reachy_poses",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = ["//cogs:config_clk_proto.proto"],
+    edition = "2024",
+    rustc_env = {
+        "COGS_CONFIG_PROTO": "$(execpath //cogs:config_clk_proto.proto)",
+    },
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cogs:config_clk_rs",
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-motion:reachy_motion",
+        "//geometry:primitives_clk_rs",
+        "@brenn_reachy_crates//:nalgebra",
+        "@brenn_reachy_crates//:prost-reflect",
+        "@brenn_reachy_crates//:protox",
+        "@brenn_reachy_crates//:thiserror",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# The document suite: parsing and arithmetic over in-memory documents, plus the
+# committed documents themselves. What a *directory* of documents means is the
+# generator's business, not this crate's; that these three particular documents
+# still load, and that the machine's stow still clears the clearance floor, is
+# this crate's, because it owns both the loader and the check. The path is
+# relative to the runfiles root, which is a test's working directory.
+rust_test(
+    name = "reachy_poses_test",
+    size = "small",
+    crate = ":reachy_poses",
+    data = ["//cogs:pose_documents"],
+    env = {"POSE_DOCUMENTS": "cogs/poses"},
+)

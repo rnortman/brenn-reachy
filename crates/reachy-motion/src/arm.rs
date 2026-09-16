@@ -62,7 +62,7 @@ use core::time::Duration;
 use nalgebra::Isometry3;
 use reachy_kin::{
     EnvelopeConfig, FkError, FkOptions, HeadGeometry, LegAngles, below_limit, forward_kinematics,
-    min_margin, neutral_head_pose, pose_margins, rest_head_pose, stow_head_pose,
+    min_margin, neutral_head_pose, pose_margins, rest_head_pose, sleep_head_pose,
 };
 
 use crate::joints::{
@@ -226,7 +226,7 @@ pub const DEFAULT_GAINS: GroupGains = GroupGains {
     // the probes hold. What selected the one hunt on record was the pose and
     // not the arrival: the antenna fold hunted at every profile pair from the
     // motor's ceiling to the shipped floor until the fold was leaned off the
-    // vertical, which is what `disarm::STOW_ANTENNAS` is. No integral term:
+    // vertical, which is what the pose library's `stow` document holds. No integral term:
     // an antenna holds nothing up, and both `I 50` and `I 25` hunt past the
     // two-count bound — the second winds the joint past its goal without
     // reversing. The accepted cost is a parking error: the loop stops where
@@ -922,7 +922,7 @@ pub(crate) fn angle_at(joints: &JointVector, row: usize) -> f64 {
 /// with this one about the poses a session can start from.
 #[must_use]
 pub fn rest_pose_seeds() -> [Isometry3<f64>; 3] {
-    [stow_head_pose(), rest_head_pose(), neutral_head_pose()]
+    [sleep_head_pose(), rest_head_pose(), neutral_head_pose()]
 }
 
 /// Commissioning, as a state machine that touches no port.
@@ -1655,7 +1655,7 @@ mod tests {
     use nalgebra::{Translation3, UnitQuaternion};
     use reachy_kin::{
         EnvelopeConfig, LegAngles, inverse_kinematics, min_pose_margin, rest_head_pose,
-        stow_head_pose,
+        sleep_head_pose,
     };
 
     /// Arming's configuration against the envelope's own fences, drawn in by
@@ -1758,7 +1758,7 @@ mod tests {
             [rad_from_counts(-202), rad_from_counts(4051)],
             [3.6, -4.2],
             [0.2, -0.15],
-            crate::disarm::STOW_ANTENNAS,
+            [-3.32, 3.32],
             [
                 10.0 * core::f64::consts::TAU,
                 -10.0 * core::f64::consts::TAU,
@@ -1971,7 +1971,7 @@ mod tests {
         let geom = HeadGeometry::default();
         let opts = FkOptions::default();
         let joints = joints_at(&rest_head_pose());
-        let from_stow = ArmRecord::solve(&geom, &opts, &joints, &[stow_head_pose()])
+        let from_stow = ArmRecord::solve(&geom, &opts, &joints, &[sleep_head_pose()])
             .expect("the stow candidate seeds it");
         let from_rest = ArmRecord::solve(&geom, &opts, &joints, &[rest_head_pose()])
             .expect("the rest candidate seeds it");
@@ -1999,7 +1999,7 @@ mod tests {
         );
         // And the seed is not one of the resting candidates under another name:
         // the pose a lifted machine holds is a long way from either.
-        for resting in [stow_head_pose(), rest_head_pose()] {
+        for resting in [sleep_head_pose(), rest_head_pose()] {
             let apart = (resting.translation.vector - neutral.translation.vector).norm();
             assert!(apart > 0.04, "the resting seed is {apart} m from neutral");
         }
@@ -2014,8 +2014,13 @@ mod tests {
         let opts = FkOptions::default();
         let mut joints = joints_at(&rest_head_pose());
         joints.legs[5] += 1.0;
-        let error = ArmRecord::solve(&geom, &opts, &joints, &[rest_head_pose(), stow_head_pose()])
-            .expect_err("the sixth leg closes nothing");
+        let error = ArmRecord::solve(
+            &geom,
+            &opts,
+            &joints,
+            &[rest_head_pose(), sleep_head_pose()],
+        )
+        .expect_err("the sixth leg closes nothing");
         assert!(matches!(
             error,
             FkError::NoConvergence { .. } | FkError::WrongAssemblyMode { .. }
@@ -2056,8 +2061,13 @@ mod tests {
         for (leg, angle) in joints.legs.iter_mut().enumerate() {
             *angle += if leg % 2 == 0 { PI / 2.0 } else { -PI / 2.0 };
         }
-        let record = ArmRecord::solve(&geom, &opts, &joints, &[rest_head_pose(), stow_head_pose()])
-            .expect("the shifted reading closes the linkage");
+        let record = ArmRecord::solve(
+            &geom,
+            &opts,
+            &joints,
+            &[rest_head_pose(), sleep_head_pose()],
+        )
+        .expect("the shifted reading closes the linkage");
         let tilt = reachy_kin::cone_angle(&record.head_pose_body.rotation).to_degrees();
         assert!((tilt - 55.2).abs() < 0.5, "tilt {tilt}°");
         assert!((record.head_pose_body.translation.z - 0.175_602).abs() < 1e-6);

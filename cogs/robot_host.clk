@@ -260,6 +260,14 @@ box SimDriver
         path="cogs/sim_params.textproto");
     connect plant_params to plant.params;
 
+    // The base postures the plant starts folded at: the same asset the control
+    // process binds, so the two halves of this system agree about where the
+    // machine rests.
+    new plant_pose_library: SerializedDataFile(
+        representation=Protobuf<config::PoseLibraryConfig>,
+        path="cogs/pose_library.textproto");
+    connect plant_pose_library to plant.poses;
+
     // What the control process asked for, off the wire.
     new goal_in: HostGoalIn;
     connect goal_in to HostGoalChan;

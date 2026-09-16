@@ -3450,6 +3450,15 @@ mod tests {
     use crate::seq::{RegId, SeqStepKind, StepContext};
     use reachy_kin::rest_head_pose;
 
+    /// Where these cases fold the antennas, right then left, radians: past
+    /// straight down and leaning inboard, which is the shape of a fold.
+    ///
+    /// A fixture. Where this machine folds is the pose library's `stow`
+    /// document, which a sans-I/O crate reads nothing of; what the arc and
+    /// direction cases below need is only a pair of directions past the half
+    /// turn.
+    const FOLD: [f64; 2] = [-3.32, 3.32];
+
     fn secs(s: f64) -> Duration {
         Duration::from_secs_f64(s)
     }
@@ -3783,7 +3792,7 @@ mod tests {
         cfg.max_step.antennas = f64::INFINITY;
 
         let stow = JointTargets {
-            head_pose_body: reachy_kin::stow_head_pose(),
+            head_pose_body: reachy_kin::sleep_head_pose(),
             ..JointTargets::default()
         };
         let (mut state, pinned) = armed_at(&cfg, &stow);
@@ -3852,7 +3861,7 @@ mod tests {
         // floor faults rather than being trimmed and sent.
         let cfg = MotionConfig::default();
         let stow = JointTargets {
-            head_pose_body: reachy_kin::stow_head_pose(),
+            head_pose_body: reachy_kin::sleep_head_pose(),
             ..JointTargets::default()
         };
         let (mut state, pinned) = armed_at(&cfg, &stow);
@@ -3881,7 +3890,7 @@ mod tests {
     fn a_feasible_move_keeps_the_clock_it_was_given() {
         let cfg = MotionConfig::default();
         let stow = JointTargets {
-            head_pose_body: reachy_kin::stow_head_pose(),
+            head_pose_body: reachy_kin::sleep_head_pose(),
             ..JointTargets::default()
         };
         let (state, _) = armed_at(&cfg, &stow);
@@ -3912,7 +3921,7 @@ mod tests {
     fn a_move_under_the_head_floor_is_stretched_past_it() {
         let cfg = MotionConfig::default();
         let stow = JointTargets {
-            head_pose_body: reachy_kin::stow_head_pose(),
+            head_pose_body: reachy_kin::sleep_head_pose(),
             ..JointTargets::default()
         };
         let requested = secs(0.2);
@@ -4109,7 +4118,7 @@ mod tests {
             ..JointTargets::default()
         };
         let stow = JointTargets {
-            head_pose_body: reachy_kin::stow_head_pose(),
+            head_pose_body: reachy_kin::sleep_head_pose(),
             ..JointTargets::default()
         };
         let calm = MotionCommand::MoveTo {
@@ -4254,7 +4263,7 @@ mod tests {
             ..JointTargets::default()
         };
         let stow = JointTargets {
-            head_pose_body: reachy_kin::stow_head_pose(),
+            head_pose_body: reachy_kin::sleep_head_pose(),
             ..JointTargets::default()
         };
         let command = MotionCommand::MoveTo {
@@ -4313,7 +4322,7 @@ mod tests {
             ..JointTargets::default()
         };
         let stow = JointTargets {
-            head_pose_body: reachy_kin::stow_head_pose(),
+            head_pose_body: reachy_kin::sleep_head_pose(),
             ..JointTargets::default()
         };
         let command = MotionCommand::MoveTo {
@@ -4493,7 +4502,7 @@ mod tests {
         // third of a radian of yaw is what remains.
         let remaining = 0.3;
         let stowed = JointTargets {
-            head_pose_body: reachy_kin::stow_head_pose(),
+            head_pose_body: reachy_kin::sleep_head_pose(),
             ..JointTargets::default()
         };
         let part_way = JointTargets {
@@ -4726,8 +4735,8 @@ mod tests {
             ..JointTargets::default()
         };
         let stow = JointTargets {
-            head_pose_body: reachy_kin::stow_head_pose(),
-            antennas: crate::disarm::STOW_ANTENNAS,
+            head_pose_body: reachy_kin::sleep_head_pose(),
+            antennas: FOLD,
             ..JointTargets::default()
         };
         let raised = JointTargets {
@@ -5037,7 +5046,7 @@ mod tests {
     fn a_constant_offset_emits_the_goals_an_on_time_loop_does() {
         let cfg = MotionConfig::default();
         let stow = JointTargets {
-            head_pose_body: reachy_kin::stow_head_pose(),
+            head_pose_body: reachy_kin::sleep_head_pose(),
             ..JointTargets::default()
         };
         let command = MotionCommand::MoveTo {
@@ -5119,7 +5128,7 @@ mod tests {
         let cfg = MotionConfig::default();
         let requested = MoveDurations::uniform(secs(0.3));
         let stow = JointTargets {
-            head_pose_body: reachy_kin::stow_head_pose(),
+            head_pose_body: reachy_kin::sleep_head_pose(),
             ..JointTargets::default()
         };
 
@@ -5277,7 +5286,7 @@ mod tests {
     /// stowed: the pose every recorded antenna sweep started from.
     fn stowed_with(antennas: [f64; 2]) -> JointTargets {
         JointTargets {
-            head_pose_body: reachy_kin::stow_head_pose(),
+            head_pose_body: reachy_kin::sleep_head_pose(),
             antennas,
             ..JointTargets::default()
         }
@@ -10053,7 +10062,7 @@ mod tests {
     fn an_antenna_sweep_misses_its_outboard_point() {
         let cfg = MotionConfig::default();
         for (side, outboard) in ANTENNA_OUTBOARD.into_iter().enumerate() {
-            let stow = crate::disarm::STOW_ANTENNAS[side];
+            let stow = FOLD[side];
             // Inboard of the outboard point, so its short arc crosses it.
             let crossing = if side == 0 { -2.5 } else { 2.5 };
             for (from, to) in [(stow, 0.0), (0.0, stow), (crossing, 0.0), (0.0, crossing)] {
@@ -10091,7 +10100,7 @@ mod tests {
     fn an_antenna_at_sideways_takes_the_short_way() {
         let cfg = MotionConfig::default();
         for (side, outboard) in ANTENNA_OUTBOARD.into_iter().enumerate() {
-            let stow = crate::disarm::STOW_ANTENNAS[side];
+            let stow = FOLD[side];
             let mut antennas = [0.0; 2];
             antennas[side] = outboard;
             let start = antennas_at(antennas);
@@ -10123,7 +10132,7 @@ mod tests {
     fn an_antenna_commanded_to_sideways_arrives_the_short_way() {
         let cfg = MotionConfig::default();
         for (side, outboard) in ANTENNA_OUTBOARD.into_iter().enumerate() {
-            let stow = crate::disarm::STOW_ANTENNAS[side];
+            let stow = FOLD[side];
             let mut antennas = [0.0; 2];
             antennas[side] = stow;
             let start = antennas_at(antennas);
@@ -10158,7 +10167,7 @@ mod tests {
             ANTENNA_OUTBOARD,
             [-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2]
         );
-        let stow_midpoint = crate::disarm::STOW_ANTENNAS[1] / 2.0;
+        let stow_midpoint = FOLD[1] / 2.0;
         assert!(
             (stow_midpoint - core::f64::consts::FRAC_PI_2).abs() > 0.04,
             "halfway to the fold is {stow_midpoint}, which is not horizontal"
@@ -10203,11 +10212,7 @@ mod tests {
         let (mut state, mut pinned) = armed_at(&cfg, &start);
 
         let mut previous = start.antennas;
-        for directions in [
-            crate::disarm::STOW_ANTENNAS,
-            [0.0, 0.0],
-            crate::disarm::STOW_ANTENNAS,
-        ] {
+        for directions in [FOLD, [0.0, 0.0], FOLD] {
             let (_, out) = run_move(
                 &cfg,
                 &mut state,
@@ -11072,7 +11077,7 @@ mod tests {
             armed_at(
                 cfg,
                 &JointTargets {
-                    head_pose_body: reachy_kin::stow_head_pose(),
+                    head_pose_body: reachy_kin::sleep_head_pose(),
                     ..JointTargets::default()
                 },
             )
@@ -11108,7 +11113,7 @@ mod tests {
             let up = move_to(JointTargets::default(), secs(1.0));
             let back = move_to(
                 JointTargets {
-                    head_pose_body: reachy_kin::stow_head_pose(),
+                    head_pose_body: reachy_kin::sleep_head_pose(),
                     ..JointTargets::default()
                 },
                 secs(1.0),

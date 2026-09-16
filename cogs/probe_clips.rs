@@ -1,17 +1,18 @@
-//! The probe documents, as the constants they step between.
+//! The probe documents, as the poses they step between.
 //!
 //! A probe is an instrument, and what makes it one is the shape of its frame
 //! track: a pose reached in one frame and held, or a ramp of a stated length
 //! between two poses. Both are stated here as a table — poses by name, segments
 //! by frame count — and the JSON document under `cogs/clips/probe/` is written
-//! from it by [`Probe::document`], which `gen_clip_config` calls before it walks
-//! the directory.
+//! from it by [`Probe::document`], which `gen_library_config` calls after it
+//! loads the pose documents and before it walks the clips directory.
 //!
-//! The poses are differences of the tree's own constants ([`NEUTRAL_ANTENNAS`],
-//! [`ANTENNA_OUTBOARD`], [`STOW_ANTENNAS`]), never literals: a document
-//! authored against a fold the tree has since moved loads, emits and holds
-//! exactly as happily, and reads as the instrument it no longer is. Writing the
-//! frames from the constants is what keeps that from being possible.
+//! The poses are differences of where the machine's own antennas stand — the
+//! [`Folds`] the `neutral` and `stow` pose documents author, and
+//! [`ANTENNA_OUTBOARD`] — never literals: a document authored against a fold
+//! the machine has since moved loads, emits and holds exactly as happily, and
+//! reads as the instrument it no longer is. Writing the frames from the library
+//! the machine is commanded through is what keeps that from being possible.
 //!
 //! Two frame conventions, and the difference between them is the whole
 //! distinction between the two kinds of probe:
@@ -29,12 +30,11 @@
 
 use std::fmt::Write as _;
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 
 use reachy_clips::format::{CLIP_KIND, Channel, ClipDoc, FORMAT_VERSION, FrameDoc};
 use reachy_motion::ANTENNA_OUTBOARD;
-use reachy_motion::disarm::STOW_ANTENNAS;
-use reachy_motion::postures::NEUTRAL_ANTENNAS;
+use reachy_poses::format::Pose as LoadedPose;
 
 /// The frame rate every clip document is authored at: the tick rate.
 const FRAME_HZ: f64 = reachy_motion::FLOOR_TICK_HZ;
@@ -47,11 +47,51 @@ const FRAME_HZ: f64 = reachy_motion::FLOOR_TICK_HZ;
 /// a ten-period ramp rather than the step or the stated ramp the table says.
 const BLEND_IN_MS: u32 = 0;
 
+/// Where the machine's own antennas stand, as the pose library says.
+///
+/// The two poses a probe steps between, read out of the documents the emit has
+/// just loaded rather than from constants beside them: the raised lean and the
+/// fold are content the author owns, and a probe that stepped to a fold the
+/// library no longer holds would be measuring a move the machine never makes.
+#[derive(Clone, Copy, Debug)]
+pub struct Folds {
+    /// The antennas of the pose named `neutral`, right then left, radians: the
+    /// lean every clip's deltas are measured over.
+    neutral: [f64; 2],
+    /// The antennas of the pose named `stow`: the fold.
+    stow: [f64; 2],
+}
+
+impl Folds {
+    /// The folds the loaded poses author.
+    ///
+    /// # Errors
+    ///
+    /// If either reserved name is missing. A probe steps between them, so a
+    /// library without both is one this table cannot author an instrument
+    /// against.
+    pub fn of(poses: &[LoadedPose]) -> anyhow::Result<Self> {
+        let antennas = |name: &str| -> anyhow::Result<[f64; 2]> {
+            let pose = poses
+                .iter()
+                .find(|pose| pose.name() == name)
+                .with_context(|| {
+                    format!("the probe documents step to the pose {name}, which the library lacks")
+                })?;
+            Ok(pose.targets().antennas)
+        };
+        Ok(Self {
+            neutral: antennas(reachy_poses::NEUTRAL_POSE)?,
+            stow: antennas(reachy_poses::STOW_POSE)?,
+        })
+    }
+}
+
 /// One antenna pose a probe visits, as a delta over the rest lean.
 ///
 /// A document carries deltas over the base posture it is played on, and the
-/// base holds the antennas at [`NEUTRAL_ANTENNAS`]; so the raised pose is the
-/// zero delta and every other pose is its constant less that lean.
+/// base holds the antennas where the `neutral` pose puts them; so the raised
+/// pose is the zero delta and every other pose is its angle less that lean.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Pose {
     /// The base itself: antennas raised, zero delta.
@@ -68,19 +108,14 @@ pub enum Pose {
 impl Pose {
     /// The antenna deltas, right then left, radians.
     #[must_use]
-    pub fn antennas(self) -> [f64; 2] {
-        let delta = |target: [f64; 2]| {
-            [
-                target[0] - NEUTRAL_ANTENNAS[0],
-                target[1] - NEUTRAL_ANTENNAS[1],
-            ]
-        };
+    pub fn antennas(self, folds: &Folds) -> [f64; 2] {
+        let delta = |target: [f64; 2]| [target[0] - folds.neutral[0], target[1] - folds.neutral[1]];
         match self {
             Self::Up => [0.0, 0.0],
             Self::Sides => delta(ANTENNA_OUTBOARD),
-            Self::Down => delta(STOW_ANTENNAS),
+            Self::Down => delta(folds.stow),
             Self::HalfDown => {
-                let down = delta(STOW_ANTENNAS);
+                let down = delta(folds.stow);
                 [down[0] / 2.0, down[1] / 2.0]
             }
         }
@@ -159,7 +194,7 @@ impl Probe {
     /// If the table does not chain: a ramp whose successor does not open on the
     /// pose it was heading for never emits that pose, and a track ending on a
     /// ramp stops one step short of its own goal.
-    pub fn antenna_frames(&self) -> anyhow::Result<Vec<[f64; 2]>> {
+    pub fn antenna_frames(&self, folds: &Folds) -> anyhow::Result<Vec<[f64; 2]>> {
         if self.channel != Channel::Antennas {
             bail!(
                 "{}: only the antenna channel has a pose set today",
@@ -188,14 +223,14 @@ impl Probe {
             owed = segment.owes();
             match *segment {
                 Segment::Hold { pose, frames: held } => {
-                    frames.extend(std::iter::repeat_n(pose.antennas(), held));
+                    frames.extend(std::iter::repeat_n(pose.antennas(folds), held));
                 }
                 Segment::Ramp {
                     from,
                     to,
                     frames: steps,
                 } => {
-                    let (from, to) = (from.antennas(), to.antennas());
+                    let (from, to) = (from.antennas(folds), to.antennas(folds));
                     #[expect(
                         clippy::cast_precision_loss,
                         reason = "a probe is hundreds of frames, exact as a double"
@@ -233,8 +268,8 @@ impl Probe {
     /// # Errors
     ///
     /// Whatever [`Probe::antenna_frames`] refuses.
-    pub fn document(&self) -> anyhow::Result<String> {
-        let frames = self.antenna_frames()?;
+    pub fn document(&self, folds: &Folds) -> anyhow::Result<String> {
+        let frames = self.antenna_frames(folds)?;
         Ok(render(&ClipDoc {
             version: FORMAT_VERSION,
             kind: CLIP_KIND.to_owned(),
@@ -455,31 +490,39 @@ pub const PROBES: &[Probe] = &[
 mod tests {
     use super::*;
 
-    /// The poses are the constants, as differences over the rest lean. Stated
-    /// here so that moving a constant moves the documents and this case
-    /// together, rather than either one alone.
+    /// Folds a case steps between: not the library's, so that what these cases
+    /// judge is the arithmetic rather than the content, and a pose document the
+    /// author moves does not move an assertion about deltas.
+    const FOLDS: Folds = Folds {
+        neutral: [-0.25, 0.5],
+        stow: [-3.0, 3.25],
+    };
+
+    /// The poses are differences over the library's own rest lean. Stated here
+    /// so that moving a fold moves the documents and this case together, rather
+    /// than either one alone.
     #[test]
-    fn every_pose_is_a_difference_of_the_tree_s_own_constants() {
-        assert_eq!(Pose::Up.antennas(), [0.0, 0.0]);
+    fn every_pose_is_a_difference_of_the_library_s_own_folds() {
+        assert_eq!(Pose::Up.antennas(&FOLDS), [0.0, 0.0]);
         assert_eq!(
-            Pose::Sides.antennas(),
+            Pose::Sides.antennas(&FOLDS),
             [
-                ANTENNA_OUTBOARD[0] - NEUTRAL_ANTENNAS[0],
-                ANTENNA_OUTBOARD[1] - NEUTRAL_ANTENNAS[1]
+                ANTENNA_OUTBOARD[0] - FOLDS.neutral[0],
+                ANTENNA_OUTBOARD[1] - FOLDS.neutral[1]
             ]
         );
         assert_eq!(
-            Pose::Down.antennas(),
+            Pose::Down.antennas(&FOLDS),
             [
-                STOW_ANTENNAS[0] - NEUTRAL_ANTENNAS[0],
-                STOW_ANTENNAS[1] - NEUTRAL_ANTENNAS[1]
+                FOLDS.stow[0] - FOLDS.neutral[0],
+                FOLDS.stow[1] - FOLDS.neutral[1]
             ]
         );
         assert_eq!(
-            Pose::HalfDown.antennas(),
+            Pose::HalfDown.antennas(&FOLDS),
             [
-                Pose::Down.antennas()[0] / 2.0,
-                Pose::Down.antennas()[1] / 2.0
+                Pose::Down.antennas(&FOLDS)[0] / 2.0,
+                Pose::Down.antennas(&FOLDS)[1] / 2.0
             ]
         );
     }
@@ -489,11 +532,11 @@ mod tests {
     #[test]
     fn every_probe_opens_and_closes_on_the_base() {
         for probe in PROBES {
-            let frames = probe.antenna_frames().expect("the table chains");
-            assert_eq!(frames[0], Pose::Up.antennas(), "{}", probe.name);
+            let frames = probe.antenna_frames(&FOLDS).expect("the table chains");
+            assert_eq!(frames[0], Pose::Up.antennas(&FOLDS), "{}", probe.name);
             assert_eq!(
                 frames[frames.len() - 1],
-                Pose::Up.antennas(),
+                Pose::Up.antennas(&FOLDS),
                 "{}",
                 probe.name
             );
@@ -505,7 +548,7 @@ mod tests {
     fn a_probe_emits_the_frames_its_segments_state() {
         for probe in PROBES {
             let stated: usize = probe.segments.iter().map(|segment| segment.frames()).sum();
-            let frames = probe.antenna_frames().expect("the table chains");
+            let frames = probe.antenna_frames(&FOLDS).expect("the table chains");
             assert_eq!(frames.len(), stated, "{}", probe.name);
         }
         let sweep = PROBES
@@ -513,7 +556,10 @@ mod tests {
             .find(|probe| probe.name == "probe/antenna-sweep")
             .expect("the sweep is in the table");
         assert_eq!(
-            sweep.antenna_frames().expect("the table chains").len(),
+            sweep
+                .antenna_frames(&FOLDS)
+                .expect("the table chains")
+                .len(),
             775,
             "15.5 s at the tick rate"
         );
@@ -535,7 +581,7 @@ mod tests {
                     .all(|segment| matches!(segment, Segment::Hold { .. })),
                 "{name} is stepped, not ramped"
             );
-            let frames = probe.antenna_frames().expect("the table chains");
+            let frames = probe.antenna_frames(&FOLDS).expect("the table chains");
             assert_eq!(frames.len(), 1 + 3 * 325, "{name}");
         }
     }
@@ -565,8 +611,8 @@ mod tests {
                 },
             ],
         };
-        let down = Pose::Down.antennas();
-        let frames = probe.antenna_frames().expect("the table chains");
+        let down = Pose::Down.antennas(&FOLDS);
+        let frames = probe.antenna_frames(&FOLDS).expect("the table chains");
         assert_eq!(
             frames,
             vec![
@@ -599,7 +645,9 @@ mod tests {
                 },
             ],
         };
-        let refused = probe.antenna_frames().expect_err("the chain is broken");
+        let refused = probe
+            .antenna_frames(&FOLDS)
+            .expect_err("the chain is broken");
         assert!(format!("{refused:#}").contains("no frame then carries"));
     }
 
@@ -616,7 +664,9 @@ mod tests {
                 frames: 2,
             }],
         };
-        let refused = probe.antenna_frames().expect_err("the track is short");
+        let refused = probe
+            .antenna_frames(&FOLDS)
+            .expect_err("the track is short");
         assert!(format!("{refused:#}").contains("one step short"));
     }
 
@@ -632,7 +682,7 @@ mod tests {
                 frames: 1,
             }],
         };
-        let refused = probe.antenna_frames().expect_err("no yaw poses");
+        let refused = probe.antenna_frames(&FOLDS).expect_err("no yaw poses");
         assert!(format!("{refused:#}").contains("only the antenna channel"));
     }
 
@@ -650,7 +700,7 @@ mod tests {
                 frames: 2,
             }],
         };
-        let document = probe.document().expect("the table chains");
+        let document = probe.document(&FOLDS).expect("the table chains");
         assert_eq!(
             document,
             "{\n  \"blend_in_ms\": 0,\n  \"channels\": [\"antennas\"],\n  \

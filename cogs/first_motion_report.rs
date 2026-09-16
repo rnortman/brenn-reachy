@@ -72,10 +72,23 @@ use pose_reading::{
 use reachy_driver::NOMINAL_CYCLE_NS;
 use reachy_motion::joints::{ROW_COUNT, ROWS, flags, row, rows_of};
 use reachy_motion::plant::{GroupPlants, SHIPPED_PROFILES};
-use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::seq::failure::Name as FailureName;
 use reachy_motion::value;
 use run_report::{Report, verdict};
+
+/// Where the fold puts the machine, as the committed pose library states it.
+///
+/// The asset every consumer of a fold reads, so a report judging arrival at the
+/// stow judges it against the same bytes the run was configured from rather
+/// than against a figure restated here.
+fn stow_pose_targets() -> reachy_motion::joints::JointTargets {
+    committed_poses::library().stow().1
+}
+
+/// Where the attending pose puts the machine, read the same way.
+fn neutral_targets() -> reachy_motion::joints::JointTargets {
+    committed_poses::targets(reachy_poses::NEUTRAL_POSE)
+}
 use stillness_report::{Standard, Stillness, say};
 
 /// How far an antenna may point away from where the posture puts it, radians.

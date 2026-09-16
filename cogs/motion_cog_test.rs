@@ -20,7 +20,7 @@ use brenn_reachy__cogs__motion_clk_rs_test::{
     MoverTestWrapper, PoseTestWrapper, SessionTestWrapper,
 };
 use brenn_reachy__cogs__schedule_clk_rs::{
-    OverlayWindowWire, PostureWire, ScheduledStepWire, SessionScheduleWire, StepKindWire,
+    OverlayWindowWire, ScheduledStepWire, SessionScheduleWire, StepKindWire,
 };
 use brenn_reachy__cogs__script_clk_rs::{ScriptOverlayWire, ScriptStepWire, ScriptWire};
 use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
@@ -47,15 +47,12 @@ use reachy_clips::envelope::ClipLimits;
 use reachy_clips::format::{Channel as ClipChannel, Clip, ClipDoc, FrameDoc};
 use reachy_driver::{NOMINAL_CYCLE_NS, STARTUP_INIT_BUDGET_NS};
 use reachy_kin::{
-    HeadGeometry, LegAngles, default_geometry, inverse_kinematics, neutral_head_pose,
-    rest_head_pose, stow_head_pose, wrap_to_pi,
+    HeadGeometry, LegAngles, inverse_kinematics, neutral_head_pose, rest_head_pose,
+    sleep_head_pose, wrap_to_pi,
 };
-use reachy_motion::NEUTRAL_ANTENNAS;
 use reachy_motion::arm::{Gains, SERVO_IDS, row_of_id};
 use reachy_motion::default_motion_config;
-use reachy_motion::disarm::{
-    DEFAULT_STOW_DWELL, DEFAULT_STOW_TOLERANCE, STOW_ANTENNAS, stow_targets,
-};
+use reachy_motion::disarm::{DEFAULT_STOW_DWELL, DEFAULT_STOW_TOLERANCE};
 use reachy_motion::fault;
 use reachy_motion::joints::ROW_COUNT as JOINT_COUNT;
 use reachy_motion::joints::{
@@ -151,14 +148,14 @@ impl Sample {
 
 /// The nine angles the machine rests at, in bus-row order.
 ///
-/// Through the schema's own vector, which is where the library states the
-/// mapping between a servo's name and its bus row in both directions.
+/// The committed pose library's stow, solved once by its screen -- the same
+/// record the session judges a release against, so a reading built here is at
+/// the fold the cog under test is measuring for. Through the schema's own
+/// vector, which is where the library states the mapping between a servo's name
+/// and its bus row in both directions.
 fn stow_rows() -> [f64; JOINT_COUNT] {
     let mut slot = JointsWire::new();
-    joints::write_vector(
-        slot.clear_valid(),
-        &stow_targets(default_geometry()).expect("the baked geometry reaches stow"),
-    );
+    joints::write_vector(slot.clear_valid(), committed_poses::stow_joints());
     rows_of(
         slot.validate()
             .expect("a cleared vector of angles reads back"),
@@ -434,7 +431,7 @@ fn the_seed_is_the_last_pose_found_and_carries_across_executions() {
     // A run down to the stow pose, which is off-centre and pitched: far enough
     // from neutral that a solve seeded from neutral every time would be
     // answering a different question than one seeded from the pose before.
-    let route = [neutral_head_pose(), rest_head_pose(), stow_head_pose()];
+    let route = [neutral_head_pose(), rest_head_pose(), sleep_head_pose()];
     for (step, wanted) in route.iter().enumerate() {
         let at = T0 + (step as i64) * PERIOD;
         let estimate = one_sample(&mut cog, &sample_at(wanted, at), at);
@@ -456,7 +453,7 @@ fn a_burst_folds_to_the_last_sample_and_the_seed_follows_the_whole_run() {
     // online. An output slot carries one message per execution, so the estimate
     // published is the newest -- an older one is superseded, not lost, because
     // the state it left behind is in the seed.
-    let route = [neutral_head_pose(), rest_head_pose(), stow_head_pose()];
+    let route = [neutral_head_pose(), rest_head_pose(), sleep_head_pose()];
     for (step, wanted) in route.iter().enumerate() {
         let at = T0 + (step as i64) * PERIOD;
         publish(&mut cog, &sample_at(wanted, at), T0);
@@ -466,7 +463,7 @@ fn a_burst_folds_to_the_last_sample_and_the_seed_follows_the_whole_run() {
     let estimate =
         published(&mut cog).expect("one estimate, not three: an output is a single slot");
     assert_eq!(estimate.time_of_validity_ns, T0 + 2 * PERIOD);
-    assert_close(&estimate.pose(), &stow_head_pose());
+    assert_close(&estimate.pose(), &sleep_head_pose());
     assert!(
         cog.try_next_estimate().is_none(),
         "an output slot carries one message per execution",
@@ -554,13 +551,13 @@ fn a_refused_sample_does_not_hide_the_samples_around_it() {
     // The drop is per message; it does not poison the rest of the window.
     publish(&mut cog, &sample_at(&neutral_head_pose(), T0), T0);
     publish_unreadable(&mut cog, T0);
-    publish(&mut cog, &sample_at(&stow_head_pose(), T0 + PERIOD), T0);
+    publish(&mut cog, &sample_at(&sleep_head_pose(), T0 + PERIOD), T0);
     assert!(cog.execute(SyncTime::from_nanos(T0)));
 
     let estimate = published(&mut cog).expect("the last decodable sample in the window");
     assert!(estimate.valid);
     assert_eq!(estimate.time_of_validity_ns, T0 + PERIOD);
-    assert_close(&estimate.pose(), &stow_head_pose());
+    assert_close(&estimate.pose(), &sleep_head_pose());
 }
 
 #[test]
@@ -598,8 +595,35 @@ fn an_invalid_estimate_carries_no_pose_from_the_one_before_it() {
 /// How many cycles ahead of its sample a goal is dated.
 const LAG: i64 = 2;
 
-/// How long the move to the upright posture is given.
+/// How long the move to the attending pose is given.
+///
+/// A pace the schedule carries, so it is what a case writes on its own base
+/// steps rather than a configured number. Different from the fold's, so a case
+/// that timed the two moves fails if the pair is swapped.
 const UP_NS: i64 = 800_000_000;
+
+/// The pose these cases raise to, as the committed library numbers it.
+///
+/// A number and not a name: the schedule carries an index, and what these cases
+/// are about is that the mover resolves it through the library it was
+/// configured with. `the_raise_id_is_a_pose_the_committed_library_holds` pins
+/// that this one is a pose of that library and is not the fold.
+const UP_POSE_ID: u16 = 0;
+
+/// The index the fold sits at, as that library numbers it.
+fn stow_pose_id() -> u16 {
+    committed_poses::library().stow().0
+}
+
+/// Where the antennas rest at the raise, right then left, radians, as the
+/// committed library states it: the pose [`UP_POSE_ID`] names.
+fn neutral_antennas() -> [f64; 2] {
+    committed_poses::library()
+        .targets(UP_POSE_ID)
+        .expect("the raise is a pose the committed library holds")
+        .0
+        .antennas
+}
 
 /// How long the move to stow is given.
 const STOW_NS: i64 = 2_000_000_000;
@@ -659,13 +683,11 @@ struct Cycle {
 /// tree ships: the cases about a jam are cases about what an armed tick does,
 /// and a fixture that left the field at its zero would be testing the one
 /// state a capability run puts the machine in.
-fn params(period_ns: i64, up_ns: i64, stow_ns: i64) -> MoverParamsWire {
+fn params(period_ns: i64) -> MoverParamsWire {
     let mut message = MoverParamsWire::new();
     let params = message.clear_valid();
     params.lag_k = u32::try_from(LAG).expect("a small lag");
     params.period_ns = period_ns;
-    params.up_duration_ns = up_ns;
-    params.stow_duration_ns = stow_ns;
     params.tracking_armed = true.into();
     message
 }
@@ -692,17 +714,39 @@ struct Mover {
     holds: Option<[f64; JOINT_COUNT]>,
     /// Whether the samples carry a reading at all.
     blind: bool,
+    /// The paces this case writes on its base steps: the raise's, then the
+    /// fold's.
+    pace: (i64, i64),
 }
 
 impl Mover {
     /// A cog at stow, disengaged, on the default parameters.
     fn new() -> Self {
-        Self::on(&params(PERIOD, UP_NS, STOW_NS))
+        Self::on(&params(PERIOD))
     }
 
     /// The same, with a clip library its overlay windows can name.
     fn playing(params: &MoverParamsWire, library: &ClipLibraryConfigWire) -> Self {
         let mut mover = Self::on(params);
+        mover.cog.set_config_clips(library);
+        mover
+    }
+
+    /// The same, with the paces this case writes on its base steps.
+    fn paced(params: &MoverParamsWire, up_ns: i64, stow_ns: i64) -> Self {
+        let mut mover = Self::on(params);
+        mover.pace = (up_ns, stow_ns);
+        mover
+    }
+
+    /// Both at once.
+    fn playing_paced(
+        params: &MoverParamsWire,
+        up_ns: i64,
+        stow_ns: i64,
+        library: &ClipLibraryConfigWire,
+    ) -> Self {
+        let mut mover = Self::paced(params, up_ns, stow_ns);
         mover.cog.set_config_clips(library);
         mover
     }
@@ -719,6 +763,7 @@ impl Mover {
         cog.initialize(SyncTime::from_nanos(T0));
         cog.set_config_params(params);
         cog.set_config_profile(&servo_profile());
+        cog.set_config_poses(committed_poses::message());
 
         Self {
             cog,
@@ -728,33 +773,30 @@ impl Mover {
             held: stow_rows(),
             holds: None,
             blind: false,
+            pace: (UP_NS, STOW_NS),
         }
     }
 
     /// Publish a schedule, as the session cog's channel would.
     ///
-    /// The steps are half-open intervals from `T0`, one per posture named, each
-    /// as long as `spans` says in cycles.
-    fn schedule(&mut self, engaged: bool, epoch: u32, spans: &[(i64, Option<PostureWire>)]) {
-        let spans: Vec<(i64, StepKindWire, PostureWire)> = spans
+    /// The steps are half-open intervals from `T0`, one per pose named, each as
+    /// long as `spans` says in cycles.
+    fn schedule(&mut self, engaged: bool, epoch: u32, spans: &[(i64, Option<u16>)]) {
+        let spans: Vec<(i64, StepKindWire, u16)> = spans
             .iter()
-            .map(|(cycles, posture)| match posture {
-                Some(posture) => (*cycles, StepKindWire::BASE_POSTURE, *posture),
-                None => (*cycles, StepKindWire::BASE_KEEP, PostureWire::STOW),
+            .map(|(cycles, pose_id)| match pose_id {
+                Some(pose_id) => (*cycles, StepKindWire::BASE_POSTURE, *pose_id),
+                None => (*cycles, StepKindWire::BASE_KEEP, 0),
             })
             .collect();
         self.schedule_raw(engaged, epoch, &spans);
     }
 
-    /// The same, with each step's kind and posture written as given -- including
-    /// values this build's vocabulary does not declare, which is what a schedule
-    /// from a newer session cog carries.
-    fn schedule_raw(
-        &mut self,
-        engaged: bool,
-        epoch: u32,
-        spans: &[(i64, StepKindWire, PostureWire)],
-    ) {
+    /// The same, with each step's kind and pose written as given -- including a
+    /// kind this build's vocabulary does not declare, or an index the deployed
+    /// library does not hold, which is what a schedule from a newer session cog
+    /// or a skewed emit would carry.
+    fn schedule_raw(&mut self, engaged: bool, epoch: u32, spans: &[(i64, StepKindWire, u16)]) {
         let mut schedule = SessionScheduleWire::new();
         schedule.set_engaged(engaged);
         schedule.set_epoch(epoch);
@@ -762,14 +804,21 @@ impl Mover {
             let mut steps = schedule.steps_mut();
             steps.clear();
             let mut start = T0;
-            for (cycles, kind, posture) in spans {
+            for (cycles, kind, pose_id) in spans {
                 let end = start + cycles * PERIOD;
                 let step: &mut ScheduledStepWire =
                     steps.try_grow().expect("sixteen steps is plenty");
                 step.set_start(SyncTime::from_nanos(start));
                 step.set_end(SyncTime::from_nanos(end));
                 step.set_kind(*kind);
-                step.set_posture(*posture);
+                step.set_pose_id(*pose_id);
+                step.set_pace(clockwork_rs::Duration::from_nanos(
+                    if *pose_id == UP_POSE_ID {
+                        self.pace.0
+                    } else {
+                        self.pace.1
+                    },
+                ));
                 start = end;
             }
         }
@@ -777,7 +826,7 @@ impl Mover {
             .publish_sched(&schedule, SyncTime::from_nanos(self.now));
     }
 
-    /// Publish a schedule carrying overlay windows over one posture step.
+    /// Publish a schedule carrying overlay windows over one base step.
     ///
     /// The step spans the whole run; each window is a motion, the cycles from
     /// `T0` it opens and closes on, its gain and its speed. Times are in cycles
@@ -806,7 +855,8 @@ impl Mover {
             step.set_start(SyncTime::from_nanos(T0));
             step.set_end(SyncTime::from_nanos(T0 + 1000 * PERIOD));
             step.set_kind(StepKindWire::BASE_POSTURE);
-            step.set_posture(PostureWire::UP);
+            step.set_pose_id(UP_POSE_ID);
+            step.set_pace(clockwork_rs::Duration::from_nanos(self.pace.0));
         }
         {
             let mut rows = schedule.overlays_mut();
@@ -970,7 +1020,7 @@ fn standing_up() -> Mover {
     let mut mover = Mover::new();
     // One long step, so the whole run is inside it and a case that wants a
     // retarget publishes a fresh schedule rather than falling off the end.
-    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
+    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
     mover
 }
 
@@ -1007,10 +1057,10 @@ fn engaging_arms_from_the_sample_and_commands_the_posture_the_schedule_names() {
     {
         let angle = mover.at(antenna);
         assert!(
-            (direction(angle) - NEUTRAL_ANTENNAS[side]).abs() < 1e-9,
+            (direction(angle) - neutral_antennas()[side]).abs() < 1e-9,
             "{} stands at {angle} rad rather than at its rest lean {}",
             Name(antenna),
-            NEUTRAL_ANTENNAS[side],
+            neutral_antennas()[side],
         );
     }
     assert_eq!(
@@ -1086,7 +1136,7 @@ fn a_holding_machine_keeps_the_goal_stream_alive_with_the_setpoint_it_is_on() {
 #[test]
 fn a_session_nobody_engaged_is_never_armed_and_never_commands() {
     let mut mover = Mover::new();
-    mover.schedule(false, 1, &[(1000, Some(PostureWire::UP))]);
+    mover.schedule(false, 1, &[(1000, Some(UP_POSE_ID))]);
 
     let cycles = mover.run(5);
     assert!(cycles.iter().all(|cycle| cycle.goal.is_none()));
@@ -1111,7 +1161,7 @@ fn disengaging_ends_the_session_and_stops_the_stream() {
     mover.run(20);
     assert!(mover.cog.state_ctrl().armed());
 
-    mover.schedule(false, 2, &[(1000, Some(PostureWire::UP))]);
+    mover.schedule(false, 2, &[(1000, Some(UP_POSE_ID))]);
     let cycles = mover.run(3);
     assert!(
         cycles.iter().all(|cycle| cycle.goal.is_none()),
@@ -1130,7 +1180,7 @@ fn disengaging_ends_the_session_and_stops_the_stream() {
 
     // Engaging again builds a fresh state from where the machine now stands,
     // rather than resuming the one that ended.
-    mover.schedule(true, 3, &[(1000, Some(PostureWire::STOW))]);
+    mover.schedule(true, 3, &[(1000, Some(stow_pose_id()))]);
     let fresh = mover.step();
     assert!(mover.cog.state_ctrl().armed());
     assert!(fresh.goal.is_some());
@@ -1206,7 +1256,7 @@ fn the_tick_chases_the_setpoint_the_driver_held_and_not_the_goal_it_composed() {
 #[test]
 fn a_servo_profile_of_zero_is_no_plant_for_the_mover_to_judge_against() {
     let shipped = servo_profile();
-    let armed = params(PERIOD, UP_NS, STOW_NS);
+    let armed = params(PERIOD);
     let armed = armed.validate().expect("the fixture's parameters read");
     assert!(
         motion_cogs::commissioned_config(
@@ -1266,7 +1316,7 @@ fn a_servo_profile_of_zero_is_no_plant_for_the_mover_to_judge_against() {
         );
     }
 
-    let gridless = params(0, UP_NS, STOW_NS);
+    let gridless = params(0);
     assert!(
         motion_cogs::commissioned_config(
             shipped.validate().expect("the shipped pair reads"),
@@ -1341,7 +1391,7 @@ fn the_detector_is_armed_by_the_parameter_file_and_by_nothing_else() {
     let shipped = servo_profile();
     let shipped = shipped.validate().expect("the shipped pair reads");
 
-    let armed = params(PERIOD, UP_NS, STOW_NS);
+    let armed = params(PERIOD);
     let cfg = motion_cogs::commissioned_config(
         shipped,
         armed.validate().expect("the fixture's parameters read"),
@@ -1352,7 +1402,7 @@ fn the_detector_is_armed_by_the_parameter_file_and_by_nothing_else() {
         "the shipped parameters arm the detector"
     );
 
-    let mut disarmed = params(PERIOD, UP_NS, STOW_NS);
+    let mut disarmed = params(PERIOD);
     disarmed
         .validate_mut()
         .expect("the fixture's parameters read")
@@ -1563,9 +1613,9 @@ fn a_fresh_engagement_is_the_way_out_of_a_latched_fault() {
     assert!(mover.step().goal.is_none(), "parked");
 
     mover.blind = false;
-    mover.schedule(false, 2, &[(1000, Some(PostureWire::UP))]);
+    mover.schedule(false, 2, &[(1000, Some(UP_POSE_ID))]);
     mover.step();
-    mover.schedule(true, 3, &[(1000, Some(PostureWire::UP))]);
+    mover.schedule(true, 3, &[(1000, Some(UP_POSE_ID))]);
     let fresh = mover.step();
     assert!(
         fresh.goal.is_some(),
@@ -1729,7 +1779,7 @@ fn a_schedule_that_retargets_is_dispatched_and_the_stream_does_not_break() {
 
     // Mid-move, the session asks for stow instead. The epoch is what says the
     // schedule changed; the posture is what says where to.
-    mover.schedule(true, 2, &[(1000, Some(PostureWire::STOW))]);
+    mover.schedule(true, 2, &[(1000, Some(stow_pose_id()))]);
     let cycles = mover.run(120);
     assert!(
         cycles.iter().all(|cycle| cycle.goal.is_some()),
@@ -1737,7 +1787,7 @@ fn a_schedule_that_retargets_is_dispatched_and_the_stream_does_not_break() {
     );
     assert!(reports(&cycles).is_empty(), "a retarget refuses nothing");
 
-    let stow = stow_targets(default_geometry()).expect("the baked geometry reaches stow");
+    let stow = *committed_poses::stow_joints();
     for joint in ROWS {
         let at = mover.at(joint);
         let wanted = stow.get(joint).expect("a bus row");
@@ -1749,7 +1799,7 @@ fn a_schedule_that_retargets_is_dispatched_and_the_stream_does_not_break() {
     }
     assert_eq!(
         mover.at(JointRef::AntennaRight),
-        STOW_ANTENNAS[0],
+        stow.antennas[0],
         "the antennas folded back",
     );
 }
@@ -1762,7 +1812,7 @@ fn a_repeated_schedule_dispatches_nothing_new() {
     mover.run(60);
     let arrived = mover.step().goal.expect("a goal").targets;
 
-    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
+    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
     let same = mover.run(3);
     for cycle in &same {
         assert_eq!(
@@ -1798,10 +1848,7 @@ fn two_posture_steps_under_one_epoch_answer_it_once() {
     mover.schedule(
         true,
         1,
-        &[
-            (BOUNDARY, Some(PostureWire::UP)),
-            (1000, Some(PostureWire::STOW)),
-        ],
+        &[(BOUNDARY, Some(UP_POSE_ID)), (1000, Some(stow_pose_id()))],
     );
 
     let up = mover.run(usize::try_from(BOUNDARY - 1).expect("cycles inside the first step"));
@@ -1847,7 +1894,7 @@ fn two_bumps_in_one_gap_are_answered_once() {
     // published inside the same span.
     const KEEP: usize = 6;
     let keep_until = mover.cycles_from_start() + i64::try_from(KEEP).expect("six cycles") + 1;
-    let spans = [(keep_until, None), (1000, Some(PostureWire::UP))];
+    let spans = [(keep_until, None), (1000, Some(UP_POSE_ID))];
     mover.schedule(true, 2, &spans);
     mover.run(3);
     assert_eq!(
@@ -1916,7 +1963,7 @@ fn an_epoch_bump_alone_dispatches_a_fresh_move() {
 
     // The same step and the same posture at one epoch higher, covering the
     // instants the samples that follow name.
-    mover.schedule(true, 2, &[(1000, Some(PostureWire::UP))]);
+    mover.schedule(true, 2, &[(1000, Some(UP_POSE_ID))]);
     let again = mover.run(3);
     assert!(reports(&again).is_empty(), "a retarget refuses nothing");
 
@@ -1995,11 +2042,7 @@ fn an_epoch_bump_in_a_gap_survives_until_a_step_answers() {
     const KEEP: usize = 4;
     let keep_cycles = i64::try_from(KEEP).expect("four cycles");
     let keep_until = mover.cycles_from_start() + keep_cycles + 1;
-    mover.schedule(
-        true,
-        2,
-        &[(keep_until, None), (1000, Some(PostureWire::UP))],
-    );
+    mover.schedule(true, 2, &[(keep_until, None), (1000, Some(UP_POSE_ID))]);
     let keeping = mover.run(KEEP);
     for cycle in &keeping {
         assert_eq!(
@@ -2049,7 +2092,7 @@ fn an_epoch_bump_in_a_gap_survives_until_a_step_answers() {
 #[test]
 fn a_step_that_keeps_the_base_and_a_gap_both_hold() {
     let mut mover = Mover::new();
-    mover.schedule(true, 1, &[(5, None), (1000, Some(PostureWire::UP))]);
+    mover.schedule(true, 1, &[(5, None), (1000, Some(UP_POSE_ID))]);
 
     let keeping = mover.run(4);
     for cycle in &keeping {
@@ -2159,7 +2202,12 @@ fn the_tick_state_survives_the_slot_it_is_kept_in() {
     assert!(state.armed());
     assert_eq!(state.schedule_epoch_seen(), 1);
     assert_eq!(state.desired_kind(), StepKindWire::BASE_POSTURE);
-    assert_eq!(state.desired_posture(), PostureWire::UP);
+    assert_eq!(state.desired_pose_id(), UP_POSE_ID);
+    assert_eq!(
+        state.desired_pace(),
+        SlotDuration::from_nanos(UP_NS),
+        "the pace the dispatched step asked for outlived the execution",
+    );
 
     let snap = state_of(state.snap());
     assert!(snap.mode == MotionMode::Moving);
@@ -2243,7 +2291,7 @@ fn a_second_raise_in_one_execution_is_counted_rather_than_quietly_lost() {
     mover.schedule(
         true,
         1,
-        &[(2, Some(PostureWire::UP)), (1000, Some(PostureWire::STOW))],
+        &[(2, Some(UP_POSE_ID)), (1000, Some(stow_pose_id()))],
     );
     mover.present[row(JointRef::AntennaRight).expect("a bus row")] = stranded;
 
@@ -2321,8 +2369,8 @@ fn a_command_the_tick_refuses_is_reported_and_moves_nothing() {
 fn a_move_no_servo_could_step_through_is_floored_and_counted() {
     // The whole stand-up in one cycle, which every crank would have to cross in
     // one bus period.
-    let mut mover = Mover::on(&params(PERIOD, PERIOD, STOW_NS));
-    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
+    let mut mover = Mover::paced(&params(PERIOD), PERIOD, STOW_NS);
+    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
 
     let cycles = mover.run(80);
     assert!(
@@ -2352,43 +2400,167 @@ fn a_move_no_servo_could_step_through_is_floored_and_counted() {
         .enumerate()
     {
         assert!(
-            (wrap_to_pi(mover.at(joint)) - NEUTRAL_ANTENNAS[side]).abs() < 1e-6,
+            (wrap_to_pi(mover.at(joint)) - neutral_antennas()[side]).abs() < 1e-6,
             "{joint:?} stands at {} rather than at its rest lean {}",
             mover.at(joint),
-            NEUTRAL_ANTENNAS[side],
+            neutral_antennas()[side],
         );
     }
 }
 
-/// A posture this build's vocabulary does not declare is not a reason to stand
-/// up: stow is where the machine rests and where the minimum risk condition is,
-/// so an unrecognised value goes there.
+/// The move's clock is the row's pace and not a number this cog holds.
+///
+/// One schedule at twice the suite's own raise pace: the move the cog plans runs
+/// for as long as the row asked for, which is what makes the pace the
+/// commander's choice rather than the deployment's.
 #[test]
-fn a_posture_this_build_does_not_know_goes_to_stow() {
+fn the_moves_clock_is_the_pace_the_row_states() {
+    let slow = UP_NS * 2;
+    let mut mover = Mover::paced(&params(PERIOD), slow, STOW_NS);
+    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+    let quick = usize::try_from(UP_NS / PERIOD).expect("a move of whole cycles");
+    mover.run(quick + 5);
+    assert!(
+        state_of(mover.cog.state_ctrl().snap()).mode == MotionMode::Moving,
+        "the suite's own pace would have arrived by here; this row asked for twice it",
+    );
+    mover.run(quick + 45);
+    assert!(
+        state_of(mover.cog.state_ctrl().snap()).mode == MotionMode::Holding,
+        "and the move ends on the clock the row stated",
+    );
+}
+
+/// A row asking for a move of no time is refused, and the machine goes nowhere.
+///
+/// The session screens every base row it publishes for a positive pace, so a row
+/// that arrives with one is bytes gone wrong in the slot this cog reads rather
+/// than a schedule anybody wrote. A clock of no time carries no path for the
+/// step floor to measure, so it is not lengthened into a plausible move: the
+/// trajectory refuses it, the refusal is reported, and holding carries on.
+#[test]
+fn a_row_pacing_a_move_at_no_time_is_refused_and_moves_nothing() {
+    let mut mover = Mover::paced(&params(PERIOD), 0, STOW_NS);
+    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+
+    let first = mover.step();
+    let report = first.report.expect("a move of no time is reported");
+    assert_eq!(report.kind, FaultKindWire::COMMAND_REJECTED);
+    assert!(
+        first.goal.is_some(),
+        "a refusal changes nothing, and holding is still commanding",
+    );
+    assert_eq!(
+        state_of(mover.cog.state_ctrl().snap()).mode,
+        MotionMode::Holding,
+        "no move was started on a clock of no time",
+    );
+}
+
+/// And a pace that is no length of time at all is read as none, not as its size.
+///
+/// The row carries a signed count of nanoseconds; a negative one is the same
+/// bytes gone wrong, and the one answer that must not happen is its magnitude
+/// becoming a clock -- a move nothing ends.
+#[test]
+fn a_row_pacing_a_move_backwards_is_refused_the_same_way() {
+    let mut mover = Mover::paced(&params(PERIOD), -UP_NS, STOW_NS);
+    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+
+    let first = mover.step();
+    assert_eq!(
+        first
+            .report
+            .expect("a move of backwards time is reported")
+            .kind,
+        FaultKindWire::COMMAND_REJECTED,
+    );
+    assert_eq!(
+        state_of(mover.cog.state_ctrl().snap()).mode,
+        MotionMode::Holding,
+        "no move was started on a pace no clock could hold",
+    );
+}
+
+/// A pace is part of what a step asks for, so a row naming the posture already
+/// dispatched at another pace is a fresh ask and dispatches.
+///
+/// Within one epoch, which is what makes the point: the dispatch rule compares
+/// what the row asks for against what was last dispatched, and the posture alone
+/// would say these two rows ask for the same thing.
+#[test]
+fn a_row_naming_the_dispatched_posture_at_another_pace_dispatches() {
+    let mut mover = standing_up();
+    mover.run(4);
+    let before = state_of(mover.cog.state_ctrl().snap()).moving_elapsed;
+    assert!(before > SlotDuration::from_nanos(0), "a move is running");
+
+    // The same epoch and the same posture; only the pace differs.
+    mover.pace = (UP_NS / 2, STOW_NS);
+    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+    mover.run(1);
+    assert_eq!(
+        mover.cog.state_ctrl().desired_pace(),
+        SlotDuration::from_nanos(UP_NS / 2),
+        "the second row's pace is what stands dispatched",
+    );
+    assert_eq!(
+        state_of(mover.cog.state_ctrl().snap()).moving_elapsed,
+        SlotDuration::from_nanos(0),
+        "and the move was re-planned from where the machine stands",
+    );
+}
+
+/// The raise these cases name is a pose the deployed library holds, and it is
+/// not the fold.
+///
+/// The cases below judge where the machine went against the library's own
+/// targets, so a raise id that had drifted onto the fold -- or onto nothing --
+/// would make half of them assert about a machine that never moved.
+#[test]
+fn the_raise_id_is_a_pose_the_committed_library_holds() {
+    let library = committed_poses::library();
+    assert!(
+        library.targets(UP_POSE_ID).is_some(),
+        "the committed library holds the pose these cases raise to",
+    );
+    assert_ne!(UP_POSE_ID, stow_pose_id(), "and it is not the fold");
+}
+
+/// A pose id the deployed library does not hold is refused and nothing moves.
+///
+/// Not a substitution: a head sent to the fold, or anywhere else, because an
+/// index did not resolve is a machine moving on a guess. The refusal travels as
+/// a command rejection, which is the fault ladder's to answer, and the machine
+/// stays where the last move left it in the meantime.
+#[test]
+fn a_pose_id_the_library_does_not_hold_is_refused_and_nothing_moves() {
     let mut mover = standing_up();
     mover.run(60);
-    assert!(
-        (mover.at(JointRef::AntennaRight) - STOW_ANTENNAS[0]).abs() > 1.0,
-        "the machine is up, so stow is somewhere else",
-    );
+    let before: Vec<f64> = ROWS.iter().map(|joint| mover.at(*joint)).collect();
 
-    // A number no enumerator of this build's vocabulary carries, which is what a
-    // schedule from a newer session cog would hold.
-    mover.schedule(true, 2, &[(1000, Some(PostureWire(200)))]);
+    // An index past the end of the committed library, which is what a sidecar
+    // and a library from two different emits would produce.
+    let past = u16::try_from(committed_poses::library().len()).expect("a small library");
+    mover.schedule(true, 2, &[(1000, Some(past))]);
     let cycles = mover.run(140);
     assert!(
         cycles.iter().all(|cycle| cycle.goal.is_some()),
-        "an unknown posture is a move, not a gap in the stream",
+        "a refused command changes nothing, and a holding machine is still commanded",
+    );
+    let raised = reports(&cycles);
+    assert_eq!(
+        raised.iter().map(|report| report.kind).collect::<Vec<_>>(),
+        vec![FaultKindWire::COMMAND_REJECTED],
+        "the id is refused once, on the sample that dispatched it: {raised:?}",
     );
 
-    let stow = stow_targets(default_geometry()).expect("the baked geometry reaches stow");
-    for joint in ROWS {
-        let at = mover.at(joint);
-        let wanted = stow.get(joint).expect("a bus row");
+    for (joint, was) in ROWS.iter().zip(before) {
+        let at = mover.at(*joint);
         assert!(
-            (at - wanted).abs() < 1e-6,
-            "{} settled at {at} rather than the {wanted} rad stow asks for",
-            Name(joint),
+            (at - was).abs() < 1e-6,
+            "{} moved to {at} from {was}: an unresolved id sent the machine somewhere",
+            Name(*joint),
         );
     }
 }
@@ -2403,8 +2575,8 @@ fn a_step_kind_this_build_cannot_read_holds() {
         true,
         1,
         &[
-            (5, StepKindWire(200), PostureWire::UP),
-            (1000, StepKindWire::BASE_POSTURE, PostureWire::UP),
+            (5, StepKindWire(200), UP_POSE_ID),
+            (1000, StepKindWire::BASE_POSTURE, UP_POSE_ID),
         ],
     );
 
@@ -2442,32 +2614,16 @@ fn a_step_kind_this_build_cannot_read_holds() {
 #[test]
 #[should_panic(expected = "execute() failed")]
 fn a_control_period_of_no_length_is_refused() {
-    let mut mover = Mover::on(&params(0, UP_NS, STOW_NS));
-    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
+    let mut mover = Mover::on(&params(0));
+    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
     mover.step();
 }
 
 #[test]
 #[should_panic(expected = "execute() failed")]
 fn a_control_period_running_backwards_is_refused() {
-    let mut mover = Mover::on(&params(-PERIOD, UP_NS, STOW_NS));
-    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
-    mover.step();
-}
-
-#[test]
-#[should_panic(expected = "execute() failed")]
-fn a_move_to_the_up_posture_given_no_time_is_refused() {
-    let mut mover = Mover::on(&params(PERIOD, 0, STOW_NS));
-    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
-    mover.step();
-}
-
-#[test]
-#[should_panic(expected = "execute() failed")]
-fn a_move_to_stow_given_no_time_is_refused() {
-    let mut mover = Mover::on(&params(PERIOD, UP_NS, 0));
-    mover.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
+    let mut mover = Mover::on(&params(-PERIOD));
+    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
     mover.step();
 }
 
@@ -2678,13 +2834,13 @@ fn an_overlay_window_composes_over_the_base_and_hands_it_back() {
     const OPENS: i64 = 5;
     const CLOSES: i64 = 15;
     let library = one_motion(0.02, 40);
-    let mut mover = Mover::playing(&params(PERIOD, UP_NS, STOW_NS), &library);
+    let mut mover = Mover::playing(&params(PERIOD), &library);
     mover.schedule_playing(1, &[(0, OPENS, CLOSES, 1.0, 1.0)]);
 
     // The same schedule with no window, driven in step, which is what "the
     // composition is visible" is visible against.
     let mut bare = Mover::new();
-    bare.schedule(true, 1, &[(1000, Some(PostureWire::UP))]);
+    bare.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
 
     let mut composed = Vec::new();
     let mut plain = Vec::new();
@@ -2777,7 +2933,7 @@ fn an_overlay_window_composes_over_the_base_and_hands_it_back() {
 #[test]
 fn a_window_naming_no_motion_is_refused_once_and_the_base_carries_on() {
     let library = one_motion(0.02, 10);
-    let mut mover = Mover::playing(&params(PERIOD, UP_NS, STOW_NS), &library);
+    let mut mover = Mover::playing(&params(PERIOD), &library);
     mover.schedule_playing(1, &[(3, 2, 40, 1.0, 1.0)]);
 
     let cycles = mover.run(20);
@@ -2808,7 +2964,7 @@ fn a_refused_composition_latches_the_layer_for_that_schedule() {
     // envelope has over the neutral base the loader walks it against, and one it
     // will not have over a base still rising out of stow.
     let library = one_head_motion(-0.03, 20);
-    let mut mover = Mover::playing(&params(PERIOD, UP_NS, STOW_NS), &library);
+    let mut mover = Mover::playing(&params(PERIOD), &library);
     mover.schedule_playing(1, &[(0, 2, 60, 1.0, 1.0)]);
 
     let cycles = mover.run(20);
@@ -2850,7 +3006,7 @@ fn a_handover_onto_a_clock_too_short_for_its_span_is_stretched() {
     const EXPECTED_STRETCHES: u64 = 2;
 
     let library = one_motion(0.02, 40);
-    let mut mover = Mover::playing(&params(PERIOD, PERIOD, STOW_NS), &library);
+    let mut mover = Mover::playing_paced(&params(PERIOD), PERIOD, STOW_NS, &library);
     mover.schedule_playing(1, &[(0, 3, 60, 1.0, 1.0)]);
 
     let cycles = mover.run(70);
@@ -2903,7 +3059,7 @@ fn a_healthy_posture_move_is_a_de_phasing_and_not_a_stretch() {
     );
 
     // And the fold back is the same move mirrored, so it is the same reading.
-    mover.schedule(true, 2, &[(1000, Some(PostureWire::STOW))]);
+    mover.schedule(true, 2, &[(1000, Some(stow_pose_id()))]);
     mover.run(140);
     assert_eq!(mover.cog.state_ctrl().base_dephased(), 2);
     assert_eq!(mover.cog.state_ctrl().base_stretched(), 0);
@@ -2922,7 +3078,7 @@ fn a_healthy_posture_move_is_a_de_phasing_and_not_a_stretch() {
 fn a_window_closing_under_another_leaves_the_composed_stream_continuous() {
     const FIRST_CLOSES: i64 = 20;
     let library = one_motion(0.02, 60);
-    let mut mover = Mover::playing(&params(PERIOD, UP_NS, STOW_NS), &library);
+    let mut mover = Mover::playing(&params(PERIOD), &library);
     // Both windows name the same motion; the rows are what separate them, so the
     // two contributions are added and the first one closing leaves the second
     // riding.
@@ -2978,7 +3134,7 @@ fn a_window_closing_under_another_leaves_the_composed_stream_continuous() {
 #[test]
 fn a_disengagement_releases_the_base_and_the_players() {
     let library = one_motion(0.02, 60);
-    let mut mover = Mover::playing(&params(PERIOD, UP_NS, STOW_NS), &library);
+    let mut mover = Mover::playing(&params(PERIOD), &library);
     mover.schedule_playing(1, &[(0, 3, 60, 1.0, 1.0)]);
     mover.run(10);
     assert!(
@@ -3026,7 +3182,7 @@ fn a_disengagement_releases_the_base_and_the_players() {
 #[test]
 fn a_fresh_arming_releases_the_base_and_the_players() {
     let library = one_motion(0.02, 60);
-    let mut mover = Mover::playing(&params(PERIOD, UP_NS, STOW_NS), &library);
+    let mut mover = Mover::playing(&params(PERIOD), &library);
     mover.schedule_playing(1, &[(0, 3, 400, 1.0, 1.0)]);
     mover.run(10);
     assert!(mover.cog.state_ctrl().base().owned());
@@ -3072,7 +3228,7 @@ fn a_fresh_arming_releases_the_base_and_the_players() {
 #[test]
 fn nothing_is_screened_or_established_while_the_machine_is_disengaged() {
     let library = one_motion(0.02, 10);
-    let mut mover = Mover::playing(&params(PERIOD, UP_NS, STOW_NS), &library);
+    let mut mover = Mover::playing(&params(PERIOD), &library);
     // One window naming a motion no library holds, so there is a refusal to
     // count when the screen does run.
     mover.schedule_playing_engaged(false, 7, &[(3, 2, 40, 1.0, 1.0)]);
@@ -3113,7 +3269,7 @@ fn a_library_that_will_not_establish_refuses_the_schedules_windows_once() {
     // A motion whose one segment names a clip the library does not have, which
     // is a structural fault every establishment of it finds.
     let library = library_naming(3, 0.02, 10);
-    let mut mover = Mover::playing(&params(PERIOD, UP_NS, STOW_NS), &library);
+    let mut mover = Mover::playing(&params(PERIOD), &library);
     mover.schedule_playing(1, &[(0, 2, 40, 1.0, 1.0), (0, 5, 40, 1.0, 1.0)]);
 
     let cycles = mover.run(20);
@@ -3142,7 +3298,7 @@ fn a_library_that_will_not_establish_refuses_the_schedules_windows_once() {
 #[test]
 fn a_base_record_that_is_no_base_is_counted_and_taken_over_afresh() {
     let library = one_motion(0.02, 60);
-    let mut mover = Mover::playing(&params(PERIOD, UP_NS, STOW_NS), &library);
+    let mut mover = Mover::playing(&params(PERIOD), &library);
     mover.schedule_playing(1, &[(0, 3, 60, 1.0, 1.0)]);
     mover.run(8);
     assert!(mover.cog.state_ctrl().base().owned());
@@ -3179,7 +3335,7 @@ fn a_base_record_that_is_no_base_is_counted_and_taken_over_afresh() {
 #[test]
 fn a_player_row_that_will_not_resume_is_counted_and_started_afresh() {
     let library = one_motion(0.02, 60);
-    let mut mover = Mover::playing(&params(PERIOD, UP_NS, STOW_NS), &library);
+    let mut mover = Mover::playing(&params(PERIOD), &library);
     mover.schedule_playing(1, &[(0, 3, 60, 1.0, 1.0)]);
     mover.run(8);
     assert!(mover.cog.state_ctrl().players()[0].active());
@@ -3461,6 +3617,7 @@ fn session() -> SessionTestWrapper {
     cog.initialize(SyncTime::from_nanos(T0));
     cog.set_config_params(&session_params());
     cog.set_config_profile(&servo_profile());
+    cog.set_config_poses(committed_poses::message());
     cog
 }
 
@@ -3583,11 +3740,14 @@ fn resting_session() -> SessionTestWrapper {
 
 /// One step of a script as a case states it: an offset, a length, and what it
 /// asks for.
+///
+/// The pace is not here: every case but the one about a pace of no time asks for
+/// the suite's own, which [`script_msg`] writes per pose.
 struct Step {
     after_ms: u32,
     duration_ms: u32,
     kind: StepKindWire,
-    posture: PostureWire,
+    pose_id: u16,
 }
 
 /// One overlay window of a script, likewise.
@@ -3597,8 +3757,20 @@ struct Overlay {
     duration_ms: u32,
 }
 
-/// A script as the channel carries it.
+/// A script as the channel carries it, every base step at the suite's own pace
+/// for its pose.
 fn script_msg(script_id: u32, arrival_ns: i64, steps: &[Step], overlays: &[Overlay]) -> ScriptWire {
+    script_msg_paced(script_id, arrival_ns, steps, overlays, None)
+}
+
+/// The same, with `move_ms` written on every base step instead.
+fn script_msg_paced(
+    script_id: u32,
+    arrival_ns: i64,
+    steps: &[Step],
+    overlays: &[Overlay],
+    move_ms: Option<u32>,
+) -> ScriptWire {
     let mut msg = ScriptWire::new();
     msg.set_script_id(script_id);
     msg.set_arrival(SyncTime::from_nanos(arrival_ns));
@@ -3610,7 +3782,12 @@ fn script_msg(script_id: u32, arrival_ns: i64, steps: &[Step], overlays: &[Overl
             row.set_after_ms(step.after_ms);
             row.set_duration_ms(step.duration_ms);
             row.set_kind(step.kind);
-            row.set_posture(step.posture);
+            row.set_pose_id(step.pose_id);
+            row.set_move_ms(move_ms.unwrap_or(if step.pose_id == UP_POSE_ID {
+                u32::try_from(UP_NS / 1_000_000).expect("a pace in whole milliseconds")
+            } else {
+                u32::try_from(STOW_NS / 1_000_000).expect("a pace in whole milliseconds")
+            }));
         }
     }
     let mut rows = msg.overlays_mut();
@@ -3639,7 +3816,7 @@ fn no_timeline_script(script_id: u32, arrival_ns: i64) -> ScriptWire {
             after_ms: 0,
             duration_ms: 0,
             kind: StepKindWire::BASE_KEEP,
-            posture: PostureWire::STOW,
+            pose_id: stow_pose_id(),
         }],
         &[],
     )
@@ -3655,7 +3832,7 @@ fn one_step_script(script_id: u32, arrival_ns: i64) -> ScriptWire {
             after_ms: 500,
             duration_ms: 2_000,
             kind: StepKindWire::BASE_POSTURE,
-            posture: PostureWire::UP,
+            pose_id: UP_POSE_ID,
         }],
         &[],
     )
@@ -3878,7 +4055,7 @@ fn an_accepted_script_becomes_the_schedule_the_session_holds() {
     assert_eq!(step.start().as_nanos(), arrival + 500_000_000);
     assert_eq!(step.end().as_nanos(), arrival + 2_500_000_000);
     assert_eq!(step.kind(), StepKindWire::BASE_POSTURE);
-    assert_eq!(step.posture(), PostureWire::UP);
+    assert_eq!(step.pose_id(), UP_POSE_ID);
 }
 
 /// Two scripts in one window are answered one at a time, and the first one
@@ -3899,13 +4076,13 @@ fn the_first_script_accepted_in_a_window_is_the_schedule() {
                     after_ms: 0,
                     duration_ms: 1_000,
                     kind: StepKindWire::BASE_POSTURE,
-                    posture: PostureWire::UP,
+                    pose_id: UP_POSE_ID,
                 },
                 Step {
                     after_ms: 1_000,
                     duration_ms: 1_000,
                     kind: StepKindWire::BASE_POSTURE,
-                    posture: PostureWire::STOW,
+                    pose_id: stow_pose_id(),
                 },
             ],
             &[Overlay {
@@ -3956,7 +4133,7 @@ fn an_accepted_script_carries_its_overlay_windows() {
                 after_ms: 0,
                 duration_ms: 1_000,
                 kind: StepKindWire::BASE_POSTURE,
-                posture: PostureWire::UP,
+                pose_id: UP_POSE_ID,
             }],
             &[Overlay {
                 motion_id: 3,
@@ -4033,13 +4210,13 @@ fn a_script_whose_steps_go_backwards_is_refused() {
                     after_ms: 500,
                     duration_ms: 100,
                     kind: StepKindWire::BASE_KEEP,
-                    posture: PostureWire::STOW,
+                    pose_id: stow_pose_id(),
                 },
                 Step {
                     after_ms: 400,
                     duration_ms: 100,
                     kind: StepKindWire::BASE_KEEP,
-                    posture: PostureWire::STOW,
+                    pose_id: stow_pose_id(),
                 },
             ],
             &[],
@@ -4067,7 +4244,7 @@ fn a_step_of_no_length_is_refused() {
                 after_ms: 0,
                 duration_ms: 0,
                 kind: StepKindWire::BASE_KEEP,
-                posture: PostureWire::STOW,
+                pose_id: stow_pose_id(),
             }],
             &[],
         ),
@@ -4075,6 +4252,56 @@ fn a_step_of_no_length_is_refused() {
     );
     let report = wake(&mut cog, T0 + 1).expect("a refusal is narrated");
     assert_eq!(report.b, u32::from(RefusalReasonWire::BAD_TIMES.0));
+}
+
+/// A base step's pace crosses the screen onto the schedule, and a base move
+/// given no time is refused as a step of no length is.
+///
+/// The pace is what the mover plans the move over, so a zero would be a move
+/// this session asked for and nothing could shape; the screen is where a
+/// publisher's number is judged, not the plan.
+#[test]
+fn a_base_steps_pace_crosses_the_screen_and_a_move_of_no_time_is_refused() {
+    let mut cog = resting_session();
+    let step = |kind, pose_id| Step {
+        after_ms: 0,
+        duration_ms: 1000,
+        kind,
+        pose_id,
+    };
+
+    cog.publish_script(
+        &script_msg(1, T0, &[step(StepKindWire::BASE_POSTURE, UP_POSE_ID)], &[]),
+        SyncTime::from_nanos(T0),
+    );
+    let _ = wake(&mut cog, T0 + 1);
+    let schedule = cog.state_sess().schedule();
+    assert_eq!(schedule.steps().len(), 1, "the script was accepted");
+    let row = schedule.steps().iter().next().expect("the one step");
+    assert_eq!(
+        row.pace(),
+        SlotDuration::from_nanos(UP_NS),
+        "the schedule carries the pace the script stated",
+    );
+
+    let mut cog = resting_session();
+    cog.publish_script(
+        &script_msg_paced(
+            2,
+            T0,
+            &[step(StepKindWire::BASE_POSTURE, UP_POSE_ID)],
+            &[],
+            Some(0),
+        ),
+        SyncTime::from_nanos(T0),
+    );
+    let report = wake(&mut cog, T0 + 1).expect("a refusal is narrated");
+    assert_eq!(report.b, u32::from(RefusalReasonWire::BAD_TIMES.0));
+    assert_eq!(
+        cog.state_sess().schedule().steps().len(),
+        0,
+        "all-or-nothing, as every other bad time is",
+    );
 }
 
 /// An index no library could hold is refused at the screen, and the largest
@@ -4095,7 +4322,7 @@ fn an_overlay_naming_a_motion_no_library_could_hold_is_refused() {
                 after_ms: 0,
                 duration_ms: 1_000,
                 kind: StepKindWire::BASE_KEEP,
-                posture: PostureWire::STOW,
+                pose_id: stow_pose_id(),
             }],
             &[Overlay {
                 motion_id,
@@ -4342,7 +4569,7 @@ fn an_instant_the_clock_does_not_have_is_refused() {
                 after_ms,
                 duration_ms,
                 kind: StepKindWire::BASE_POSTURE,
-                posture: PostureWire::UP,
+                pose_id: UP_POSE_ID,
             }],
             &[],
         )
@@ -4420,7 +4647,7 @@ fn overlay_weights_cross_the_screen_as_they_arrived() {
             after_ms: 0,
             duration_ms: 1_000,
             kind: StepKindWire::BASE_KEEP,
-            posture: PostureWire::STOW,
+            pose_id: stow_pose_id(),
         }],
         &[Overlay {
             motion_id: 1,
@@ -4656,6 +4883,130 @@ fn a_servo_profile_of_zero_is_not_a_machine_this_session_commissions() {
     profile.set_antennas_profile_velocity(0);
     cog.set_config_profile(&profile);
     drive(&mut cog, FIRST_WAKE);
+}
+
+/// The library's own stow pace has to fit inside the clock the fault ladder's
+/// controlled stow runs on.
+///
+/// The ladder opens `stow_budget_ns` once and never restarts it; when it
+/// expires the machine is de-torqued where it stands. A stow paced at or past
+/// that budget is therefore a controlled stow that can never arrive from a full
+/// clock -- every fault response still reaches the Minimum Risk Condition, by
+/// the immediate torque-off, with the controlled half silently dead. Refusing
+/// at start-up stops the process with the machine de-torqued and nothing
+/// commanded, which is the only honest answer to a fault response configured
+/// not to work.
+///
+/// Equality is refused with the rest: a move planned to arrive exactly at the
+/// deadline is one the clock cannot hold either.
+fn poses_paced(pace_ns: i64) -> reachy_poses::config::Library {
+    let mut message = committed_poses::read();
+    let held = message
+        .validate_mut()
+        .expect("the committed pose library is a message this build reads");
+    let stow = usize::from(held.stow);
+    held.poses
+        .get_mut(stow)
+        .expect("the screen's own guarantee: the stow index names a pose")
+        .duration_ns = pace_ns;
+    message
+}
+
+#[test]
+#[should_panic(expected = "execute() failed")]
+fn a_stow_paced_past_the_budget_is_not_a_machine_this_session_commissions() {
+    let mut cog = session();
+    cog.set_config_poses(&poses_paced(STOW_BUDGET_NS + 1));
+    drive(&mut cog, FIRST_WAKE);
+}
+
+#[test]
+#[should_panic(expected = "execute() failed")]
+fn a_stow_paced_exactly_at_the_budget_is_refused_too() {
+    let mut cog = session();
+    cog.set_config_poses(&poses_paced(STOW_BUDGET_NS));
+    drive(&mut cog, FIRST_WAKE);
+}
+
+/// And a pace inside the budget commissions, which is what says the two cases
+/// above are about the relation and not about the library being read at all.
+///
+/// The committed library unchanged, the shipped stow pace against the shipped
+/// budget, and deliberately not `poses_paced(STOW_BUDGET_NS - 1)`: this is the
+/// only case in this file that binds a library *and* completes an execution, and
+/// an execution is what takes the session's process-wide stow cells. A library
+/// of this case's own would fix the pace every ladder case later reads back,
+/// with which case got there first deciding it. The two cases above assert
+/// before those cells are taken, so a library of their own stays theirs.
+#[test]
+fn a_stow_paced_inside_the_budget_arms() {
+    let mut cog = session();
+    cog.set_config_poses(committed_poses::message());
+    drive(&mut cog, FIRST_WAKE).expect("the survey's first transaction");
+}
+
+/// The check runs on every execution, not only the one that took the record.
+///
+/// The budget is a parameter the session re-reads each execution, so a
+/// deployment that tightened it under a library already in hand is refused on
+/// the wake that reads it -- the process does not carry on under a relation
+/// that stopped holding.
+#[test]
+#[should_panic(expected = "execute() failed")]
+fn a_budget_tightened_under_the_librarys_pace_is_refused_on_that_wake() {
+    let mut cog = session();
+    drive(&mut cog, FIRST_WAKE).expect("the survey's first transaction");
+    let mut params = session_params();
+    let (_, _, pace) = committed_poses::library().stow();
+    params.set_stow_budget_ns(
+        i64::try_from(pace.as_nanos()).expect("the library's pace is a length of time"),
+    );
+    cog.set_config_params(&params);
+    drive(&mut cog, FIRST_WAKE + LAPSE_NS);
+}
+
+/// A library with a pose nobody can be moved to: the first pose given no time.
+///
+/// A zero pace is what the screen refuses first, and it is not the stow's, so
+/// what a cog handed this does is about the screen rather than about the fault
+/// ladder's budget.
+fn poses_of_no_time() -> reachy_poses::config::Library {
+    let mut message = committed_poses::read();
+    let held = message
+        .validate_mut()
+        .expect("the committed pose library is a message this build reads");
+    held.poses
+        .get_mut(0)
+        .expect("the committed library holds poses")
+        .duration_ns = 0;
+    message
+}
+
+/// A library the screen refuses is no library to run a session on.
+///
+/// The session's record of where folded is comes off the screened library, so a
+/// session that carried on past a refusal would be judging arrival at a pose it
+/// never computed. It stops the process at start-up instead, de-torqued and
+/// with nothing commanded.
+#[test]
+#[should_panic(expected = "execute() failed")]
+fn a_pose_library_the_screen_refuses_is_no_session_to_commission() {
+    let mut cog = session();
+    cog.set_config_poses(&poses_of_no_time());
+    drive(&mut cog, FIRST_WAKE);
+}
+
+/// And the same library is no library for the mover to command off.
+///
+/// The mover resolves a row's `pose_id` positionally against the library it
+/// screened. One that carried on past a refusal would resolve those ids against
+/// whatever it did build, which is a machine commanded to a pose nobody named.
+#[test]
+#[should_panic(expected = "execute() failed")]
+fn a_pose_library_the_screen_refuses_is_no_library_to_command_off() {
+    let mut mover = Mover::on(&params(PERIOD));
+    mover.cog.set_config_poses(&poses_of_no_time());
+    mover.run(1);
 }
 
 // The session's bus half. Every case here drives the start-up survey, which is
@@ -5666,8 +6017,7 @@ impl Bus {
             AuxOpKindWire::READ_REG => {
                 let held = match asked.reg {
                     RegIdWire::PRESENT_POSITION => value::radians(
-                        stow_targets(default_geometry())
-                            .expect("stow is reachable")
+                        committed_poses::stow_joints()
                             .get(ROWS[row])
                             .expect("nine rows"),
                     ),
@@ -7106,7 +7456,7 @@ fn a_window_outliving_the_last_step_keeps_the_machine_under_command() {
             after_ms: 500,
             duration_ms: 500,
             kind: StepKindWire::BASE_POSTURE,
-            posture: PostureWire::UP,
+            pose_id: UP_POSE_ID,
         }],
         &[Overlay {
             motion_id: 0,
@@ -7413,7 +7763,7 @@ fn hold_script(script_id: u32, arrival_ns: i64, duration_ms: u32) -> ScriptWire 
             after_ms: 0,
             duration_ms,
             kind: StepKindWire::BASE_POSTURE,
-            posture: PostureWire::UP,
+            pose_id: UP_POSE_ID,
         }],
         &[],
     )
@@ -7511,7 +7861,7 @@ fn a_replacement_carries_its_own_windows_and_none_of_the_old_ones() {
                 after_ms: 0,
                 duration_ms: 3_000,
                 kind: StepKindWire::BASE_POSTURE,
-                posture: PostureWire::UP,
+                pose_id: UP_POSE_ID,
             }],
             &[Overlay {
                 motion_id: 4,
@@ -7652,7 +8002,7 @@ fn an_overlay_window_past_the_span_cap_is_refused() {
                 after_ms: 0,
                 duration_ms: 1_000,
                 kind: StepKindWire::BASE_POSTURE,
-                posture: PostureWire::UP,
+                pose_id: UP_POSE_ID,
             }],
             &[Overlay {
                 motion_id: 1,
@@ -8907,9 +9257,19 @@ struct Stow {
     steps: usize,
     overlays: usize,
     kind: StepKindWire,
-    posture: PostureWire,
+    pose_id: u16,
     start_ns: i64,
     end_ns: i64,
+    /// How fast the fold the ladder commands runs. The library's own pace for
+    /// the stow: the ladder has none of its own, and a pace a publisher stated
+    /// on some other script is that script's business.
+    pace: SlotDuration,
+}
+
+/// The pace the committed library holds for the stow, as the slot carries it.
+fn library_stow_pace() -> SlotDuration {
+    let (_, _, pace) = committed_poses::library().stow();
+    SlotDuration::from_nanos(i64::try_from(pace.as_nanos()).expect("a length of time"))
 }
 
 /// The one step the slot's schedule holds, as a stow.
@@ -8922,9 +9282,10 @@ fn stow_held(cog: &SessionTestWrapper) -> Stow {
         steps: schedule.steps().len(),
         overlays: schedule.overlays().len(),
         kind: step.kind(),
-        posture: step.posture(),
+        pose_id: step.pose_id(),
         start_ns: step.start().as_nanos(),
         end_ns: step.end().as_nanos(),
+        pace: step.pace(),
     }
 }
 
@@ -8990,9 +9351,10 @@ fn a_grabbed_head_is_stowed_under_control_and_the_machine_let_go_at_rest() {
             steps: 1,
             overlays: 0,
             kind: StepKindWire::BASE_POSTURE,
-            posture: PostureWire::STOW,
+            pose_id: stow_pose_id(),
             start_ns: grabbed,
             end_ns: grabbed + STOW_BUDGET_NS,
+            pace: library_stow_pace(),
         },
         "one step to the fold, cut from the whole of the maneuver's clock",
     );

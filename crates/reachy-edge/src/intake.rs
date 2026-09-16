@@ -26,7 +26,7 @@ use brenn_reachy__cogs__script_clk_rs::ScriptWire;
 
 use crate::compile::{CompileError, compile};
 use crate::config::EdgeConfig;
-use crate::names::MotionTable;
+use crate::names::{MotionTable, PoseTable};
 
 /// The intent edge: the screens, the numbering, and what they were configured
 /// with.
@@ -39,6 +39,7 @@ use crate::names::MotionTable;
 pub struct Edge {
     config: EdgeConfig,
     table: MotionTable,
+    poses: PoseTable,
     /// The highest sequence number accepted this run, or `None` before the
     /// first. Nothing persists it: a restarted host counts from nothing, and
     /// the running schedule's own horizon is what concludes the engagement it
@@ -158,12 +159,17 @@ impl Refusal {
 }
 
 impl Edge {
-    /// An edge configured by `config`, resolving names through `table`.
+    /// An edge configured by `config`, resolving motion names through `table`
+    /// and pose names through `poses`.
+    ///
+    /// Both tables come out of one read of one sidecar, which is what says the
+    /// numbering this edge sends is the numbering the boxes loaded.
     #[must_use]
-    pub fn new(config: EdgeConfig, table: MotionTable) -> Self {
+    pub fn new(config: EdgeConfig, table: MotionTable, poses: PoseTable) -> Self {
         Self {
             config,
             table,
+            poses,
             accepted_seq: None,
             issued: 0,
         }
@@ -219,7 +225,7 @@ impl Edge {
         // and a reader of that narration would be looking for a script nothing
         // ever sent.
         let next_id = next_id(self.issued);
-        let message = compile(&script, arrival, next_id, &self.config, &self.table)?;
+        let message = compile(&script, arrival, next_id, &self.table, &self.poses)?;
         self.issued = next_id;
         self.accepted_seq = Some(script.seq());
         Ok(Accepted {
@@ -247,7 +253,7 @@ const fn next_id(issued: u32) -> u32 {
 mod tests {
     use brenn_reachy__cogs__script_clk_rs::ScriptWire;
     use clockwork_rs::{Blob as _, SyncTime, blob_from_bytes};
-    use motion_proto::{DecodeError, MotionScript, Posture, Step};
+    use motion_proto::{DecodeError, MotionScript, STOW_POSE, Step};
 
     use super::{Edge, Refusal, next_id};
     use crate::compile::CompileError;
@@ -266,7 +272,11 @@ mod tests {
     /// An edge for `reachy00` over an empty library: no case here plays a
     /// motion, and the compile's own suite covers the ones that do.
     fn edge() -> Edge {
-        Edge::new(EdgeConfig::for_pod("reachy00"), MotionTable::default())
+        Edge::new(
+            EdgeConfig::for_pod("reachy00"),
+            MotionTable::default(),
+            crate::fixture::poses(),
+        )
     }
 
     /// The body a scripter would publish: up now, stowed at the close.
@@ -274,7 +284,10 @@ mod tests {
         let script = MotionScript::new(
             pod,
             seq,
-            vec![Step::new(0, Posture::Up), Step::new(2000, Posture::Stow)],
+            vec![
+                Step::new(0, crate::fixture::NEUTRAL_POSE),
+                Step::new(2000, STOW_POSE),
+            ],
             30_000,
         )
         .expect("a lawful timeline");
@@ -345,8 +358,13 @@ mod tests {
         let mut edge = edge();
         // A timeline with no room for its closing stow: refused at the compile,
         // after the sequence gate has already looked at it.
-        let unstowable = MotionScript::new("reachy00", 100, vec![Step::new(0, Posture::Up)], 2000)
-            .expect("a lawful timeline");
+        let unstowable = MotionScript::new(
+            "reachy00",
+            100,
+            vec![Step::new(0, crate::fixture::NEUTRAL_POSE)],
+            2000,
+        )
+        .expect("a lawful timeline");
         let unstowable = unstowable.encode().into_bytes();
         assert!(matches!(
             edge.accept(&unstowable, at(0)),
@@ -438,7 +456,7 @@ mod tests {
             "stale",
         );
         assert_eq!(
-            Refusal::Uncompilable(CompileError::NoPosture).kind(),
+            Refusal::Uncompilable(CompileError::NoPose).kind(),
             "uncompilable",
         );
 
@@ -459,7 +477,7 @@ mod tests {
                 accepted: 0,
             }
             .kind(),
-            Refusal::Uncompilable(CompileError::NoPosture).kind(),
+            Refusal::Uncompilable(CompileError::NoPose).kind(),
         ];
         kinds.sort_unstable();
         let named = kinds.len();

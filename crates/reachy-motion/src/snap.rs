@@ -312,7 +312,7 @@ mod tests {
             a_pose(),
             Isometry3::identity(),
             reachy_kin::neutral_head_pose(),
-            reachy_kin::stow_head_pose(),
+            reachy_kin::sleep_head_pose(),
         ] {
             let restored = PoseSnapshot::from(&pose)
                 .to_isometry()

@@ -36,7 +36,7 @@
 //! and the run's totals are the state slot's own fields, read and written
 //! through the validated view the cycle opens once at the top.
 
-use brenn_reachy__cogs__config_clk_rs::{SimParams, SimParamsWire};
+use brenn_reachy__cogs__config_clk_rs::{PoseLibraryConfig, SimParams, SimParamsWire};
 use brenn_reachy__cogs__session_cmd_clk_rs::SessionCmdKind;
 use brenn_reachy__cogs__sim_clk_rs::{MotorSimDial, MotorSimOutputs, MotorSimSignals};
 use brenn_reachy__cogs__sim_state_clk_rs::{SimCmd, SimOp, SimState, SimStateWire};
@@ -52,8 +52,6 @@ use reachy_driver::{
     GateAction, GoalGate, TORQUE_OFF_CONFIRM_BUDGET_NS, TorqueOffConfirm, credit_engagement,
     engage_verdict, fail_engagement,
 };
-use reachy_kin::default_geometry;
-use reachy_motion::disarm::stow_targets;
 use reachy_motion::joints::{
     ROW_COUNT, angle_of, flags, row, rows_of, set_angle, write_rows, write_vector,
 };
@@ -61,6 +59,7 @@ use reachy_motion::plant::{
     MAX_GAP_PERIODS, PlantModel, Predicted, RESPONSE_DEAD_SAMPLES, SHIPPED_PROFILES,
 };
 use reachy_motion::value::Value;
+use reachy_poses::config::screen;
 
 pub mod sim_aux;
 pub mod sim_regs;
@@ -162,10 +161,19 @@ pub fn execute_motor_sim(dial: &mut MotorSimDial<'_>) {
     if first {
         check_params(params);
         state.initialized = true.into();
-        write_vector(
-            &mut state.positions,
-            &stow_targets(default_geometry()).expect("the baked geometry reaches stow"),
-        );
+        // Folded, where a machine this process has just met stands. The pose
+        // comes off the same asset the session judges a release against, so a
+        // plant that starts here starts where a real one rests. Read and solved
+        // on this execution alone: a plant that re-solved the fold every cycle
+        // would pay for it at the grid's rate.
+        let poses: &PoseLibraryConfig = configured(dial.configs.poses, "the plant's pose library");
+        let library = screen(poses).unwrap_or_else(|error| {
+            panic!("the plant's pose library states no pose to stand folded at: {error}")
+        });
+        let folded = library.stow_joints().unwrap_or_else(|error| {
+            panic!("the plant's pose library folds nowhere the linkage reaches: {error}")
+        });
+        write_vector(&mut state.positions, &folded);
         // The provisioning, before anything reads a register: a machine this
         // process has just met is a correctly provisioned one, and a scenario
         // that wants otherwise says so with an injection.

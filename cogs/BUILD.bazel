@@ -184,10 +184,10 @@ SIM_MODULES = MOTION_MODULES + [
 ]
 
 exports_files([
-    # The clip library's name table: the join between a motion's name and the
-    # index the session takes, read at startup by the process that resolves
-    # overlay names -- which is outside this package.
-    "clip_library.names.json",
+    # Both libraries' name table: the join between an asset's name and the index
+    # the session takes, read at startup by the process that resolves overlay
+    # and pose names -- which is outside this package.
+    "library.names.json",
     "config.clk",
     "motion.clk",
     "mover.clk",
@@ -224,6 +224,35 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
+# The committed pose library, as this package's Rust readers see it: the cog
+# cases that hand a cog its configuration, and the scenario checkers that judge
+# where the machine folded. The asset is `compile_data` rather than a runfile
+# because what is wanted is the committed bytes, not a staged copy.
+rust_library(
+    name = "committed_poses",
+    srcs = ["committed_poses.rs"],
+    compile_data = [
+        "library.names.json",
+        "pose_library.textproto",
+    ],
+    edition = "2024",
+    deps = [
+        # The sidecar's own reader: the names half of the emit is read by the
+        # intent edge, and this crate reads it the same way rather than walking
+        # the JSON a second time.
+        "//crates/reachy-edge:reachy_edge",
+        "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-poses:reachy_poses",
+    ],
+)
+
+# The crate's own case: that the committed asset reads and screens at all.
+rust_test(
+    name = "committed_poses_test",
+    size = "small",
+    crate = ":committed_poses",
+)
+
 # The configs, in a module of their own because they are the only schemas that
 # cross the Protobuf backend -- which is what lets a box bind one to a file of
 # text -- and generation is declared per module. Most of the vocabulary cannot
@@ -255,9 +284,13 @@ rust_clk_module(
     src = "config.clk",
 )
 
-# The edge's two restated bounds, beside the artifacts they anticipate: the
-# session's deployed span cap against the wire contract's timeout ceiling, and
-# the edge's motion-index screen against the clip library's own capacity.
+# The restated bounds, beside the artifacts they anticipate: the session's
+# deployed span cap against the wire contract's timeout ceiling, the edge's
+# motion-index screen against the clip library's own capacity, the wire
+# contract's asset-name bound against the mirror every asset crate shares in
+# `reachy-motion`, its speed pair against the clip format's mirror, and its two
+# reserved base spellings and its pace ceiling against the pose library's copies
+# of them. The only target that links all five crates.
 rust_test(
     name = "edge_caps_test",
     size = "small",
@@ -271,6 +304,8 @@ rust_test(
         "//crates/motion-proto:motion_proto",
         "//crates/reachy-clips:reachy_clips",
         "//crates/reachy-edge:reachy_edge",
+        "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-poses:reachy_poses",
     ],
 )
 
@@ -296,6 +331,7 @@ rust_binary(
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
+        ":committed_poses",
         ":log_read",
         ":motion_channels",
         ":motion_evidence",
@@ -310,6 +346,7 @@ rust_binary(
         "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-poses:reachy_poses",
         "//driver:goal_clk_rs",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
@@ -391,35 +428,40 @@ rust_test(
     },
 )
 
-# The clip library asset's emitter, run as
-# `bazel run //cogs:gen_clip_config -- --clips ... --out ... --names ...`, which
-# is what `make clip-config` does with this package's own paths. Offline and
-# host-side: it reads clip documents, not hardware.
+# Both library assets' emitter, run as
+# `bazel run //cogs:gen_library_config -- --clips ... --out ... --poses ...
+# --poses-out ... --names ...`, which is what `make library-config` does with
+# this package's own paths. Offline and host-side: it reads documents, not
+# hardware.
 rust_binary(
-    name = "gen_clip_config",
+    name = "gen_library_config",
     srcs = [
-        "gen_clip_config.rs",
-        # The probe documents' own table: the emitter writes them from the
-        # antenna constants before it walks the directory.
+        "gen_library_config.rs",
+        # The probe documents' own table: the emitter writes them from the folds
+        # the pose documents author, after it loads those and before it walks
+        # the clips directory.
         "probe_clips.rs",
     ],
-    # The committed asset is embedded, so the drift case compares a fresh emit
-    # against the file itself. The documents it comes from are not: they are a
-    # tree that grows by import, and the test target below supplies them through
-    # runfiles so adding one is not a code change.
+    # The committed assets are embedded, so the drift case compares a fresh emit
+    # against the files themselves. The documents they come from are not: the
+    # clips are a tree that grows by import and the poses are authored one at a
+    # time, and the test target below supplies both through runfiles so adding
+    # one is not a code change.
     compile_data = [
-        "clip_library.names.json",
         "clip_library.textproto",
+        "library.names.json",
+        "pose_library.textproto",
     ],
     edition = "2024",
     deps = [
         ":config_clk_rs",
         "//crates/reachy-clips:reachy_clips",
-        # Direct for the probe pin: the step probes' poses are asserted as
-        # differences of the antenna constants rather than as literals, so a
-        # moved fold or sideways point fails the emit's own case. Already
-        # transitive through reachy_clips' envelope walk.
+        # Direct for the probe pin: the step probes' sideways point is asserted
+        # as a difference of the antenna constant rather than as a literal, so a
+        # moved point fails the emit's own case. Already transitive through
+        # reachy_clips' envelope walk.
         "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-poses:reachy_poses",
         "@brenn_reachy_crates//:anyhow",
         "@brenn_reachy_crates//:serde_json",
     ],
@@ -428,17 +470,20 @@ rust_binary(
 # A binary's root is its own crate, so the library's test target never sees the
 # argument parsing, the printer, or the drift check against the committed asset.
 #
-# The clip documents arrive here rather than on the binary: a `rust_test` with
+# The documents arrive here rather than on the binary: a `rust_test` with
 # `crate =` inherits the binary's `compile_data` but takes its runfiles from its
-# own `data`. `CLIP_DOCUMENTS` names the directory beside the attribute that
-# supplies it, relative to the runfiles root, which is a test's working
-# directory.
+# own `data`. `CLIP_DOCUMENTS` and `POSE_DOCUMENTS` name the directories beside
+# the attribute that supplies them, relative to the runfiles root, which is a
+# test's working directory.
 rust_test(
-    name = "gen_clip_config_test",
+    name = "gen_library_config_test",
     size = "small",
-    crate = ":gen_clip_config",
-    data = glob(["clips/**/*.json"]),
-    env = {"CLIP_DOCUMENTS": "cogs/clips"},
+    crate = ":gen_library_config",
+    data = glob(["clips/**/*.json"]) + [":pose_documents"],
+    env = {
+        "CLIP_DOCUMENTS": "cogs/clips",
+        "POSE_DOCUMENTS": "cogs/poses",
+    },
     deps = ["//crates/reachy-scratch:reachy_scratch"],
 )
 
@@ -457,6 +502,7 @@ filegroup(
         "clip_library.textproto",
         "host_logger.textproto",
         "mover_params.textproto",
+        "pose_library.textproto",
         "robot_logger_rates.textproto",
         "servo_gains.textproto",
         "servo_profile.textproto",
@@ -642,6 +688,7 @@ rust_test(
         "SESSION_PARAMS": "cogs/session_params.textproto",
     },
     deps = [
+        ":committed_poses",
         ":config_clk_rs",
         ":motion_clk_rs_test",
         ":motion_cogs",
@@ -654,6 +701,7 @@ rust_test(
         "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-poses:reachy_poses",
         "//driver:goal_clk_rs",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
@@ -697,6 +745,7 @@ rust_library(
         "//crates/reachy-clips:reachy_clips",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-poses:reachy_poses",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
         "//hardware/dynamixel:registers_clk_rs",
@@ -725,6 +774,13 @@ rust_test(
     name = "motion_cogs_test",
     size = "small",
     crate = ":motion_cogs",
+    # Only the cases need it: the base configurations a move is planned between
+    # are the committed library's, read through the package's one embedding of
+    # it rather than restated here.
+    deps = [
+        ":committed_poses",
+        "//crates/reachy-poses:reachy_poses",
+    ],
 )
 
 # Where the head actually went, read off an estimate stream: the pose arithmetic
@@ -752,6 +808,13 @@ rust_test(
     name = "motion_evidence_test",
     size = "small",
     crate = ":motion_evidence",
+    # Only the cases need it: the base configurations a move is planned between
+    # are the committed library's, read through the package's one embedding of
+    # it rather than restated here.
+    deps = [
+        ":committed_poses",
+        "//crates/reachy-poses:reachy_poses",
+    ],
 )
 
 rust_test(
@@ -862,12 +925,25 @@ rust_test(
     # the refusal cases stamp an undeclared discriminant into the base's own
     # move, which is the wire form of the seed's vocabulary.
     deps = [
+        ":committed_poses",
         ":config_clk_rs",
         "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-poses:reachy_poses",
         "//motion:tick_state_clk_rs",
         "@brenn_reachy_crates//:nalgebra",
         "@brenn_reachy_crates//:serde_json",
     ],
+)
+
+# The committed pose documents, for the targets outside this package that read
+# them: `reachy-poses`'s own guard that the machine's stow still clears the
+# clearance floor, and, once it exists, the emitter's drift test. A filegroup
+# rather than a glob at each use, because a document nobody listed is a document
+# a test silently does not judge.
+filegroup(
+    name = "pose_documents",
+    srcs = glob(["poses/*.textproto"]),
+    visibility = ["//visibility:public"],
 )
 
 # Reading a driver's sample stream: the nine angles off a sample, the run-wide
@@ -917,15 +993,21 @@ rust_test(
 #
 # It reads two files -- the recorder's console and the voice host's, both in the
 # fetch -- and answers with a session document, a timeline and one `.wav` per
-# utterance. `--extract <segment-id>` writes one segment out as a clip draft
-# beside them. The analyzer holds no arithmetic of its own about what a hold is or
-# where the head was: segmentation is `reachy-motion`, head poses are
+# utterance. `--extract <segment-id>` writes one segment out beside them, as a
+# clip draft or, with `--as-pose`, as a pose document. The analyzer holds no
+# arithmetic of its own about what a hold is or where the head was: segmentation
+# is `reachy-motion`, head poses are
 # `reachy-kin`, counts-to-radians is `dxl-proto`, the pose stream's line schema
 # is `reachy-bench`'s, which is what writes it, and the recorded audio is read
 # and cut by brenn-pod's own store reader.
 rust_binary(
     name = "pose_session_report",
     srcs = ["pose_session_report.rs"],
+    # The committed pose documents: a clip draft's deltas are measured over the
+    # `neutral` document, and `--poses` defaults to `cogs/poses` relative to the
+    # working directory a `bazel run` starts in, which is this binary's own
+    # runfiles root. Staged here so that default names a file that is there.
+    data = [":pose_documents"],
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
@@ -944,6 +1026,10 @@ rust_binary(
         "//crates/reachy-clips:reachy_clips",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
+        # The pose document and the extractor's half of it: `--as-pose` writes
+        # an asset the library emitter reads back, so the field order, the
+        # antenna reduction and the envelope verdict are the format crate's.
+        "//crates/reachy-poses:reachy_poses",
         "@brenn_reachy_crates//:nalgebra",
         "@brenn_reachy_crates//:serde",
         "@brenn_reachy_crates//:serde_json",
@@ -969,6 +1055,10 @@ rust_test(
     name = "pose_session_report_test",
     size = "small",
     crate = ":pose_session_report",
+    # The committed pose documents: a clip draft's deltas are measured over the
+    # `neutral` document, so the cases read the same file the tool does.
+    data = [":pose_documents"],
+    env = {"POSE_DOCUMENTS": "cogs/poses"},
     deps = [
         "//crates/reachy-scratch:reachy_scratch",
         # A fixture audio store written through brenn-pod's own frame-log
@@ -1071,8 +1161,8 @@ clk(
 # added here and reaches both.
 #
 # Scoped to what the composition's own processes read. A file in this package
-# that only a process outside the composition reads -- `clip_library.names.json`,
-# which the voice host resolves overlay names through -- does not belong in
+# that only a process outside the composition reads -- `library.names.json`,
+# which the voice host resolves asset names through -- does not belong in
 # `robot_clk`'s runfiles and is named directly in `tools/build-motion.sh`'s
 # `config_targets` instead, beside this filegroup.
 filegroup(
@@ -1080,6 +1170,7 @@ filegroup(
     srcs = [
         "clip_library.textproto",
         "mover_params.textproto",
+        "pose_library.textproto",
         "robot_logger.textproto",
         "robot_logger_rates.textproto",
         "servo_gains.textproto",
@@ -1724,10 +1815,6 @@ rust_library(
         "scenario/check.rs",
         "scenario/read.rs",
     ],
-    # The generated name-to-number sidecar is embedded, so a scenario naming a
-    # motion resolves it out of the committed asset rather than restating an
-    # index the emitter may renumber.
-    compile_data = ["clip_library.names.json"],
     crate_root = "scenario.rs",
     edition = "2024",
     # One package outside this one, and only its test: `reachy-ask`'s gesture has
@@ -1737,6 +1824,7 @@ rust_library(
     # into a binary.
     visibility = ["//crates/reachy-ask:__pkg__"],
     deps = [
+        ":committed_poses",
         ":log_read",
         ":motion_channels",
         ":motion_cogs",
@@ -1751,6 +1839,7 @@ rust_library(
         "//crates/reachy-edge:reachy_edge",
         "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-poses:reachy_poses",
         "//driver:goal_clk_rs",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
@@ -1938,6 +2027,7 @@ clk(
     data = [
         "clip_library.textproto",
         "mover_params.textproto",
+        "pose_library.textproto",
         "servo_gains.textproto",
         "servo_profile.textproto",
         "session_params.textproto",
@@ -1982,13 +2072,13 @@ rust_test(
     srcs = ["sim_cog_test.rs"],
     edition = "2024",
     deps = [
+        ":committed_poses",
         ":config_clk_rs",
         ":session_cmd_clk_rs",
         ":sim_clk_rs_test",
         ":sim_cogs",
         ":sim_state_clk_rs",
         "//crates/reachy-driver:reachy_driver",
-        "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
         "//driver:gate_clk_rs",
         "//driver:goal_clk_rs",
@@ -2017,8 +2107,8 @@ rust_library(
         ":sim_state_clk_rs",
         "//crates/reachy-bus:reachy_bus",
         "//crates/reachy-driver:reachy_driver",
-        "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-poses:reachy_poses",
         "//driver:gate_clk_rs",
         "//driver:goal_clk_rs",
         "//driver:health_clk_rs",
@@ -2085,6 +2175,7 @@ rust_binary(
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
+        ":committed_poses",
         ":log_read",
         ":motion_channels",
         ":motion_evidence",
@@ -2097,6 +2188,7 @@ rust_binary(
         "//crates/reachy-edge:reachy_edge",
         "//crates/reachy-host:reachy_host_lib",
         "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-poses:reachy_poses",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
         "//motion:reports_clk_rs",

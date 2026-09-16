@@ -136,21 +136,24 @@ pub fn neutral_head_pose() -> Isometry3<f64> {
     Isometry3::translation(0.0, 0.0, baked::HEAD_Z_OFFSET)
 }
 
-/// The stow head pose: off-centre, low, and pitched up.
+/// The vendor's sleep head pose: off-centre, low, and pitched up.
 ///
 /// Adapted from the sleep head pose of the Apache-2.0 `reachy_mini`
-/// distribution. It is **not** the bottom of pure vertical travel, and it is
-/// not the resting configuration the machine settles into when limp — which
-/// one it settles into is a measurement, not a derivation.
+/// distribution, and kept as a kinematics subject — an FK seed and a pose the
+/// bench and the solvers are exercised against. It is **not** where this
+/// machine folds: that is the pose library's `stow` document. It is **not** the
+/// bottom of pure vertical travel, and it is not the resting configuration the
+/// machine settles into when limp — which one it settles into is a measurement,
+/// not a derivation.
 #[must_use]
-pub fn stow_head_pose() -> Isometry3<f64> {
+pub fn sleep_head_pose() -> Isometry3<f64> {
     Isometry3::from_parts(
         Translation3::new(
-            baked::STOW_TRANSLATION[0],
-            baked::STOW_TRANSLATION[1],
-            baked::STOW_TRANSLATION[2],
+            baked::SLEEP_TRANSLATION[0],
+            baked::SLEEP_TRANSLATION[1],
+            baked::SLEEP_TRANSLATION[2],
         ),
-        UnitQuaternion::from_axis_angle(&Vector3::y_axis(), baked::STOW_PITCH),
+        UnitQuaternion::from_axis_angle(&Vector3::y_axis(), baked::SLEEP_PITCH),
     )
 }
 
@@ -248,32 +251,33 @@ mod tests {
         }
     }
 
-    /// Stow is low, off the yaw axis, and pitched — none of which the neutral
-    /// pose is.
+    /// The sleep pose is low, off the yaw axis, and pitched — none of which the
+    /// neutral pose is.
     #[test]
-    fn stow_pose_is_low_and_pitched() {
-        let pose = stow_head_pose();
+    fn sleep_pose_is_low_and_pitched() {
+        let pose = sleep_head_pose();
         assert!((pose.translation.z - 0.133).abs() < 1e-12);
         assert!((pose.translation.x + 0.021).abs() < 1e-12);
         let head_z = pose.rotation * Vector3::z();
         let cone = head_z.z.acos();
-        assert!((cone - baked::STOW_PITCH).abs() < 1e-9, "cone {cone}");
+        assert!((cone - baked::SLEEP_PITCH).abs() < 1e-9, "cone {cone}");
     }
 
     /// The recorded resting pose is low, off-axis and pitched a good deal
-    /// further than stow, and it is the pose the baked numbers say it is.
+    /// further than the sleep pose, and it is the pose the baked numbers say it
+    /// is.
     #[test]
-    fn rest_pose_is_lower_and_steeper_than_stow() {
+    fn rest_pose_is_lower_and_steeper_than_sleep() {
         let rest = rest_head_pose();
         assert_eq!(rest.translation.z, baked::REST_TRANSLATION[2]);
         assert_eq!(rest.translation.x, baked::REST_TRANSLATION[0]);
-        assert!(rest.translation.z < stow_head_pose().translation.z);
+        assert!(rest.translation.z < sleep_head_pose().translation.z);
         assert!(
             (cone_angle(&rest.rotation) - baked::REST_PITCH_DEG.to_radians()).abs() < 1e-12,
             "cone {}",
             cone_angle(&rest.rotation)
         );
-        assert!(cone_angle(&rest.rotation) > baked::STOW_PITCH);
+        assert!(cone_angle(&rest.rotation) > baked::SLEEP_PITCH);
     }
 
     /// The tilt extraction agrees with the rotation matrix's own third diagonal

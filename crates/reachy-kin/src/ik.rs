@@ -85,7 +85,7 @@ impl LegSolve {
 ///
 /// The one piece of circular arithmetic in this workspace: the leg solve folds
 /// its crank angle here, and the motion layer resolves an antenna direction and
-/// measures an antenna's distance from stow with it. One definition, so a
+/// measures an antenna's distance from its fold with it. One definition, so a
 /// difference taken in one place and a bound applied in another cannot disagree
 /// about where the half turn is.
 #[must_use]
@@ -258,7 +258,7 @@ pub fn min_pose_margin(geom: &HeadGeometry, head_pose_body: &Isometry3<f64>) -> 
 mod tests {
     use super::*;
     use crate::baked;
-    use crate::geometry::{BranchSign, neutral_head_pose, rest_head_pose, stow_head_pose};
+    use crate::geometry::{BranchSign, neutral_head_pose, rest_head_pose, sleep_head_pose};
     use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 
     use crate::testutil::Rng;
@@ -409,7 +409,7 @@ mod tests {
         assert_eq!(min_margin(&[-0.002, 0.5, 0.5, 0.5, 0.5, 0.5]), -0.002);
 
         let geom = HeadGeometry::default();
-        for pose in [neutral_head_pose(), stow_head_pose(), rest_head_pose()] {
+        for pose in [neutral_head_pose(), sleep_head_pose(), rest_head_pose()] {
             let mut margins = [0.0; 6];
             pose_margins(&geom, &pose, &mut margins);
             assert_eq!(min_margin(&margins), min_pose_margin(&geom, &pose));
@@ -480,19 +480,19 @@ mod tests {
         }
     }
 
-    /// The stow pose is solvable, well inside every travel window, and carries
-    /// about 10 mm of clearance — twice what a bottom-of-vertical-travel
+    /// The vendor's sleep pose is solvable, well inside every travel window, and
+    /// carries about 10 mm of clearance — twice what a bottom-of-vertical-travel
     /// assumption would predict for it.
     ///
     /// The per-leg window slack is pinned as a golden alongside the angles and
     /// margins, so a slip in one window bound names the leg it belongs to. The
     /// windows themselves are pinned by `vertical_travel_binds_where_the_windows_say`.
     #[test]
-    fn stow_pose_golden() {
+    fn sleep_pose_golden() {
         let geom = HeadGeometry::default();
-        let pose = stow_head_pose();
+        let pose = sleep_head_pose();
         let mut angles = LegAngles::default();
-        inverse_kinematics(&geom, &pose, &mut angles).expect("stow is reachable");
+        inverse_kinematics(&geom, &pose, &mut angles).expect("the sleep pose is reachable");
 
         let mut margins = [0.0; 6];
         pose_margins(&geom, &pose, &mut margins);
@@ -524,19 +524,19 @@ mod tests {
     }
 
     /// The resting configuration the vendor's simulated backends start from sits
-    /// far tighter than stow: 0.141 mm on the tightest leg, a twentieth of the
+    /// far tighter than the sleep pose: 0.141 mm on the tightest leg, a tenth of the
     /// clearance floor. Pinned as a golden rather than a band, because it is the
     /// number the whole clearance-baseline policy is sized against, and because
     /// the same configuration is on record a second way that yields 0.182 mm —
     /// a band loose enough to hold both would hide which record moved.
     #[test]
-    fn candidate_resting_pose_is_much_tighter_than_stow() {
+    fn candidate_resting_pose_is_much_tighter_than_sleep() {
         let geom = HeadGeometry::default();
         let min = min_pose_margin(&geom, &rest_head_pose());
         assert!((min - 0.000_141_133).abs() < 1e-9, "min margin {min}");
 
-        let stow_min = min_pose_margin(&geom, &stow_head_pose());
-        assert!(stow_min > 40.0 * min, "stow {stow_min} vs rest {min}");
+        let sleep_min = min_pose_margin(&geom, &sleep_head_pose());
+        assert!(sleep_min > 40.0 * min, "sleep {sleep_min} vs rest {min}");
     }
 
     /// The angles this crate hands to the servos actually close the linkage:

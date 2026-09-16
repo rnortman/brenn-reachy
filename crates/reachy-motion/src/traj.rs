@@ -427,7 +427,7 @@ mod tests {
     use super::*;
     use clockwork_rs::blob_as_bytes;
     use nalgebra::{Quaternion, Vector3};
-    use reachy_kin::stow_head_pose;
+    use reachy_kin::sleep_head_pose;
 
     fn secs(s: f64) -> Duration {
         Duration::from_secs_f64(s)
@@ -437,11 +437,15 @@ mod tests {
         JointTargets::default()
     }
 
+    /// A folded configuration these cases plan moves to and from: a low head,
+    /// a turned base, and both antennas past straight down. A fixture, not the
+    /// deployment's fold — that is the pose library's `stow` document, which a
+    /// sans-I/O crate reads nothing of.
     fn stow() -> JointTargets {
         JointTargets {
-            head_pose_body: stow_head_pose(),
+            head_pose_body: sleep_head_pose(),
             body_yaw: 0.3,
-            antennas: crate::disarm::STOW_ANTENNAS,
+            antennas: [-3.32, 3.32],
         }
     }
 

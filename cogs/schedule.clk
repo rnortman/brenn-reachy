@@ -16,9 +16,9 @@
 
 // What a scheduled step asks for.
 //
-// `base_keep` is not "do nothing": it is "hold whatever the base posture
-// already is", which is what a step that exists to occupy time says. A step
-// naming a posture is the only thing that retargets the base.
+// `base_keep` is not "do nothing": it is "hold whatever the base pose already
+// is", which is what a step that exists to occupy time says. A step naming a
+// pose is the only thing that retargets the base.
 enum StepKind
 {
     uuid: 186ddcf8-bbcd-423c-8544-a4e692c94a5d;
@@ -28,31 +28,10 @@ enum StepKind
     }
     values
     {
-        // Hold the posture already commanded.
+        // Hold the pose already commanded.
         #0 base_keep default { underlying_value: 0; }
-        // Move the base to the posture this step names.
+        // Move the base to the pose this step names.
         #1 base_posture { underlying_value: 1; }
-    }
-}
-
-// The base postures a step may name.
-//
-// Two, deliberately: stowed is the posture the machine rests in and the one
-// every de-torqued position is safe from, and up is the working posture. A
-// third arrives when something needs one, not before.
-enum Posture
-{
-    uuid: 9ce82955-0620-4580-9d3a-2670d6350059;
-    options
-    {
-        underlying_type: UInt8;
-    }
-    values
-    {
-        // Low, off-centre, pitched up: where the machine rests.
-        #0 stow default { underlying_value: 0; }
-        // The neutral working posture.
-        #1 up { underlying_value: 1; }
     }
 }
 
@@ -73,12 +52,28 @@ schema ScheduledStep
         // What the step asks for.
         #2 kind: StepKind;
 
-        // Which posture, meaningful only when `kind` is `base_posture`.
-        #3 posture: Posture;
+        // How long the move to `pose_id` takes; meaningful only when `kind` is
+        // `base_posture`. Positive: a move given no time is not a move. The
+        // commander states it, because choosing where the base goes and how
+        // fast it gets there is one choice; a commander that states none is
+        // given the pace the pose library holds for that pose.
+        #4 pace: Duration;
+
+        // Which pose, as its index in the configured library's poses.
+        // Meaningful only when `kind` is `base_posture`. Identity is position
+        // there, exactly as an overlay's motion is, so nothing here carries a
+        // name: names live at the authoring edge and the number is what the
+        // machine commands against.
+        #5 pose_id: UInt16;
+    }
+    history
+    {
+        version: 2;
+        removed: [3];
     }
 }
 
-// One motion playing over the base posture, and the window it plays in.
+// One motion playing over the base pose, and the window it plays in.
 //
 // A window rather than a start and a length because the two ends are what a
 // consumer asks about: whether a window is open at an instant, and whether every
@@ -122,7 +117,7 @@ schema SessionSchedule
     fields
     {
         // The gate: nothing is commanded while this is false. Not a step and
-        // not a posture -- engagement is whether the machine is under command
+        // not a pose -- engagement is whether the machine is under command
         // at all.
         #0 engaged: Bool;
 
@@ -134,7 +129,7 @@ schema SessionSchedule
         #2 steps: VarArray<ScheduledStep, 16>;
 
         // The overlay windows, in time order. Independent of the steps: an
-        // overlay is a delta composed over whatever posture the base is holding,
+        // overlay is a delta composed over whatever pose the base is holding,
         // so a window may span several steps or none at all, and the stream
         // outlives the last step until the last window closes.
         #3 overlays: VarArray<OverlayWindow, 4>;

@@ -27,6 +27,13 @@ pub mod check;
 #[path = "scenario/read.rs"]
 pub mod read;
 
+/// The two pose names this suite's scripts spell, as the library spells them.
+///
+/// Re-exported rather than restated per scenario: a name is the join between a
+/// script and the emitted library, and one spelling is what keeps the two in
+/// step.
+pub use reachy_poses::{NEUTRAL_POSE, STOW_POSE};
+
 /// The scenario epoch: an arbitrary round Unix time, far enough from zero that
 /// a dropped or defaulted timestamp reads as obviously wrong rather than as a
 /// plausible small number.
@@ -39,11 +46,73 @@ pub const PERIOD_NS: i64 = 20_000_000;
 /// How many cycles ahead of the sample that decided it a goal is dated.
 pub const LAG_K: i64 = 2;
 
-/// How long a move to the upright posture is given.
+/// How long a move to the attending pose is given.
+///
+/// A step states its own pace, so this is the suite's statement and not a
+/// configured knob: every scenario but the two that lay a hand on the raise
+/// writes this on its raise step.
 pub const UP_DURATION_NS: i64 = 800_000_000;
 
 /// How long a move to stow is given.
+///
+/// The library's own pace for the fold, restated here so a scenario's arithmetic
+/// is a constant rather than a lookup, and pinned to it by
+/// `the_suites_fold_pace_is_the_librarys`: the fold the fault ladder commands
+/// takes the library's pace, so a suite stating another would be judging a run
+/// against a clock the machine did not use.
 pub const STOW_DURATION_NS: i64 = 2_000_000_000;
+
+/// How long the raise is given in the two scenarios that lay a hand on it.
+///
+/// Slower than the suite's own raise, and the reason is the run itself: a hand
+/// on the cranks has to leave the generator the detector's screening distance to
+/// travel *and* have settled before the fault lands, and on the recorded fold's
+/// shorter arc an 0.8 s raise leaves no cycle where both hold. A step states its
+/// own pace, so these two scenarios state one; nothing else moves with it.
+pub const JAM_RAISE_DURATION_NS: i64 = 1_000_000_000;
+
+/// [`JAM_RAISE_DURATION_NS`] as a script's field carries it.
+///
+/// # Panics
+///
+/// If it is not a whole number of milliseconds.
+#[must_use]
+pub fn jam_raise_ms() -> u32 {
+    u32::try_from(JAM_RAISE_DURATION_NS / 1_000_000).expect("a raise pace inside a script's field")
+}
+
+/// The pace a base step is written with when the scenario states none,
+/// milliseconds.
+///
+/// The suite's own default for each pose, which is what an author that does not
+/// care about the clock gets. The fold is the library's; anything else is the
+/// suite's raise.
+///
+/// # Panics
+///
+/// If the pace is not a whole number of milliseconds, which is a constant above
+/// stated off the grid a script's fields carry.
+#[must_use]
+pub fn pace_ms(pose: &str) -> u32 {
+    let ns = if pose == STOW_POSE {
+        STOW_DURATION_NS
+    } else {
+        UP_DURATION_NS
+    };
+    u32::try_from(ns / 1_000_000).expect("a base pace inside a script's field")
+}
+
+/// The number the committed pose library gives the pose called `name`.
+///
+/// [`motion_id`]'s twin over the other half of the same sidecar.
+///
+/// # Panics
+///
+/// As [`pose_entry`] does.
+#[must_use]
+pub fn pose_id(name: &str) -> u16 {
+    pose_entry(name).pose_id
+}
 
 /// How long the goal stream may be silent before the gate de-torques.
 pub const HOLD_TIMEOUT_NS: i64 = 200_000_000;
@@ -520,13 +589,23 @@ pub fn posture_walk(
 #[must_use]
 pub fn up_walk() -> &'static PostureWalk {
     static WALK: std::sync::OnceLock<PostureWalk> = std::sync::OnceLock::new();
-    WALK.get_or_init(|| {
-        posture_walk(
-            &reachy_motion::postures::stow_pose_targets(),
-            &reachy_motion::postures::neutral_targets(),
-            UP_DURATION_NS,
-        )
-    })
+    WALK.get_or_init(|| posture_walk(&stow_pose(), &neutral_pose(), UP_DURATION_NS))
+}
+
+/// The stepped walk of the raise the two hand-on-the-raise scenarios state,
+/// walked once per process.
+///
+/// The same travel as [`up_walk`] on [`JAM_RAISE_DURATION_NS`]: what
+/// [`jam_on_the_raise`] searches, because the placement is a fact about the
+/// raise those runs actually command.
+///
+/// # Panics
+///
+/// As [`posture_walk`] does.
+#[must_use]
+pub fn jam_walk() -> &'static PostureWalk {
+    static WALK: std::sync::OnceLock<PostureWalk> = std::sync::OnceLock::new();
+    WALK.get_or_init(|| posture_walk(&stow_pose(), &neutral_pose(), JAM_RAISE_DURATION_NS))
 }
 
 /// The stepped walk of the fold, walked once per process: the same distance on
@@ -538,13 +617,7 @@ pub fn up_walk() -> &'static PostureWalk {
 #[must_use]
 pub fn stow_walk() -> &'static PostureWalk {
     static WALK: std::sync::OnceLock<PostureWalk> = std::sync::OnceLock::new();
-    WALK.get_or_init(|| {
-        posture_walk(
-            &reachy_motion::postures::neutral_targets(),
-            &reachy_motion::postures::stow_pose_targets(),
-            STOW_DURATION_NS,
-        )
-    })
+    WALK.get_or_init(|| posture_walk(&neutral_pose(), &stow_pose(), STOW_DURATION_NS))
 }
 
 /// How long the walk above may run before it is a bug rather than a slow
@@ -740,7 +813,7 @@ pub fn jam_on_the_raise(rows: brenn_reachy__motion__joints_clk_rs::JointFlags) -
 /// As [`jam_on_the_raise`] does.
 fn derive_jam_on_the_raise(rows: brenn_reachy__motion__joints_clk_rs::JointFlags) -> Jam {
     let cfg = reachy_motion::tick::default_motion_config();
-    let walk = up_walk();
+    let walk = jam_walk();
     let held: Vec<usize> = reachy_motion::joints::flags::iter(rows)
         .map(|joint| reachy_motion::joints::row(joint).expect("a jammed joint sits on a bus row"))
         .collect();
@@ -899,21 +972,13 @@ const PAIR_TAIL_ALLOWANCE_CYCLES: i64 = 3;
 /// which every scenario's machine starts.
 #[must_use]
 pub fn up_clocks() -> MoveClocks {
-    posture_clocks(
-        &reachy_motion::postures::stow_pose_targets(),
-        &reachy_motion::postures::neutral_targets(),
-        UP_DURATION_NS,
-    )
+    posture_clocks(&stow_pose(), &neutral_pose(), UP_DURATION_NS)
 }
 
 /// The clocks the fold runs on: the same move back, on its own duration.
 #[must_use]
 pub fn stow_clocks() -> MoveClocks {
-    posture_clocks(
-        &reachy_motion::postures::neutral_targets(),
-        &reachy_motion::postures::stow_pose_targets(),
-        STOW_DURATION_NS,
-    )
+    posture_clocks(&neutral_pose(), &stow_pose(), STOW_DURATION_NS)
 }
 
 /// Why a step of `step_ns` ending in a hold at `clocks`' destination cannot be
@@ -1017,8 +1082,60 @@ pub fn answered_within(fault_cycle: i64) -> i64 {
     fault_cycle + health_lap_cycles() + 1
 }
 
-/// The committed name-to-number sidecar the clip-config emitter writes.
-const CLIP_LIBRARY_NAMES: &str = include_str!("clip_library.names.json");
+/// The committed pose library, parsed and screened.
+///
+/// The committed asset's own bytes, read through the same reader and the same
+/// screen every consumer of a bound library runs: a checker that judges where
+/// the machine folded reads the fold out of the library rather than restating a
+/// number the author may move. One embedding of the asset serves every reader
+/// in this package, which is what stops two of them disagreeing about which
+/// emit the tree holds.
+#[must_use]
+pub fn pose_library() -> &'static reachy_poses::library::PoseLibrary<'static> {
+    committed_poses::library()
+}
+
+/// Where the fold puts the machine, as the committed library states it.
+///
+/// Every scenario's machine starts here and every schedule ends here, and the
+/// figure is the library's rather than a checker's: a run is judged against the
+/// asset the run was configured from.
+#[must_use]
+pub fn stow_pose() -> reachy_motion::joints::JointTargets {
+    pose_library().stow().1
+}
+
+/// Where the attending pose puts the machine, as the committed library states
+/// it.
+///
+/// [`stow_pose`]'s twin over the other end of every scenario's raise, and read
+/// the same way: the pose a run was configured from rather than a
+/// configuration restated in a checker.
+///
+/// # Panics
+///
+/// If the committed library holds no pose under [`NEUTRAL_POSE`], which is a
+/// broken emit rather than a case.
+#[must_use]
+pub fn neutral_pose() -> reachy_motion::joints::JointTargets {
+    committed_poses::targets(NEUTRAL_POSE)
+}
+
+/// What a release is judged against, as a checker outside the session process
+/// reads it.
+///
+/// The session's own construction, over the committed library: the record is
+/// built by one function, `session_bus::release_record`, so a field added to it
+/// reaches the run and the checker together. What differs is only where the
+/// library comes from — a running session is configured with one and a checker
+/// reading a log has none, so this reads the committed bytes [`pose_library`]
+/// holds, which is what the run was configured from.
+#[must_use]
+pub fn disarm_config() -> &'static reachy_motion::disarm::DisarmConfig {
+    static CONFIGURED: std::sync::OnceLock<reachy_motion::disarm::DisarmConfig> =
+        std::sync::OnceLock::new();
+    CONFIGURED.get_or_init(|| motion_cogs::session_bus::release_record(pose_library()))
+}
 
 /// The number the committed clip library gives the motion called `name`.
 ///
@@ -1040,15 +1157,33 @@ pub fn motion_id(name: &str) -> u16 {
         .motion_id
 }
 
-/// The committed sidecar as the intent edge reads it.
+/// The number the committed pose library gives the pose called `name`, and the
+/// pace it holds for it.
 ///
-/// The edge's own reader rather than a walk of the JSON here: the sidecar is one
+/// [`motion_id`]'s twin, over the other half of the same sidecar and for the
+/// same reason: the numbering is positional and generated, so a scenario that
+/// names a pose reads the number rather than restating it.
+///
+/// # Panics
+///
+/// If the sidecar is not the emitter's JSON, or carries no pose of that name.
+#[must_use]
+pub fn pose_entry(name: &str) -> reachy_edge::PoseEntry {
+    committed_poses::tables()
+        .1
+        .resolve(name)
+        .unwrap_or_else(|| panic!("the committed pose library carries no pose named {name}"))
+}
+
+/// The committed sidecar's motions, as the intent edge reads them.
+///
+/// The edge's own reader rather than a walk of the JSON here, and the package's
+/// one embedding of the document rather than a second: the sidecar is one
 /// artifact with one shape, and a second reader of it is a second thing to
 /// update when the emitter grows a field -- the one that keeps compiling while
 /// it is wrong.
-fn motion_table() -> reachy_edge::MotionTable {
-    reachy_edge::MotionTable::from_sidecar(CLIP_LIBRARY_NAMES)
-        .expect("the committed sidecar is the emitter's")
+fn motion_table() -> &'static reachy_edge::MotionTable {
+    &committed_poses::tables().0
 }
 
 /// How many cycles the goal stream may be silent before the gate de-torques.
@@ -1364,8 +1499,6 @@ pub fn check_params(paths: &ConfigPaths<'_>) -> Vec<String> {
         &[
             ("lag_k", Value::Int(LAG_K)),
             ("period_ns", Value::Int(PERIOD_NS)),
-            ("up_duration_ns", Value::Int(UP_DURATION_NS)),
-            ("stow_duration_ns", Value::Int(STOW_DURATION_NS)),
             ("tracking_armed", Value::Bool(TRACKING_ARMED)),
         ],
         &mut failures,
@@ -1645,10 +1778,9 @@ mod tests {
         AUX_RETRIES, AUX_TIMEOUT_NS, BUS_WATCHDOG, ConfigPaths, HEALTH_POLL_PERIOD_NS,
         HOLD_TIMEOUT_NS, LAG_K, PERIOD_NS, RAIL_STALE_AFTER_NS, SAMPLE_STALE_AFTER,
         SCRIPT_SPAN_CAP_MS, SESSION_CONFIRM_BUDGET_NS, START_TORQUED, STARTUP_GRACE_NS,
-        STOW_BUDGET_NS, STOW_DURATION_NS, TRACKING_ARMED, UP_DURATION_NS, check_params,
-        crossing_cycles, head_jam_rows, head_up_travel, jam_on_the_raise, motion_id, motion_table,
-        posture_joints, response_delay_cycles, travel_cycles, unjudgeable_step, up_clocks,
-        up_travel, up_walk,
+        STOW_BUDGET_NS, TRACKING_ARMED, check_params, crossing_cycles, head_jam_rows,
+        head_up_travel, jam_on_the_raise, motion_id, motion_table, posture_joints,
+        response_delay_cycles, travel_cycles, unjudgeable_step, up_clocks, up_travel, up_walk,
     };
 
     /// The sidecar the emitter committed is the sidecar the edge's reader parses,
@@ -1667,6 +1799,30 @@ mod tests {
         assert_eq!(tour.motion_id, motion_id("bench/tour"));
         assert_eq!(tour.window.duration_ms, 1701);
         assert_eq!(tour.window.blend_out_ms, 200);
+    }
+
+    /// The fold the fault ladder commands runs at the library's pace, and no
+    /// scenario states one on a stow step, so the suite's constant has to be
+    /// that pace: a run judged against another clock would be judged against a
+    /// move the machine did not make.
+    ///
+    /// The raise has no such pin: every scenario states its own raise pace, so
+    /// `UP_DURATION_NS` is the suite's statement rather than a copy of the
+    /// library's.
+    #[test]
+    fn the_suites_fold_pace_is_the_librarys() {
+        let (_, _, pace) = super::pose_library().stow();
+        assert_eq!(
+            i64::try_from(pace.as_nanos()).expect("a length of time"),
+            super::STOW_DURATION_NS,
+            "the suite folds on the clock the library states",
+        );
+        assert_eq!(
+            super::pace_ms(super::STOW_POSE),
+            u32::try_from(super::STOW_DURATION_NS / 1_000_000)
+                .expect("a pace in whole milliseconds"),
+            "and that is what an author who states none is given",
+        );
     }
 
     /// The stepped walk every re-derived instant in the suite is an expression
@@ -1707,8 +1863,8 @@ mod tests {
     /// min-jerk tail to come inside the arrival tolerance.
     #[test]
     fn the_stepped_arrival_walk_agrees_with_the_plant_it_walks() {
-        let stow = reachy_motion::postures::stow_pose_targets();
-        let neutral = reachy_motion::postures::neutral_targets();
+        let stow = super::stow_pose();
+        let neutral = super::neutral_pose();
         let folded = posture_joints(&stow);
         let upright = posture_joints(&neutral);
         let arc = core::f64::consts::TAU - (upright.antennas[0] - folded.antennas[0]).abs();
@@ -1884,8 +2040,6 @@ mod tests {
                     vec![
                         ("lag_k", LAG_K.to_string()),
                         ("period_ns", PERIOD_NS.to_string()),
-                        ("up_duration_ns", UP_DURATION_NS.to_string()),
-                        ("stow_duration_ns", STOW_DURATION_NS.to_string()),
                         ("tracking_armed", TRACKING_ARMED.to_string()),
                     ],
                 ),

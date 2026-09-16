@@ -164,7 +164,7 @@ fn check_arrival(run: &Run, failures: &mut Vec<String>) {
         run,
         "upright with the window closed",
         window_close_cycle(),
-        &held_targets(reachy_motion::postures::NEUTRAL_ANTENNAS),
+        &held_targets(scenario::neutral_pose().antennas),
         failures,
     );
 }

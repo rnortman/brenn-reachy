@@ -718,5 +718,22 @@
       "motion_id": 71,
       "name": "bench/tour"
     }
+  ],
+  "poses": [
+    {
+      "duration_ms": 800,
+      "name": "neutral",
+      "pose_id": 0
+    },
+    {
+      "duration_ms": 800,
+      "name": "peek",
+      "pose_id": 1
+    },
+    {
+      "duration_ms": 2000,
+      "name": "stow",
+      "pose_id": 2
+    }
   ]
 }

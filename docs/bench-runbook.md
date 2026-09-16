@@ -79,7 +79,7 @@ driver de-torques.
 
     make library-run   # build, push, play every motion, fetch, judge
 
-Every motion in `cogs/clip_library.names.json` but the `probe/` instruments
+Every motion in `cogs/library.names.json` but the `probe/` instruments
 (`make motion-probe MOTION=<name>` plays those singly), in order, at recorded
 pace: minutes of unattended motion.
 **Keep the space around the machine clear until it returns.** Reaching the
@@ -133,8 +133,8 @@ enabled = true`; `listen_addr`, `pod_psk_file`, `[pods]` and both `[wake]`
 keys must match.
 
 The fetch prints the `pose_session_report` command, which writes `session.json`
-and `timeline.txt` (a line per hold, move, utterance). Segmenter flags
-tune it; `--extract <segment>` drafts a clip.
+and `timeline.txt` (a line per hold, move, utterance). `--extract <segment>`
+drafts a clip, `--as-pose` a pose: `docs/pose-authoring.md`.
 
 ## Exit codes
 

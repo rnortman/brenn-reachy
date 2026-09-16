@@ -29,7 +29,7 @@ use serde_json::json;
 use crate::alerts::{Alert, Alerts};
 use crate::config::EdgeConfig;
 use crate::intake::{Accepted, Edge, Origin};
-use crate::names::MotionTable;
+use crate::names::{MotionTable, PoseTable};
 use crate::narrate::{
     edge_line, lost_line, refusal_line, restart_line, severity_word, timeline_line,
 };
@@ -116,11 +116,11 @@ pub struct HostEdge {
 }
 
 impl HostEdge {
-    /// The edge this configuration and this name table describe.
+    /// The edge this configuration and the sidecar's two name tables describe.
     #[must_use]
-    pub fn new(config: EdgeConfig, table: MotionTable) -> Self {
+    pub fn new(config: EdgeConfig, table: MotionTable, poses: PoseTable) -> Self {
         Self {
-            edge: Edge::new(config, table),
+            edge: Edge::new(config, table, poses),
             story: Story::new(),
             alerts: Alerts::new(),
         }
@@ -219,7 +219,7 @@ fn not_a_story_line(detail: &str, at: SyncTime) -> String {
 #[cfg(test)]
 mod tests {
     use clockwork_rs::{SyncTime, blob_as_bytes};
-    use motion_proto::{MotionScript, Posture, Step};
+    use motion_proto::{MotionScript, Step};
 
     use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
     use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
@@ -268,15 +268,24 @@ mod tests {
 
     /// The edge under test.
     fn host() -> HostEdge {
-        HostEdge::new(EdgeConfig::for_pod(POD), MotionTable::default())
+        HostEdge::new(
+            EdgeConfig::for_pod(POD),
+            MotionTable::default(),
+            crate::fixture::poses(),
+        )
     }
 
     /// A script body for `POD`, numbered `seq`, as the wire contract encodes
     /// one: a raise now, with the closing stow left to the compile.
     fn body(seq: u64) -> String {
-        MotionScript::new(POD, seq, vec![Step::new(0, Posture::Up)], 13_000)
-            .expect("a lawful script")
-            .encode()
+        MotionScript::new(
+            POD,
+            seq,
+            vec![Step::new(0, crate::fixture::NEUTRAL_POSE)],
+            13_000,
+        )
+        .expect("a lawful script")
+        .encode()
     }
 
     /// A story of `rows` rows of `kind`, with `dropped` said to have fallen off
@@ -366,10 +375,14 @@ mod tests {
     fn a_local_refusal_is_narrated_as_local_and_alerted_loudly() {
         let mut host = host();
         let mut surface = Recorded::default();
-        let foreign =
-            MotionScript::new("somebody-else", 1, vec![Step::new(0, Posture::Up)], 13_000)
-                .expect("a lawful script for another machine")
-                .encode();
+        let foreign = MotionScript::new(
+            "somebody-else",
+            1,
+            vec![Step::new(0, crate::fixture::NEUTRAL_POSE)],
+            13_000,
+        )
+        .expect("a lawful script for another machine")
+        .encode();
 
         assert!(
             host.offer(foreign.as_bytes(), Origin::Local, at(), &mut surface)

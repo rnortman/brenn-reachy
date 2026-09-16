@@ -65,8 +65,8 @@ const PARAMS_MESSAGE: &str = "HostParams";
 pub struct HostSettings {
     /// What the edge screens and compiles with.
     pub edge: EdgeConfig,
-    /// Where the clip library's name table is.
-    pub clip_names: PathBuf,
+    /// Where the asset libraries' name table is.
+    pub library_names: PathBuf,
 }
 
 /// A configuration that was not read.
@@ -265,24 +265,21 @@ fn transcribe(message: &DynamicMessage) -> Result<HostParamsWire, ParamsErrorKin
                     });
                 }
             }
-            "stow_duration_ms" => {
-                wire.set_stow_duration_ms(count(message, &field, "stow_duration_ms")?);
-            }
             "body_cap_bytes" => {
                 wire.set_body_cap_bytes(count(message, &field, "body_cap_bytes")?);
             }
-            "clip_names_path" => {
-                let path = text(message, &field, "clip_names_path")?;
+            "library_names_path" => {
+                let path = text(message, &field, "library_names_path")?;
                 if path.is_empty() {
                     return Err(ParamsErrorKind::NoPath {
-                        name: "clip_names_path",
+                        name: "library_names_path",
                     });
                 }
-                if !wire.try_set_clip_names_path(&path) {
+                if !wire.try_set_library_names_path(&path) {
                     return Err(ParamsErrorKind::TooLong {
-                        name: "clip_names_path",
+                        name: "library_names_path",
                         value: path,
-                        capacity: wire.clip_names_path().capacity(),
+                        capacity: wire.library_names_path().capacity(),
                     });
                 }
             }
@@ -314,10 +311,10 @@ fn settings(wire: &HostParamsWire) -> Result<HostSettings, ParamsErrorKind> {
             name: "body_cap_bytes",
             value: params.body_cap_bytes.to_string(),
         })?;
-    let edge = EdgeConfig::new(params.pod.as_str(), params.stow_duration_ms, body_cap_bytes)?;
+    let edge = EdgeConfig::new(params.pod.as_str(), body_cap_bytes)?;
     Ok(HostSettings {
         edge,
-        clip_names: PathBuf::from(params.clip_names_path.as_str()),
+        library_names: PathBuf::from(params.library_names_path.as_str()),
     })
 }
 
@@ -378,9 +375,8 @@ mod tests {
     fn lines() -> Vec<&'static str> {
         vec![
             "pod: \"kitchen-reachy\"",
-            "stow_duration_ms: 3000",
             "body_cap_bytes: 8192",
-            "clip_names_path: \"cogs/clip_library.names.json\"",
+            "library_names_path: \"cogs/library.names.json\"",
         ]
     }
 
@@ -420,22 +416,16 @@ mod tests {
     fn a_whole_configuration_is_what_the_edge_runs_on() {
         let settings = parse(&whole()).expect("the fixture parses");
         assert_eq!(settings.edge.pod(), "kitchen-reachy");
-        assert_eq!(settings.edge.stow_duration_ms(), 3000);
         assert_eq!(settings.edge.body_cap_bytes(), 8192);
         assert_eq!(
-            settings.clip_names.to_str(),
-            Some("cogs/clip_library.names.json")
+            settings.library_names.to_str(),
+            Some("cogs/library.names.json")
         );
     }
 
     #[test]
     fn every_field_is_required() {
-        for field in [
-            "pod",
-            "stow_duration_ms",
-            "body_cap_bytes",
-            "clip_names_path",
-        ] {
+        for field in ["pod", "body_cap_bytes", "library_names_path"] {
             let refusal = refused(&without(field));
             assert_eq!(
                 refusal,
@@ -453,10 +443,6 @@ mod tests {
             refused(&with("pod", "pod: \"  \"")),
             ParamsErrorKind::Rejected(ConfigError::PodUnnamed),
         ));
-        assert!(matches!(
-            refused(&with("stow_duration_ms", "stow_duration_ms: 0")),
-            ParamsErrorKind::Rejected(ConfigError::StowTakesNoTime),
-        ));
         let cap = format!("body_cap_bytes: {}", MIN_BODY_CAP_BYTES - 1);
         assert!(matches!(
             refused(&with("body_cap_bytes", &cap)),
@@ -467,9 +453,9 @@ mod tests {
     #[test]
     fn an_empty_path_names_no_file() {
         assert_eq!(
-            refused(&with("clip_names_path", "clip_names_path: \"\"")),
+            refused(&with("library_names_path", "library_names_path: \"\"")),
             ParamsErrorKind::NoPath {
-                name: "clip_names_path"
+                name: "library_names_path"
             },
         );
     }
@@ -508,7 +494,7 @@ mod tests {
     #[test]
     fn a_value_of_the_wrong_kind_is_the_parsers_refusal() {
         assert!(matches!(
-            refused(&with("stow_duration_ms", "stow_duration_ms: \"3000\"")),
+            refused(&with("body_cap_bytes", "body_cap_bytes: \"8192\"")),
             ParamsErrorKind::Text { .. },
         ));
         assert!(matches!(
@@ -526,8 +512,8 @@ mod tests {
         // built with, and through `compiled`, so the guard cannot pass against
         // a pipeline the parse no longer uses.
         let grown = PARAMS_PROTO.replace(
-            "optional string clip_names_path = 4;",
-            "optional string clip_names_path = 4;\n    optional uint32 lead_ms = 5;",
+            "optional string library_names_path = 3;",
+            "optional string library_names_path = 3;\n    optional uint32 lead_ms = 4;",
         );
         assert_ne!(grown, PARAMS_PROTO, "the schema still reads this way");
 
@@ -550,10 +536,10 @@ mod tests {
         // an operator can fix, so the refusal is `Schema`.
         for (declared, retyped, field, value, why) in [
             (
-                "optional uint32 stow_duration_ms = 2;",
-                "optional string stow_duration_ms = 2;",
-                "stow_duration_ms",
-                "stow_duration_ms: \"3000\"",
+                "optional uint32 body_cap_bytes = 2;",
+                "optional string body_cap_bytes = 2;",
+                "body_cap_bytes",
+                "body_cap_bytes: \"8192\"",
                 "a whole count",
             ),
             (

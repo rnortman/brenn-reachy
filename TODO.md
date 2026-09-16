@@ -309,6 +309,12 @@ playback half is `compose`, `config`, `player` and `speed`; the authoring half
 is `format`, `library`, `vendor`, `files` and the importer binary, with `serde`,
 `serde_json` and `anyhow` behind it.
 
+`reachy-poses` has the same shape and the same problem: its document reader and
+the descriptor compilation behind it are host-side only — a running machine
+reaches a pose out of the configuration message — and every cog build compiles
+them along with `prost-reflect` and `protox`. Whatever shape the split takes,
+both crates take it.
+
 Deferral context: playback now reads clips only out of the configuration
 message, so nothing the running machine reaches touches the JSON document
 reader, the loader, the vendor importer or the filesystem walk — yet every cog
@@ -316,8 +322,30 @@ build compiles them, and the crate's own header has to explain which of its
 parts are at the crate's edge instead of the build saying so. The split is a new
 crate with its own package and visibility boundary rather than a target-level
 edit, which is a packaging decision the frozen design does not make, and the
-cost grows each time the authoring side gains a format. Marked in the header of
-`crates/reachy-clips/src/lib.rs`.
+cost grows each time the authoring side gains a format. Marked in the headers of
+`crates/reachy-clips/src/lib.rs` and `crates/reachy-poses/src/lib.rs`.
+
+## `clk-textproto-reader-copies`
+
+Give the "read a `.clk`-generated schema's protobuf text" scaffolding one
+statement instead of three. The mechanical half is the same everywhere: compile
+the embedded generated `.proto` in memory behind a `OnceLock`, look a message up
+by its package-qualified name, then read scalar fields through presence-checked
+accessors that refuse an unset or wrongly typed field.
+
+Deferral context: it is stated in `crates/reachy-motord/src/params.rs`, in
+`crates/reachy-host/src/params.rs` and now in
+`crates/reachy-poses/src/format.rs`, copied down to the comment explaining why
+the schema is compiled in memory. The pose library emitter will make a fourth.
+Each copy has to be found and edited when `protox` or `prost-reflect` changes
+shape, and a copy that is missed reintroduces the schema-at-runtime failure mode
+all three headers say the embed exists to delete, with nothing in the build to
+notice. What keeps them apart is that each raises its own error type, which a
+generic parameter or one `From` arm answers. The shared piece is a new
+host-side crate with its own package and visibility boundary — a packaging
+decision the frozen design does not make, and one that touches three crates
+already under review. Marked at `descriptor` in
+`crates/reachy-poses/src/format.rs`.
 
 ## `ci-cache-refresh`
 
@@ -819,6 +847,13 @@ Two copies of the motion wire contract compile in this build: `crates/
 motion-proto`, and the one `speech-surface` brings through the pinned host
 closure. `//crates/reachy-host:host_closure_test` links the second.
 
+The two copies exist because the dependency runs both ways: brenn-reachy
+consumes `speech-surface` by pinned revision, and `speech-surface` consumes
+`motion-proto` by pinned revision in the other direction
+(`host/crates/speech-surface/Cargo.toml`). Neither pin can move without the
+other repository having already published, so a wire change is two pushes in a
+fixed order and the fetched copy is never this tree's.
+
 Deferral context: `speech-surface` takes `motion-proto` from a *historical*
 brenn-reachy commit, so the fetched copy is one publish behind this tree's and
 re-pinning does not dissolve it. Harmless by construction: both seams the host
@@ -1188,10 +1223,11 @@ for the verdict. Marked at both: the yaw's triple in
 Give the antennas' raise its own clock, so the wake gesture can snap the
 antennas into position without speeding the head's raise with it.
 
-Deferral context: the wake raise is one duration. Head and antennas start
-together on one command and the mover holds a single `up_duration_ns`, 0.8 s,
-which the tick shapes into a min-jerk path for every joint -- so shortening it
-speeds the head's raise on the six cranks too, which is a different move against
+Deferral context: the wake raise is one duration, wherever it is stated -- the
+commanding step's own `move_ms`, or the pose library's pace for the pose when
+the step states none. Head and antennas start together on one command and the
+tick shapes that one clock into a min-jerk path for every joint, so shortening
+it speeds the head's raise on the six cranks too, which is a different move against
 a different capability and not a taste knob. The servo profile is not the lever
 either: nothing in the planner reads it, and what a faster pair changes is how
 closely the servo follows the streamed path, not how fast the path is. At the `20 / 50` the
@@ -1203,7 +1239,8 @@ that is the antennas alone is a mover change with the detector's margin and the
 head's timing in it, and it wants its own reading.
 
 Done = a raise the user calls a snap, on record, or the ask withdrawn. Marked at
-`up_duration_ns` in `cogs/mover_params.textproto`.
+`PoseDocument.duration_ms` in `cogs/config.clk`, which is where a move's one
+clock is authored.
 
 ## `bench-probe-series-retention`
 

@@ -74,7 +74,7 @@ rust_library(
 rust_binary(
     name = "reachy_host",
     srcs = ["src/main.rs"],
-    data = ["//cogs:clip_library.names.json"],
+    data = ["//cogs:library.names.json"],
     edition = "2024",
     rustc_flags = ["-Clink-arg=-Wl,-rpath,$$ORIGIN"],
     visibility = ["//visibility:public"],
@@ -104,6 +104,7 @@ rust_test(
         "//cogs:script_clk_rs",
         "//crates/motion-proto:motion_proto",
         "//crates/reachy-scratch:reachy_scratch",
+        ":pose_fixture",
         ":reachy_host_lib",
         ":speech_fixture",
     ],
@@ -149,6 +150,7 @@ rust_test(
     size = "small",
     crate = ":reachy_host_lib",
     deps = [
+        ":pose_fixture",
         ":speech_fixture",
         "//crates/motion-proto:motion_proto",
         "//crates/reachy-scratch:reachy_scratch",
@@ -166,6 +168,21 @@ rust_library(
     srcs = ["testing/speech_fixture.rs"],
     edition = "2024",
     deps = ["@brenn_reachy_crates//:speech-surface"],
+)
+
+# The pose library both test crates hand a `HostEdge`. Its own `testonly`
+# library for the same reason `speech_fixture` is one: a module inside either
+# crate is unreachable from the other, and two copies of the two poses and the
+# ids they are numbered under can drift apart without anything saying so.
+rust_library(
+    name = "pose_fixture",
+    testonly = True,
+    srcs = ["testing/pose_fixture.rs"],
+    edition = "2024",
+    deps = [
+        "//crates/motion-proto:motion_proto",
+        "//crates/reachy-edge:reachy_edge",
+    ],
 )
 
 # The voice pipeline's third-party closure, linked. Every other target in this
@@ -206,13 +223,13 @@ rust_test(
     size = "small",
     srcs = ["tests/example_params.rs"],
     data = [
-        "//cogs:clip_library.names.json",
+        "//cogs:library.names.json",
         "//host:host_params.example.textproto",
     ],
     edition = "2024",
     env = {
         "HOST_PARAMS": "host/host_params.example.textproto",
-        "CLIP_NAMES": "cogs/clip_library.names.json",
+        "CLIP_NAMES": "cogs/library.names.json",
     },
     deps = [
         ":reachy_host_lib",

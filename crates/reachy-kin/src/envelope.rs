@@ -43,7 +43,7 @@
 //!
 //! The clearance floor is a floor on *commanded* poses, but the machine can
 //! come to rest below it — one documented resting configuration sits at 0.141 mm
-//! of clearance, a twentieth of the floor. Refusing every command from there
+//! of clearance, a tenth of the floor. Refusing every command from there
 //! would leave the head stuck at its tightest. So a caller that knows the
 //! present pose's clearance passes it as `margin_baseline`, and a pose that
 //! strictly increases clearance is admissible even below the floor. Motion
@@ -89,9 +89,17 @@ pub struct EnvelopeConfig {
 
 impl Default for EnvelopeConfig {
     /// The vendor's published figures, with the tighter of the two relative-yaw
-    /// candidates, and a clearance floor of 3 mm — comfortably above the
-    /// millimetre the crank stops leave at the top of vertical travel, so the
-    /// floor is what binds there rather than the stops.
+    /// candidates, and a clearance floor of 1.5 mm.
+    ///
+    /// The floor is the clearance this tree has already reviewed a rest
+    /// against: half of the worst settle measured on this unit, which is the
+    /// same 1.5 mm the bench's resting-pose check was given. A rest the bench
+    /// accepts as sanely assembled is a pose the envelope admits commanding;
+    /// the two floors ask different questions and stay separate constants, so
+    /// this one states its own figure. It is also above the 1.17 mm
+    /// the crank stops leave at the top of vertical travel, so the floor is
+    /// what binds there rather than the stops. This machine's own rest sits
+    /// below it at 0.141 mm, which is what the margin baseline is for.
     fn default() -> Self {
         Self {
             crank_windows: core::array::from_fn(|leg| {
@@ -106,7 +114,7 @@ impl Default for EnvelopeConfig {
             // tighter one is the working cap until the axis is measured.
             relative_yaw_limit: 55.0_f64.to_radians(),
             head_cone_limit: 35.0_f64.to_radians(),
-            min_toggle_margin: 0.003,
+            min_toggle_margin: 0.0015,
         }
     }
 }
@@ -328,7 +336,7 @@ pub fn check_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{neutral_head_pose, rest_head_pose, stow_head_pose};
+    use crate::geometry::{neutral_head_pose, rest_head_pose, sleep_head_pose};
     use crate::ik::min_pose_margin;
     use nalgebra::{Translation3, UnitQuaternion, Vector3};
 
@@ -399,14 +407,16 @@ mod tests {
         assert!(report.cone_angle < 1e-15);
     }
 
-    /// Stow is a pose the machine has to be able to command, so it has to pass
-    /// its own envelope — including the cone, which it uses 24° of.
+    /// The vendor's sleep pose is a bench kinematics subject the solvers and the
+    /// self-tests command, so it has to pass the envelope. Where *this* machine
+    /// folds is the pose library's `stow` document, screened in `reachy-poses`.
+    /// The cone is part of that pass, and this pose uses 24° of it.
     #[test]
-    fn the_stow_pose_passes() {
-        let (verdict, report) = check(&stow_head_pose(), 0.0, None);
+    fn the_sleep_pose_passes() {
+        let (verdict, report) = check(&sleep_head_pose(), 0.0, None);
         assert!(verdict.is_ok(), "{:?}", report.violations);
         assert!(
-            (report.cone_angle - baked::STOW_PITCH).abs() < 1e-9,
+            (report.cone_angle - baked::SLEEP_PITCH).abs() < 1e-9,
             "cone {}",
             report.cone_angle
         );
@@ -459,13 +469,14 @@ mod tests {
     /// inside every window is still refused for clearance alone.
     #[test]
     fn the_clearance_floor_binds_before_the_crank_stops() {
-        let (verdict, report) = check(&at_height(0.1995), 0.0, None);
+        let floor = EnvelopeConfig::default().min_toggle_margin;
+        let (verdict, report) = check(&at_height(0.2000), 0.0, None);
         assert!(verdict.is_err());
         assert!(report.violations.margin);
         assert_eq!(report.violations.window, [false; 6]);
         assert_eq!(report.violations.unreachable, [false; 6]);
         assert!(
-            report.min_margin > 0.0 && report.min_margin < 0.003,
+            report.min_margin > 0.0 && report.min_margin < floor,
             "margin {}",
             report.min_margin
         );
@@ -476,6 +487,7 @@ mod tests {
     /// would be stuck there without it.
     #[test]
     fn the_baseline_admits_a_lift_and_refuses_a_tightening() {
+        let floor = EnvelopeConfig::default().min_toggle_margin;
         let rest = rest_shifted(0.0);
         let baseline = min_pose_margin(&HeadGeometry::default(), &rest);
         assert!(
@@ -494,7 +506,7 @@ mod tests {
         let (verdict, report) = check(&lift, 0.0, Some(baseline));
         assert!(verdict.is_ok(), "{:?}", report.violations);
         assert!(
-            report.min_margin > baseline && report.min_margin < 0.003,
+            report.min_margin > baseline && report.min_margin < floor,
             "lifted margin {}",
             report.min_margin
         );
@@ -574,8 +586,8 @@ mod tests {
         );
     }
 
-    /// The head attitude cone, which no crank window expresses. Stow already
-    /// uses 24° of it, so the bound is one the machine works close to.
+    /// The head attitude cone, which no crank window expresses. The sleep pose
+    /// already uses 24° of it, so the bound is one the machine works close to.
     #[test]
     fn the_cone_bounds_head_attitude() {
         let (verdict, report) = check(&pitched(34.0), 0.0, None);
@@ -739,7 +751,7 @@ mod tests {
                 "leg 1 outside its travel window",
             ),
             (
-                check(&at_height(0.1995), 0.0, None).1.violations,
+                check(&at_height(0.2000), 0.0, None).1.violations,
                 "toggle margin below the floor",
             ),
             (

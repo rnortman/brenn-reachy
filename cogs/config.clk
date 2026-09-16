@@ -10,11 +10,11 @@
 // into one of them would have to drag the whole module across. What the backend
 // itself refuses is narrower but real -- a negative enumerator, for one, which
 // a direction enum naturally wants. So the schemas that must be authored as text
-// live here, and they are held to what that backend will carry: scalars and
-// `VarString`, never the motion vocabulary. Not because a config field has to be
-// a bare number -- `driver/motord_config.clk` names a device path -- but because
-// a config reaching for one of this system's own types drags a module across the
-// Protobuf backend that cannot cross it.
+// live here, and they are held to what that backend will carry: scalars, arrays
+// of scalars, and `VarString`, never the motion vocabulary. Not because a config
+// field has to be a bare number -- `driver/motord_config.clk` names a device
+// path -- but because a config reaching for one of this system's own types drags
+// a module across the Protobuf backend that cannot cross it.
 //
 // The nanosecond counts below are the one place in this system bare numbers
 // stand in for time. The Protobuf path carries integers rather than the
@@ -46,14 +46,6 @@ schema MoverParams
         // the unit `lag_k` counts in.
         #1 period_ns: Int64;
 
-        // How long a move to the upright posture takes, nanoseconds.
-        #2 up_duration_ns: Int64;
-
-        // How long a move to stow takes, nanoseconds. Longer than the way up:
-        // stowing is the posture the machine ends every session in, and it is
-        // done gently.
-        #3 stow_duration_ns: Int64;
-
         // Whether the plant-model tracking detector judges joints at all.
         //
         // True on every shipped configuration, and pinned true by the scenario
@@ -64,6 +56,11 @@ schema MoverParams
         // An attended run is what that state is for, and every analyzer reads
         // a run recorded with it as a failed run.
         #4 tracking_armed: Bool;
+    }
+    history
+    {
+        version: 2;
+        removed: [2, 3];
     }
 }
 
@@ -501,5 +498,128 @@ schema ClipLibraryConfig
         // motion id is an index into this, and it is a different numbering from
         // the clip ids above.
         #1 motions: VarArray<MotionConfig, 128>;
+    }
+}
+
+// One authored pose, as a person writes it under `cogs/poses/`.
+//
+// Not a config anything binds: this schema is here because the document is
+// authored as protobuf text, which is the same reason every other schema in this
+// module is here. The library emitter reads it, the pose extractor writes it,
+// and no box ever sees one -- what a box binds is the `PoseLibraryConfig` below,
+// emitted from a directory of these.
+//
+// A pose is a whole base configuration and not a delta over one, so every
+// channel is required and there is no mask: a document that left the antennas
+// out would be a base nobody could stand at.
+schema PoseDocument
+{
+    uuid: 1bb9eb18-3654-4155-b517-cd1a8c9069c9;
+    fields
+    {
+        // The asset name, which is also the document's file stem. A `VarString`
+        // spends one byte on its terminator, so the declared size is one past
+        // the longest name: the field holds exactly `MAX_ASSET_NAME_LEN`
+        // characters, and a test in `reachy-poses` joins the two numbers.
+        #0 name: VarString<129>;
+
+        // Provenance: which recording session, which segment, and why this pose
+        // is the shape it is. A pose is a measurement more often than a
+        // derivation, and the measurement's origin is not recoverable from the
+        // numbers.
+        #1 description: VarString<512>;
+
+        // Head position relative to the neutral head pose, metres. A recorded
+        // figure transcribes with a unit change and nothing else.
+        #2 dt: FixedArray<Float64, 3>;
+
+        // Head rotation relative to the neutral head pose, unit quaternion
+        // [w, x, y, z].
+        #3 dq: FixedArray<Float64, 4>;
+
+        // Body yaw, radians, absolute.
+        #4 body_yaw: Float64;
+
+        // Antenna angles, right then left, radians, a direction -- an angle mod
+        // 2*pi.
+        #5 antennas: FixedArray<Float64, 2>;
+
+        // The pace of a move to this pose when the command states none,
+        // milliseconds. The default for any step that does not declare its own.
+        // Milliseconds because a person writes this file.
+        //
+        // TODO(antenna-raise-clock): one clock carries the head and the
+        // antennas alike, here as at every other place a pace is stated.
+        #6 duration_ms: UInt32;
+    }
+}
+
+// One pose as the mover is handed it: the head pose relative to neutral, the
+// body yaw, the two antennas, and the library's own pace.
+//
+// Flattened into scalars rather than carrying this system's pose types, for the
+// reason the module header gives. Nanoseconds because that is the unit every
+// duration in this module carries.
+schema PoseConfig
+{
+    uuid: 2717490d-2134-4f93-8bca-6078eb98231d;
+    fields
+    {
+        // Head position relative to the neutral head pose, metres, along the
+        // body's forward axis.
+        #0 dx: Float64;
+
+        // The same, along the body's left axis.
+        #1 dy: Float64;
+
+        // The same, along the body's vertical.
+        #2 dz: Float64;
+
+        // Head rotation relative to the neutral head pose, unit quaternion:
+        // the real part.
+        #3 qw: Float64;
+
+        // The rotation's i coefficient.
+        #4 qx: Float64;
+
+        // The rotation's j coefficient.
+        #5 qy: Float64;
+
+        // The rotation's k coefficient.
+        #6 qz: Float64;
+
+        // Body yaw, radians, absolute.
+        #7 body_yaw: Float64;
+
+        // The right antenna's angle, radians, a direction.
+        #8 antenna_right: Float64;
+
+        // The left antenna's angle, radians, a direction.
+        #9 antenna_left: Float64;
+
+        // The pace of a move to this pose when the command states none.
+        #10 duration_ns: Int64;
+    }
+}
+
+// Every base posture the machine can be sent to, in one read-only message.
+//
+// A config rather than state, for the reason `ClipLibraryConfig` is: poses are
+// authored before the run starts and nothing writes them afterwards. A pose's
+// identity is its index here; the name table lives beside the asset for whoever
+// authors scripts.
+schema PoseLibraryConfig
+{
+    uuid: 1280051a-1c33-4d5f-adfc-f864afeb730b;
+    fields
+    {
+        // The poses in the order the emitter wrote them. A schedule's pose id is
+        // an index into this.
+        #0 poses: VarArray<PoseConfig, 32>;
+
+        // The index of the pose named `stow`: where the machine rests, what
+        // every schedule ends at, and what the disarm sequence judges folded
+        // against. One record, so nothing that stows has to know a number.
+        #1 stow: UInt16;
     }
 }

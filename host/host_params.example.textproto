@@ -25,20 +25,14 @@
 # machine would be a deployment file in a public tree.
 pod: "example-reachy"
 
-# Three seconds for the closing stow. The wake gesture's own stow budget, which
-# is the only measured number available -- it is what the machine has been
-# folding in since the first motion run. The scripter's refresh headroom has to
-# exceed it, and at the shipped pod defaults (5 s) it does.
-stow_duration_ms: 3000
-
 # Eight kilobytes is the most body the edge reads. Comfortably above any script
 # the compile could accept -- sixteen steps and four overlay windows of JSON is
 # a few hundred bytes -- so a body past this is not a large script but a sender
 # doing something else entirely.
 body_cap_bytes: 8192
 
-# The clip library's name table, at the path the payload puts it: overlay steps
-# name a motion and the session takes an index, and this file is the join. It is
-# emitted beside the library it describes by `make clip-config`, so the two
-# cannot disagree about what index a name has.
-clip_names_path: "cogs/clip_library.names.json"
+# Both libraries' name table, at the path the payload puts it: a script step
+# names a motion or a pose and the session takes an index, and this file is the
+# join. It is emitted beside the libraries it describes by `make library-config`,
+# so the two cannot disagree about what index a name has.
+library_names_path: "cogs/library.names.json"

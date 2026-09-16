@@ -23,7 +23,6 @@ use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
 use brenn_reachy__motion__timeline_clk_rs::WindDownOutcomeWire;
 use reachy_motion::joints::{JointGroup, Name, flags, row};
-use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::tick::default_motion_config;
 use scenario::check;
 use scenario::check::{present_rows, sample_at, sample_at_or};
@@ -292,14 +291,14 @@ fn check_second_engagement(run: &Run, failures: &mut Vec<String>) {
         run,
         "upright on the second script",
         second_stow_cycle() - 1,
-        &neutral_targets(),
+        &scenario::neutral_pose(),
         failures,
     );
     check::arrived_at(
         run,
         "stowed again",
         second_disengage_cycle() - 1,
-        &stow_pose_targets(),
+        &scenario::stow_pose(),
         failures,
     );
 }

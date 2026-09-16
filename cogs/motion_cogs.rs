@@ -39,11 +39,11 @@ mod session_stow;
 
 pub use session_cog::execute_session;
 
-use brenn_reachy__cogs__config_clk_rs::{MoverParams, ServoGains, ServoProfile};
+use brenn_reachy__cogs__config_clk_rs::{MoverParams, PoseLibraryConfig, ServoGains, ServoProfile};
 use brenn_reachy__cogs__motion_clk_rs::{MoverDial, MoverSignals, PoseDial, PoseSignals};
 use brenn_reachy__cogs__mover_clk_rs::MoverStateWire;
 use brenn_reachy__cogs__pose_state_clk_rs::PoseStateWire;
-use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, SessionScheduleWire, StepKindWire};
+use brenn_reachy__cogs__schedule_clk_rs::{SessionScheduleWire, StepKindWire};
 use brenn_reachy__driver__pose_clk_rs::PoseSample;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use brenn_reachy__motion__tick_state_clk_rs::MotionSnap;
@@ -59,13 +59,14 @@ use reachy_motion::arm::{ArmRecord, Gains, GroupGains, rest_pose_seeds};
 use reachy_motion::fault::{self, FaultKind};
 use reachy_motion::joints::{JointRef, JointVector, flags, rows_of, vector_of, write_vector};
 use reachy_motion::plant::{ClassProfile, GroupPlants, GroupProfiles};
-use reachy_motion::postures::{neutral_targets, stow_pose_targets};
 use reachy_motion::record;
 use reachy_motion::tick::{
     CommandDisposition, CommandRejection, Fault, MotionConfig, MotionMode, MoveAbort, TickInputs,
     TickOutputs, arm, last_goal, motion_tick, resume, standing_fault,
 };
 use reachy_motion::traj::MoveDurations;
+use reachy_poses::config::screen;
+use reachy_poses::library::PoseLibrary;
 
 /// Bus rows the six legs occupy: body yaw is row zero and the antennas are the
 /// last two, so the cranks are the block between them.
@@ -295,6 +296,16 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
         params,
     );
     let clips = dial.configs.clips;
+    // Where each pose puts the machine: the pose library's, screened here as
+    // the session screens it, so the base this cog commands is the base the
+    // release judges arrival at. One record, one geometry. The screen this body
+    // runs is arithmetic over the dial's own numbers and solves nothing -- where
+    // folded is in joint space is asked for by the consumers that judge arrival
+    // there, and this cog is not one of them.
+    let poses: &PoseLibraryConfig = configured(dial.configs.poses, "the mover's pose library");
+    let library = screen(poses).unwrap_or_else(|error| {
+        panic!("the mover's pose library states no pose to move to: {error}")
+    });
     let before = MoverCounters::read(dial.states.ctrl);
     let mut counters = before;
 
@@ -442,7 +453,7 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
         // A retarget is spent by the step that answers it, not by the schedule
         // arriving, so it cannot be lost to the gap it happens to land in: a
         // bumped epoch stands, sample over sample and across the slot, until a
-        // posture step covers an instant and the machine is sent somewhere. One
+        // base step covers an instant and the machine is sent somewhere. One
         // site, so the dispatch and the consumption cannot come apart.
         let asked = schedule.and_then(|schedule| {
             let retarget = schedule.epoch() != epoch_seen;
@@ -458,8 +469,24 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
                 })
         });
 
+        // An id the deployed library does not hold is refused here and nothing
+        // is commanded for it: the raise travels as a command rejection and the
+        // fault ladder answers it with its own stow, whose id came off the same
+        // screened library. Only the dispatch raises -- a standing goal that
+        // will not resolve is the refusal already reported, and one raise per
+        // sample for as long as the step stood would be a channel nobody can
+        // read.
+        let fresh = match asked.map(|asked| asked.goal(&library)).transpose() {
+            Ok(goal) => goal.flatten(),
+            Err(UnknownPose { .. }) => {
+                reports.offer(Raise::of_unknown_pose(nominal));
+                None
+            }
+        };
+        let standing = desired.goal(&library).unwrap_or(None);
+
         // What the base does this period, and what rides on it. Three answers
-        // in one call: the ordinary posture move while the tick owns the base, a
+        // in one call: the ordinary base move while the tick owns the base, a
         // composed setpoint while an overlay window is open, and the re-anchored
         // move that hands the base back when the last one closes.
         let commanded = mover_overlay::decide(
@@ -471,8 +498,8 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
                 now_ns: nominal,
                 period: Duration::from_nanos(settings.period_ns),
                 tick_hz: settings.tick_hz(),
-                fresh: asked.and_then(|asked| asked.goal(&settings)),
-                standing: desired.goal(&settings),
+                fresh,
+                standing,
             },
             // Every armed state has one: it was read off the arming that
             // established this one, off the tick that last advanced it, or off
@@ -751,7 +778,7 @@ pub fn group_profiles(profile: &ServoProfile) -> GroupProfiles {
     }
 }
 
-/// The grid this cog commands on, and how long a posture change takes.
+/// The grid this cog commands on.
 ///
 /// Read once per execution and checked there: a scenario that asked for a
 /// cycle of no length, or a move of none, would otherwise produce a plausible
@@ -761,10 +788,6 @@ struct Settings {
     lag_k: i64,
     /// The bus cycle, nanoseconds.
     period_ns: u64,
-    /// How long the move to the upright posture takes.
-    up: Duration,
-    /// How long the move to stow takes.
-    stow: Duration,
 }
 
 impl Settings {
@@ -773,11 +796,6 @@ impl Settings {
         Self {
             lag_k: i64::from(params.lag_k),
             period_ns: length_of(params.period_ns, "the control period"),
-            up: Duration::from_nanos(length_of(
-                params.up_duration_ns,
-                "the move to the up posture",
-            )),
-            stow: Duration::from_nanos(length_of(params.stow_duration_ns, "the move to stow")),
         }
     }
 
@@ -810,48 +828,70 @@ fn length_of(ns: i64, what: &str) -> u64 {
         .unwrap_or_else(|| panic!("{what} must be a length of time, not {ns}ns"))
 }
 
-/// The base posture last dispatched as a move.
+/// A pace off a schedule row, as the length of time it states.
 ///
-/// A pair rather than a posture alone, because "nothing has been dispatched" is
-/// a state of its own and the kind carries it: a step that keeps the base is
-/// never dispatched, so `base_keep` is a value no dispatch produces.
+/// Non-positive is taken as no time at all. The session screens every base row
+/// it publishes for a positive pace, so the case is bytes gone wrong rather than
+/// a schedule; non-positive maps to zero here, and the caller must refuse a
+/// zero clock -- a move of no duration carries no path.
+fn pace_of(pace: clockwork_rs::Duration) -> Duration {
+    Duration::from_nanos(u64::try_from(pace.as_nanos()).unwrap_or(0))
+}
+
+/// The base move last dispatched: where it sends the machine, and how fast.
+///
+/// A triple rather than a pose alone. "Nothing has been dispatched" is a state
+/// of its own and the kind carries it -- a step that keeps the base is never
+/// dispatched, so `base_keep` is a value no dispatch produces -- and the pace is
+/// part of what a step asks for, so a row naming the pose already commanded at
+/// another pace is a fresh ask and dispatches.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Desired {
     /// What the last dispatched step asked for.
     kind: StepKindWire,
-    /// Which posture it named.
-    posture: PostureWire,
+    /// Which pose it named, as the deployed library numbers it.
+    pose_id: u16,
+    /// How long the move that step asked for takes.
+    pace: Duration,
 }
 
 impl Desired {
     /// Nothing dispatched: what a freshly armed machine has asked for.
+    ///
+    /// The id and the pace are zero and nothing reads either: [`Desired::goal`]
+    /// answers `None` for a kept base before it looks at them.
     const NOTHING_DISPATCHED: Self = Self {
         kind: StepKindWire::BASE_KEEP,
-        posture: PostureWire::STOW,
+        pose_id: 0,
+        pace: Duration::ZERO,
     };
 
     /// What the slot says was last dispatched.
     fn of(state: &MoverStateWire) -> Self {
         Self {
             kind: state.desired_kind(),
-            posture: state.desired_posture(),
+            pose_id: state.desired_pose_id(),
+            pace: pace_of(state.desired_pace()),
         }
     }
 
     /// Record it for the next execution.
     fn store(self, state: &mut MoverStateWire) {
         state.set_desired_kind(self.kind);
-        state.set_desired_posture(self.posture);
+        state.set_desired_pose_id(self.pose_id);
+        state.set_desired_pace(clockwork_rs::Duration::from_nanos(
+            i64::try_from(self.pace.as_nanos()).unwrap_or(i64::MAX),
+        ));
     }
 
     /// What the schedule asks for at `nominal`, or `None` where it asks for
     /// nothing new.
     ///
     /// The step containing the instant, half-open, so two steps may share an
-    /// edge without either owning it twice. A step that keeps the base, an
-    /// instant no step covers, and a step this build cannot read all answer
-    /// with the posture already dispatched -- the machine holds where the last
-    /// move left it rather than being sent somewhere by a gap in a schedule.
+    /// edge without either owning it twice. A step that keeps the base and an
+    /// instant no step covers both answer with the pose already dispatched --
+    /// the machine holds where the last move left it rather than being sent
+    /// somewhere by a gap in a schedule.
     fn at(self, schedule: &SessionScheduleWire, nominal: i64) -> Option<Self> {
         let step = schedule
             .steps()
@@ -859,34 +899,52 @@ impl Desired {
             .find(|step| (step.start().as_nanos()..step.end().as_nanos()).contains(&nominal))?;
         (step.kind() == StepKindWire::BASE_POSTURE).then_some(Self {
             kind: StepKindWire::BASE_POSTURE,
-            posture: step.posture(),
+            pose_id: step.pose_id(),
+            pace: pace_of(step.pace()),
         })
     }
 
-    /// Where this sends the base, and over what clocks -- or `None` for a
-    /// dispatch that names no posture, which is what nothing dispatched is.
+    /// Where this sends the base, and over what clocks — or `None` for a
+    /// dispatch that names no pose, which is what nothing dispatched is.
     ///
-    /// Where each posture is is the motion library's statement, not this cog's:
-    /// stow is the posture the minimum risk condition names, and a host
-    /// composing its own would be free to disagree with the one the bench
-    /// commands and the one disarming checks.
-    fn goal(self, settings: &Settings) -> Option<Goal> {
+    /// Targets come from the library, the single source of truth for where each
+    /// pose sends the head.
+    ///
+    /// # Errors
+    ///
+    /// [`UnknownPose`] for an id the deployed library does not hold. A refusal
+    /// and not a substitution: a head sent to the fold, or anywhere else,
+    /// because an id did not resolve is a machine moving on a guess, and the
+    /// answer to a command this cog cannot carry out is to say so and let the
+    /// fault policy decide what the machine does about it.
+    fn goal(self, library: &PoseLibrary<'_>) -> Result<Option<Goal>, UnknownPose> {
         if self.kind != StepKindWire::BASE_POSTURE {
-            return None;
+            return Ok(None);
         }
-        let (target, duration) = match self.posture {
-            PostureWire::UP => (neutral_targets(), settings.up),
-            // Stow is the default of the vocabulary and the posture the machine
-            // rests in, so a value this build does not know goes there rather
-            // than to the working posture: an unknown posture must not be a
-            // reason to stand up.
-            _ => (stow_pose_targets(), settings.stow),
-        };
-        Some(Goal {
+        let (target, _) = library.targets(self.pose_id).ok_or(UnknownPose {
+            pose_id: self.pose_id,
+        })?;
+        Ok(Some(Goal {
             target,
-            durations: MoveDurations::uniform(duration),
-        })
+            durations: MoveDurations::uniform(self.pace),
+        }))
     }
+}
+
+/// A base step naming a pose the deployed library does not hold.
+///
+/// The mover's own refusal and not [`reachy_motion::tick::CommandRejection`]'s:
+/// a pose id is the library's vocabulary and this cog's, and the tick never sees
+/// one — what reaches it is a target the library resolved. It travels as
+/// [`FaultKind::CommandRejected`] all the same, because from the machine's side
+/// it is the same event: a command that was asked for and not carried out.
+///
+/// Only a sidecar and a library from two different emits produce one, which the
+/// payload's delivery rules out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnknownPose {
+    /// The index that resolved to nothing.
+    pose_id: u16,
 }
 
 /// One thing the tick had to say, as the message that carries it.
@@ -996,6 +1054,23 @@ impl Raise {
             joint,
             detail,
             count,
+        }
+    }
+
+    /// A base step this cog refused, which changed nothing.
+    ///
+    /// Takes no id, because the record has no field one belongs in: `detail` is
+    /// a magnitude in the joint's own unit and an index written there would be
+    /// read as one. Which id was refused is on the logged schedule slot the
+    /// analyzer reads beside the raise. So the joint, the magnitude and the
+    /// count are the nothing they are.
+    fn of_unknown_pose(nominal: i64) -> Self {
+        Self {
+            time_ns: nominal,
+            kind: FaultKind::CommandRejected,
+            joint: JointRef::None,
+            detail: 0.0,
+            count: 0,
         }
     }
 
@@ -1268,7 +1343,7 @@ counters! {
         /// or would not go back in.
         refused_state / set_refused_state,
         /// Times an epoch this cog had not answered yet was answered by a
-        /// posture step. One execution sees only the latest schedule, so bumps
+        /// base step. One execution sees only the latest schedule, so bumps
         /// coalesced by a gap count once: this counts epoch changes observed,
         /// not epochs the session published.
         epochs_answered / set_epochs_answered,

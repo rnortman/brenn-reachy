@@ -41,12 +41,9 @@
 use scenario::author::{Overlay, Step};
 use scenario::{ARRIVAL_SETTLE_CYCLES, LAG_K, cycle_at, run_end_cycle};
 
-use brenn_reachy__cogs__schedule_clk_rs::PostureWire;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use reachy_motion::ANTENNA_OUTBOARD;
-use reachy_motion::disarm::STOW_ANTENNAS;
 use reachy_motion::joints::{JointGroup, JointTargets};
-use reachy_motion::postures::{NEUTRAL_ANTENNAS, neutral_targets};
 
 // The shape of an ordinary run, stated once for every scenario: where a run
 // begins, the cycle a script may first be taken on, and the cycle the machine
@@ -150,16 +147,19 @@ pub fn antenna_rows() -> JointFlags {
 /// The three poses the document steps to, in order, with the name each is read
 /// under.
 ///
-/// The tree's own constants rather than the document's numbers: a probe carries
-/// deltas over the base's antenna lean, and these are what those deltas are
-/// differences of. A document authored against a fold the tree has since moved
-/// fails the arrival assertions rather than passing against its own stale copy.
+/// Where the machine's own antennas stand rather than the document's numbers: a
+/// probe carries deltas over the base's antenna lean, and these are what those
+/// deltas are differences of. The fold is the pose library's, read out of the
+/// committed asset, so a stow document the author moves moves the probe and
+/// this assertion together; a document authored against a fold the library has
+/// since moved fails the arrival assertions rather than passing against its own
+/// stale copy.
 #[must_use]
 pub fn held_poses() -> [(&'static str, [f64; 2]); 3] {
     [
         ("outboard", ANTENNA_OUTBOARD),
-        ("folded", STOW_ANTENNAS),
-        ("raised again", NEUTRAL_ANTENNAS),
+        ("folded", scenario::pose_library().stow().1.antennas),
+        ("raised again", scenario::neutral_pose().antennas),
     ]
 }
 
@@ -172,7 +172,7 @@ pub fn held_poses() -> [(&'static str, [f64; 2]); 3] {
 pub fn held_targets(antennas: [f64; 2]) -> JointTargets {
     JointTargets {
         antennas,
-        ..neutral_targets()
+        ..scenario::neutral_pose()
     }
 }
 
@@ -222,7 +222,7 @@ pub fn arrived_after(step: i64, arc_rad: f64) -> i64 {
 #[must_use]
 pub fn step_arcs() -> [f64; 3] {
     let poses = held_poses();
-    let mut from = NEUTRAL_ANTENNAS;
+    let mut from = scenario::neutral_pose().antennas;
     let mut arcs = [0.0; 3];
     for (arc, (_, to)) in arcs.iter_mut().zip(poses) {
         *arc = (to[0] - from[0]).abs().max((to[1] - from[1]).abs());
@@ -237,7 +237,8 @@ pub fn steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(up_start_cycle()),
         end_ns: cycle_at(disengage_cycle()),
-        posture: Some(PostureWire::UP),
+        pose: Some(scenario::NEUTRAL_POSE),
+        move_ms: None,
     }]
 }
 
@@ -264,9 +265,10 @@ mod tests {
     /// the planner allows its own moves, so the content really does outrun the
     /// servos on each of them.
     ///
-    /// Arithmetic over the tree's own constants, and it runs whether or not the
-    /// simulated run produced a readable log -- which is exactly the state a
-    /// document edited down to gentle steps would leave the tree in.
+    /// Arithmetic over the tree's own constants and the committed pose library,
+    /// and it runs whether or not the simulated run produced a readable log --
+    /// which is exactly the state a document edited down to gentle steps would
+    /// leave the tree in.
     #[test]
     fn every_step_the_document_makes_outruns_the_planners_own_bound() {
         let bound = default_motion_config().max_step.antennas;

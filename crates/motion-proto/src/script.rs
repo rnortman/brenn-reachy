@@ -12,8 +12,10 @@
 //! anything else arrives.
 //!
 //! The timeline carries two kinds of step, and they are two timelines in one
-//! list. A **base** step ([`Base`]) says where the head is going — a posture, or
-//! `keep`, which is "hold the base where it is commanded now". A **play** step
+//! list. A **base** step ([`Base`]) says where the head is going — a pose the
+//! daemon's library holds under that name, optionally at a pace this command
+//! picks, or `keep`, which is "hold the base where it is commanded now". A
+//! **play** step
 //! ([`Play`]) starts an overlay: a named motion the daemon looks up in its own
 //! library and layers on top of whatever the base is doing, at a speed the
 //! caller picks. The base collapses to the last due step ([`base_at`]); overlays
@@ -21,10 +23,13 @@
 //! the second one starting does not end the first.
 //!
 //! This crate holds no library, so every question that needs one — does this
-//! name resolve, how long does that motion run — is the daemon's to answer.
-//! What is here is the arithmetic that does not need one: the window a play
-//! step occupies given a duration the caller supplies, and how many overlays
-//! that timeline would ever run at once.
+//! name resolve, how long does that motion run, where is that pose — is the
+//! daemon's to answer. What is here is the arithmetic that does not need one:
+//! the window a play step occupies given a duration the caller supplies, and
+//! how many overlays that timeline would ever run at once. One name is
+//! reserved rather than resolved: [`STOW_POSE`], the pose the machine rests at,
+//! which every library holds and which is how a closing step says "fold"
+//! without knowing a number.
 //!
 //! [`base_at`]: MotionScript::base_at
 //! [`overlays_at`]: MotionScript::overlays_at
@@ -37,7 +42,7 @@
 //! A second bound applies to the timeout itself — [`MAX_TIMEOUT_MS`] — so no
 //! single message can name an exposure nobody would mean. There is no
 //! vocabulary here for a conversation, a lease, or a turn: the daemon executes
-//! timed posture intents and knows nothing else.
+//! timed pose intents and knows nothing else.
 //!
 //! Both bounds are refusals rather than clamps. A publisher whose timeline
 //! outruns its timeout has miscomputed one of them, and executing the part that
@@ -46,9 +51,11 @@
 //! with its own timeout — stays in force.
 //!
 //! Tolerance runs in one direction only. Unknown *fields* are ignored, so a
-//! newer scripter may add one without a lockstep deploy. An unknown *posture* is
-//! a refusal: the postures are the whole meaning of the message, and guessing at
-//! one nobody has defined would move a head on a guess.
+//! newer scripter may add one without a lockstep deploy. A step that names no
+//! action, or more than one, is a refusal: the actions are the whole meaning of
+//! the message, and guessing at a step nobody stated would move a head on a
+//! guess. Whether a pose name resolves is the daemon's question, not this
+//! crate's, and a name no library holds is refused there.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -72,42 +79,25 @@ pub const MOTION_SCRIPT_TYPE: &str = "motion-script";
 /// takes a single synthesized clip over ten minutes long.
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
-/// A posture the head can be asked to take.
+/// The one pose name this contract reserves: where the machine rests.
 ///
-/// A closed vocabulary, and small on purpose: everything richer — a thinking
-/// tilt, a gaze direction, an emote — is a new value with its own parameters,
-/// added here and executed by the same script executor. None of them is a new
-/// state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Posture {
-    /// Head up and attending — the neutral pose.
-    Up,
-    /// Head stowed. Reaching it is also what lets the daemon rest.
-    Stow,
-}
+/// Every other pose name is content the daemon's library decides on and this
+/// crate never sees. This one is structural — a script closes with it, the
+/// daemon's compiler recognises a timeline that ends at it, and the library must
+/// hold it — so it is spelled once, here, rather than hand-copied by the
+/// scripter and the consumer separately.
+pub const STOW_POSE: &str = "stow";
 
-impl Posture {
-    /// The posture as the wire spells it.
-    ///
-    /// Defined beside the serde rename that decides the spelling, because every
-    /// consumer that logs a posture would otherwise hand-copy it: a JSONL line
-    /// whose spelling drifts from the wire's stops joining against the
-    /// scripter's capture, and the drift is silent.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Up => "up",
-            Self::Stow => "stow",
-        }
-    }
-}
-
-impl std::fmt::Display for Posture {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+/// How the wire spells a base step that moves nothing, and so a pose name no
+/// library may use.
+///
+/// A step says either "go to this pose" or "hold what is commanded", and the two
+/// are different fields; a pose *called* `keep` would make the second meaning
+/// expressible as the first, which is one spelling for two intents. Refused as a
+/// pose name by every door that validates a script. It is a lawful *motion*
+/// name: an overlay is named in its own field and never in a base step, so the
+/// two spellings cannot collide there.
+pub const KEEP_BASE: &str = "keep";
 
 /// The slowest an overlay may be asked to play. Below this a motion degenerates
 /// into a creep that squats on the session without reading as motion.
@@ -119,9 +109,9 @@ pub const MIN_SPEED: f64 = 0.25;
 /// of its own, and nothing downstream narrows this pair.
 ///
 /// These two are the authoritative pair. `reachy-clips`, on the far side of the
-/// repo seam, carries a mirror of them and of [`MAX_MOTION_NAME_LEN`]; the
-/// daemon depends on both crates and asserts the copies agree, so a change that
-/// crosses the seam without its mirror fails there.
+/// repo seam, carries a mirror of them under the same spellings;
+/// `cogs/edge_caps_test` links both crates and asserts the copies agree, so a
+/// change that crosses the seam without its mirror fails there.
 pub const MAX_SPEED: f64 = 2.0;
 
 /// The most overlays a script may ever have running at one instant.
@@ -132,56 +122,91 @@ pub const MAX_SPEED: f64 = 2.0;
 /// rather than run with the excess dropped.
 pub const MAX_CONCURRENT_OVERLAYS: usize = 4;
 
-/// The longest motion name the wire carries, matching the library's own name
+/// The longest asset name the wire carries, matching the library's own name
 /// bound under the same spelling.
 ///
-/// The length is all this side checks. The library also holds a charset, which
-/// stays there: it is the library's alphabet, and duplicating it here would be
-/// a second copy across the repo seam of a rule whose owner is the asset
-/// format. A name of legal length in a wrong alphabet therefore decodes and is
-/// refused at the daemon as a name no library holds.
+/// It bounds both kinds of name a script states: the motion a play step invokes,
+/// and the pose a base step names. Both are indices in the deployed libraries
+/// and names only at the authoring edge, so one bound covers them.
 ///
-/// The third of the three constants `reachy-clips` mirrors, held to this one by
-/// the daemon's drift guard.
-pub const MAX_MOTION_NAME_LEN: usize = 128;
+/// The length is all this side checks. The libraries also hold a charset, which
+/// stays there: it is the asset format's alphabet, and duplicating it here would
+/// be a second copy across the repo seam of a rule whose owner is that format. A
+/// name of legal length in a wrong alphabet therefore decodes and is refused at
+/// the daemon as a name no library holds.
+///
+/// `reachy_motion::asset_name` mirrors this one for the asset crates that share
+/// the namespace — neither may be the other's authority — and the drift guard in
+/// `cogs/edge_caps_test` holds that mirror to this one under the same spelling.
+pub const MAX_ASSET_NAME_LEN: usize = 128;
 
 /// What the base layer — the reference an overlay rides on — is asked to do.
 ///
-/// [`Posture`] stays the two-value vocabulary it is, because it is also the
-/// daemon's posture *state* and every target set is written against it.
-/// `Keep` has no target set and no holdable meaning there: it is an instruction
-/// to the timeline, not a place to be, so it lives here instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A pose is named rather than enumerated: where the machine's poses are, and
+/// how many there are, is the deployed library's business, and a closed
+/// vocabulary here would mean a wire change for every new pose. `Keep` has
+/// no pose and no holdable meaning in a library: it is an instruction to the
+/// timeline, not a place to be, so it lives here as the other arm instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Base {
-    /// Go to, or stay at, a named posture.
-    Posture(Posture),
+    /// Go to, or stay at, the pose the library holds under this name.
+    ///
+    /// Nothing here can check that it resolves — a publisher may hold no
+    /// library at all. Length and the reserved spelling are checked at
+    /// validation; resolution is the daemon's.
+    Pose {
+        /// The pose's name in the daemon's library.
+        name: String,
+        /// How long the move to it takes, milliseconds; `None` leaves the pace
+        /// to the library's own default for that pose.
+        ///
+        /// A pose is a place and the pace is the commander's choice, the way
+        /// [`Play::speed`] is the commander's choice over a motion's recorded
+        /// clock. It hangs off this arm rather than off [`Step`] because only a
+        /// move to somewhere has a pace: a `keep` has no destination and an
+        /// overlay's clock is its speed.
+        move_ms: Option<u64>,
+    },
     /// Do not move the base: hold it wherever it is commanded now.
     ///
     /// What a publisher opens a replacement script with when it wants to change
-    /// overlays mid-motion. Restating a named posture there would *retarget* the
-    /// base — mid-transition, toward somewhere it is already leaving — where the
-    /// intent was to leave it alone.
+    /// overlays mid-motion. Restating a pose there would *retarget* the base —
+    /// mid-transition, toward somewhere it is already leaving — where the intent
+    /// was to leave it alone.
     ///
     /// It never wakes a resting machine: a machine at rest has no commanded
-    /// pose to keep, and a script that wants motion from rest says `up`.
+    /// pose to keep, and a script that wants motion from rest names a pose.
     Keep,
 }
 
 impl Base {
-    /// The base command as the wire spells it.
+    /// The base command as the wire spells it: the pose name, or [`KEEP_BASE`].
+    ///
+    /// What a consumer that logs a base step writes, so a JSONL line joins
+    /// against the scripter's own capture with no translation table between.
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
-            Self::Posture(posture) => posture.as_str(),
-            Self::Keep => "keep",
+            Self::Pose { name, .. } => name,
+            Self::Keep => KEEP_BASE,
         }
     }
 
-    /// The posture this names, or `None` for `keep`.
+    /// The pose this names, or `None` for `keep`.
     #[must_use]
-    pub const fn posture(self) -> Option<Posture> {
+    pub fn pose(&self) -> Option<&str> {
         match self {
-            Self::Posture(posture) => Some(posture),
+            Self::Pose { name, .. } => Some(name),
+            Self::Keep => None,
+        }
+    }
+
+    /// The pace this step states for its move, or `None` when it states none
+    /// and when there is no move to pace.
+    #[must_use]
+    pub fn move_ms(&self) -> Option<u64> {
+        match self {
+            Self::Pose { move_ms, .. } => *move_ms,
             Self::Keep => None,
         }
     }
@@ -190,37 +215,6 @@ impl Base {
 impl std::fmt::Display for Base {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-/// The base command as the wire spells it, which is also how an older daemon
-/// reads it: straight into two-value [`Posture`], refusing `keep` as it refuses
-/// any posture outside its vocabulary.
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum BaseWire {
-    Up,
-    Stow,
-    Keep,
-}
-
-impl From<Base> for BaseWire {
-    fn from(base: Base) -> Self {
-        match base {
-            Base::Posture(Posture::Up) => Self::Up,
-            Base::Posture(Posture::Stow) => Self::Stow,
-            Base::Keep => Self::Keep,
-        }
-    }
-}
-
-impl From<BaseWire> for Base {
-    fn from(wire: BaseWire) -> Self {
-        match wire {
-            BaseWire::Up => Self::Posture(Posture::Up),
-            BaseWire::Stow => Self::Posture(Posture::Stow),
-            BaseWire::Keep => Self::Keep,
-        }
     }
 }
 
@@ -291,9 +285,9 @@ pub enum Action {
 impl Action {
     /// The base command this step gives, or `None` for a play step.
     #[must_use]
-    pub const fn base(&self) -> Option<Base> {
+    pub const fn base(&self) -> Option<&Base> {
         match self {
-            Self::Base(base) => Some(*base),
+            Self::Base(base) => Some(base),
             Self::Play(_) => None,
         }
     }
@@ -327,12 +321,29 @@ pub struct Step {
 }
 
 impl Step {
-    /// A base step naming `posture` at `after_ms` past receipt.
+    /// A base step naming the pose `pose` at `after_ms` past receipt, moved at
+    /// the library's own pace for that pose.
     #[must_use]
-    pub const fn new(after_ms: u64, posture: Posture) -> Self {
+    pub fn new(after_ms: u64, pose: impl Into<String>) -> Self {
         Self {
             after_ms,
-            action: Action::Base(Base::Posture(posture)),
+            action: Action::Base(Base::Pose {
+                name: pose.into(),
+                move_ms: None,
+            }),
+        }
+    }
+
+    /// The same base step, moved over `move_ms` milliseconds instead of at the
+    /// library's pace.
+    #[must_use]
+    pub fn timed(after_ms: u64, pose: impl Into<String>, move_ms: u64) -> Self {
+        Self {
+            after_ms,
+            action: Action::Base(Base::Pose {
+                name: pose.into(),
+                move_ms: Some(move_ms),
+            }),
         }
     }
 
@@ -373,19 +384,32 @@ impl Step {
     }
 }
 
-/// The step's JSON shape: the two actions as two optional fields, so a base
-/// step encodes exactly as it always has and an older daemon reading a play
-/// step sees a step with no `posture` and refuses the script whole.
+/// The step's JSON shape: the three things a step can be, as three mutually
+/// exclusive optional fields. Exactly one is set, and the hand-written codec
+/// beside this enforces that rather than resolving a precedence nobody would
+/// remember.
 ///
 /// No `deny_unknown_fields`, matching the envelope around it: a scripter may
-/// add a field before its daemon knows it.
+/// add a field before its daemon knows it. So a step spelled in a vocabulary
+/// this one does not carry sets none of the three and is refused as a step that
+/// names no action.
 #[derive(Serialize, Deserialize)]
 struct StepWire {
     after_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    posture: Option<BaseWire>,
+    pose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keep: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     play: Option<PlayWire>,
+    /// The pace of a move to `pose`, milliseconds. Only a step that names a
+    /// pose may carry it; absent means the library's own pace for that pose.
+    ///
+    /// Not spelled `duration_ms`: on the daemon's own protocol that word is a
+    /// step's span, and one word for two quantities is how the two come to be
+    /// confused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    move_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -397,20 +421,27 @@ struct PlayWire {
 
 impl Serialize for Step {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let (posture, play) = match &self.action {
-            Action::Base(base) => (Some(BaseWire::from(*base)), None),
+        let (pose, keep, play, move_ms) = match &self.action {
+            Action::Base(Base::Pose { name, move_ms }) => {
+                (Some(name.clone()), None, None, *move_ms)
+            }
+            Action::Base(Base::Keep) => (None, Some(true), None, None),
             Action::Play(play) => (
+                None,
                 None,
                 Some(PlayWire {
                     name: play.name.clone(),
                     speed: play.speed,
                 }),
+                None,
             ),
         };
         StepWire {
             after_ms: self.after_ms,
-            posture,
+            pose,
+            keep,
             play,
+            move_ms,
         }
         .serialize(serializer)
     }
@@ -419,22 +450,45 @@ impl Serialize for Step {
 impl<'de> Deserialize<'de> for Step {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = StepWire::deserialize(deserializer)?;
-        let action = match (wire.posture, wire.play) {
-            (Some(base), None) => Action::Base(base.into()),
-            (None, Some(play)) => Action::Play(Play {
+        // A `keep` that is not a keep is a publisher having built a step it
+        // could not have meant: the field's only lawful value is the one that
+        // makes the step a hold, and reading `false` as "no keep here" would
+        // turn a mistake into a step that does nothing.
+        if wire.keep == Some(false) {
+            return Err(serde::de::Error::custom(
+                "a step sets `keep` to false; `keep` is a hold, and its only value is true",
+            ));
+        }
+        let named = usize::from(wire.pose.is_some())
+            + usize::from(wire.keep.is_some())
+            + usize::from(wire.play.is_some());
+        if named != 1 {
+            return Err(serde::de::Error::custom(format!(
+                "a step names {named} of `pose`, `keep` and `play`; a step does exactly one of them"
+            )));
+        }
+        // A pace without a destination is a publisher having meant something
+        // this vocabulary does not carry: a hold goes nowhere, and an overlay's
+        // clock is its speed. Dropping the field silently would run the move at
+        // a pace nobody asked for.
+        if wire.move_ms.is_some() && wire.pose.is_none() {
+            return Err(serde::de::Error::custom(
+                "a step states `move_ms` without `pose`; only a move to a pose has a pace",
+            ));
+        }
+        let action = if let Some(name) = wire.pose {
+            Action::Base(Base::Pose {
+                name,
+                move_ms: wire.move_ms,
+            })
+        } else if wire.keep.is_some() {
+            Action::Base(Base::Keep)
+        } else {
+            let play = wire.play.expect("exactly one field is set");
+            Action::Play(Play {
                 name: play.name,
                 speed: play.speed,
-            }),
-            (Some(_), Some(_)) => {
-                return Err(serde::de::Error::custom(
-                    "a step names both `posture` and `play`; a step does exactly one of them",
-                ));
-            }
-            (None, None) => {
-                return Err(serde::de::Error::custom(
-                    "a step names neither `posture` nor `play`",
-                ));
-            }
+            })
         };
         Ok(Self {
             after_ms: wire.after_ms,
@@ -595,20 +649,54 @@ pub enum ScriptError {
         speed: f64,
     },
 
-    /// A play step names nothing, or names something longer than any library
-    /// entry can be. Neither can resolve, and both are the publisher's bug
-    /// rather than a missing asset.
+    /// A step names an asset no library could hold: nothing at all, something
+    /// longer than any library entry can be, or — for a pose — the reserved
+    /// spelling [`KEEP_BASE`], which the base vocabulary spends on an
+    /// instruction. The publisher's bug rather than a missing asset.
     ///
-    /// Length and emptiness only: the library's charset is not checked here
-    /// (see [`MAX_MOTION_NAME_LEN`]), so a name of legal length spelled in a
-    /// wrong alphabet passes this and is refused at the daemon as a motion no
-    /// library holds.
-    #[error("step {index} names a motion of {len} characters; a name is 1..={MAX_MOTION_NAME_LEN}")]
-    MotionNameUnusable {
+    /// One variant for both kinds of name a step states. A step does exactly one
+    /// thing, so whether the misnamed asset was a motion or a pose is on the
+    /// step at `index`, and what a publisher does about either is the same.
+    ///
+    /// The name is carried rather than its length: `keep` is a refusal nobody
+    /// can diagnose from a count, and a length tells a publisher less about
+    /// which string it built than the string does.
+    ///
+    /// Length, emptiness and the reserved spelling only: the library's charset
+    /// is not checked here (see [`MAX_ASSET_NAME_LEN`]), so a name of legal
+    /// length spelled in a wrong alphabet passes this and is refused at the
+    /// daemon as a name no library holds.
+    #[error(
+        "step {index} names `{name}`; an asset name is 1..={MAX_ASSET_NAME_LEN} \
+         characters, and a pose is never `{KEEP_BASE}`"
+    )]
+    NameUnusable {
         /// Which step named it.
         index: usize,
-        /// How long the name was.
-        len: usize,
+        /// What it named.
+        name: String,
+    },
+
+    /// A base step asks for a pace of zero, or one past [`MAX_TIMEOUT_MS`].
+    ///
+    /// A move of no time is a jump the machine cannot make and a move longer
+    /// than any script may last is a move nothing could contain, and both are
+    /// arithmetic the publisher got wrong. Refused rather than clamped, at the
+    /// door the publisher's own number enters by, so no consumer downstream
+    /// has to carry a bound of its own.
+    ///
+    /// What the pace does *not* answer for is whether the servos can follow it:
+    /// a lawful pace may still be a move the daemon's own trajectory check
+    /// refuses, which is where that judgement belongs.
+    #[error(
+        "step {index} asks for a {move_ms} ms move; a move takes between 1 and \
+         {MAX_TIMEOUT_MS} ms"
+    )]
+    MoveOutOfBounds {
+        /// Which step asked.
+        index: usize,
+        /// What it asked for.
+        move_ms: u64,
     },
 
     /// A play step comes due before any base step does.
@@ -644,8 +732,8 @@ pub struct MotionScript {
     /// survive its own restarts, which is what [`crate::seq::SeqSource`] is
     /// for.
     seq: u64,
-    /// The timeline, ascending by offset. Empty is lawful: it commands no
-    /// posture change, and the script's only effect is its timeout.
+    /// The timeline, ascending by offset. Empty is lawful: it commands no base
+    /// step, and the script's only effect is its timeout.
     steps: Vec<Step>,
     /// How long after receipt the daemon stows and rests regardless. This is
     /// the loss-of-instruction bound — the head's exposure stays finite even if
@@ -696,7 +784,7 @@ pub enum DecodeError {
     },
 
     /// The body claims to be a script and does not hold one — a missing field,
-    /// a field of the wrong type, or a posture nobody has defined.
+    /// a field of the wrong type, or a step that names no action.
     #[error("the body is not a well-formed `{MOTION_SCRIPT_TYPE}` message: {detail}")]
     Malformed {
         /// What the deserializer said.
@@ -761,7 +849,7 @@ impl MotionScript {
     /// part of this collapse: an overlay is a window (see
     /// [`Self::overlays_at`]), not a state the next step supersedes.
     #[must_use]
-    pub fn base_at(&self, elapsed_ms: u64) -> Option<Base> {
+    pub fn base_at(&self, elapsed_ms: u64) -> Option<&Base> {
         self.steps
             .iter()
             .rev()
@@ -931,7 +1019,8 @@ impl MotionScript {
 /// decoder cannot come to different conclusions about the same script.
 ///
 /// Everything checkable without a library: the timeout bounds, the ascending
-/// timeline, and — for play steps — a usable name, a speed inside the bounds
+/// timeline, a usable pose name and a pace inside the bounds on every base
+/// step, and — for play steps — a usable motion name, a speed inside the bounds
 /// both ends share, and a base step ahead of every overlay.
 fn validate(steps: &[Step], timeout_ms: u64) -> Result<(), ScriptError> {
     if timeout_ms == 0 {
@@ -963,36 +1052,78 @@ fn validate(steps: &[Step], timeout_ms: u64) -> Result<(), ScriptError> {
 
     let mut base_seen = false;
     for (index, step) in steps.iter().enumerate() {
-        let Some(play) = step.action.play() else {
-            base_seen = true;
-            continue;
-        };
-        if play.name.is_empty() || play.name.len() > MAX_MOTION_NAME_LEN {
-            return Err(ScriptError::MotionNameUnusable {
-                index,
-                len: play.name.len(),
-            });
-        }
-        if !play.speed.is_finite() || play.speed < MIN_SPEED || play.speed > MAX_SPEED {
-            return Err(ScriptError::SpeedOutOfBounds {
-                index,
-                speed: play.speed,
-            });
-        }
-        if !base_seen {
-            return Err(ScriptError::PlayBeforeBase {
-                index,
-                name: play.name.clone(),
-                after_ms: step.after_ms,
-            });
+        match &step.action {
+            Action::Base(base) => {
+                base_seen = true;
+                // `keep` on top of the shared rule: the base vocabulary spends
+                // that spelling on an instruction, so no library may hold it.
+                if let Some(name) = base.pose()
+                    && (!name_is_usable(name) || name == KEEP_BASE)
+                {
+                    return Err(ScriptError::NameUnusable {
+                        index,
+                        name: name.to_owned(),
+                    });
+                }
+                if let Some(move_ms) = base.move_ms()
+                    && (move_ms == 0 || move_ms > MAX_TIMEOUT_MS)
+                {
+                    return Err(ScriptError::MoveOutOfBounds { index, move_ms });
+                }
+            }
+            Action::Play(play) => {
+                if !name_is_usable(&play.name) {
+                    return Err(ScriptError::NameUnusable {
+                        index,
+                        name: play.name.clone(),
+                    });
+                }
+                if !play.speed.is_finite() || play.speed < MIN_SPEED || play.speed > MAX_SPEED {
+                    return Err(ScriptError::SpeedOutOfBounds {
+                        index,
+                        speed: play.speed,
+                    });
+                }
+                if !base_seen {
+                    return Err(ScriptError::PlayBeforeBase {
+                        index,
+                        name: play.name.clone(),
+                        after_ms: step.after_ms,
+                    });
+                }
+            }
         }
     }
     Ok(())
 }
 
+/// Whether `name` could name an asset at all: not empty, and inside
+/// [`MAX_ASSET_NAME_LEN`].
+///
+/// One rule, applied to both kinds of name a script states, so the motion a play
+/// step invokes and the pose a base step names cannot come to disagree about
+/// what a deployed library could hold. The charset is the asset format's and is
+/// not checked here (see [`MAX_ASSET_NAME_LEN`]); the reserved base spelling is
+/// the base vocabulary's and is checked where a pose is read.
+fn name_is_usable(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_ASSET_NAME_LEN
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pose name that is not the reserved one, so a case that means "some
+    /// pose" is visibly not a case about the stow.
+    const NEUTRAL: &str = "neutral";
+
+    /// The base a `Step::new` builds: a pose at the library's own pace.
+    fn pose_base(name: &str) -> Base {
+        Base::Pose {
+            name: name.to_owned(),
+            move_ms: None,
+        }
+    }
 
     fn script(steps: Vec<Step>, timeout_ms: u64) -> MotionScript {
         MotionScript::new("reachy00", 1, steps, timeout_ms).expect("a lawful script")
@@ -1016,8 +1147,8 @@ mod tests {
     fn a_script_survives_the_wire() {
         for steps in [
             vec![],
-            vec![Step::new(0, Posture::Up)],
-            vec![Step::new(0, Posture::Up), Step::new(6740, Posture::Stow)],
+            vec![Step::new(0, NEUTRAL)],
+            vec![Step::new(0, NEUTRAL), Step::new(6740, STOW_POSE)],
         ] {
             let script = MotionScript::new("reachy00", 1_786_543_210_123, steps, 30_000)
                 .expect("a lawful script");
@@ -1035,7 +1166,7 @@ mod tests {
         let script = MotionScript::new(
             "reachy00",
             1_786_543_210_123,
-            vec![Step::new(0, Posture::Up), Step::new(6740, Posture::Stow)],
+            vec![Step::new(0, NEUTRAL), Step::new(6740, STOW_POSE)],
             30_000,
         )
         .expect("a lawful script");
@@ -1046,22 +1177,39 @@ mod tests {
         assert_eq!(value["seq"], 1_786_543_210_123u64);
         assert_eq!(value["timeout_ms"], 30_000);
         assert_eq!(value["steps"][0]["after_ms"], 0);
-        assert_eq!(value["steps"][0]["posture"], "up");
+        assert_eq!(value["steps"][0]["pose"], "neutral");
         assert_eq!(value["steps"][1]["after_ms"], 6740);
-        assert_eq!(value["steps"][1]["posture"], "stow");
+        assert_eq!(value["steps"][1]["pose"], "stow");
     }
 
     /// The spelling a consumer logs and the spelling that crosses the wire are
     /// the same one, checked against the encoding rather than against a second
-    /// copy of the table.
+    /// copy of the name.
     #[test]
-    fn a_posture_names_itself_the_way_the_wire_does() {
-        for posture in [Posture::Up, Posture::Stow] {
-            let text = script(vec![Step::new(0, posture)], 1000).encode();
+    fn a_base_step_names_itself_the_way_the_wire_does() {
+        for pose in [NEUTRAL, STOW_POSE, "peek"] {
+            let text = script(vec![Step::new(0, pose)], 1000).encode();
             let value: serde_json::Value = serde_json::from_str(&text).expect("it is json");
-            assert_eq!(value["steps"][0]["posture"], posture.as_str());
-            assert_eq!(posture.to_string(), posture.as_str());
+            assert_eq!(value["steps"][0]["pose"], pose);
+            let base = pose_base(pose);
+            assert_eq!(base.as_str(), pose);
+            assert_eq!(base.to_string(), pose);
+            assert_eq!(base.pose(), Some(pose));
         }
+    }
+
+    /// The reserved name is a value of this contract and not a literal each end
+    /// spells for itself: a scripter closes with it, the daemon's compiler
+    /// recognises it, and a drift between the two spellings would be a machine
+    /// that never folds.
+    #[test]
+    fn the_reserved_stow_name_is_the_one_the_wire_carries() {
+        assert_eq!(STOW_POSE, "stow");
+        assert_eq!(KEEP_BASE, "keep");
+        let value: serde_json::Value =
+            serde_json::from_str(&script(vec![Step::new(0, STOW_POSE)], 1000).encode())
+                .expect("it is json");
+        assert_eq!(value["steps"][0]["pose"], STOW_POSE);
     }
 
     /// A field this daemon has never heard of is not a reason to drop the
@@ -1071,10 +1219,10 @@ mod tests {
     #[test]
     fn a_field_nobody_here_knows_is_ignored() {
         let text = r#"{"type":"motion-script","pod":"reachy00","seq":3,
-                       "steps":[{"after_ms":0,"posture":"up","ease":"quintic"}],
+                       "steps":[{"after_ms":0,"pose":"neutral","ease":"quintic"}],
                        "timeout_ms":30000,"base":1786543210123}"#;
         let decoded = MotionScript::decode(text).expect("the fields it needs are all there");
-        assert_eq!(decoded.steps(), [Step::new(0, Posture::Up)]);
+        assert_eq!(decoded.steps(), [Step::new(0, NEUTRAL)]);
         assert_eq!(decoded.seq(), 3);
     }
 
@@ -1089,9 +1237,9 @@ mod tests {
         }
     }
 
-    /// The malformed shapes, each reported as what it is. A posture nobody has
-    /// defined is refused rather than guessed at: the postures are the
-    /// message's whole meaning, and a guess here moves a head.
+    /// The malformed shapes, each reported as what it is. A step whose action
+    /// this vocabulary does not carry is refused rather than guessed at: the
+    /// actions are the message's whole meaning, and a guess here moves a head.
     #[test]
     fn a_body_that_is_not_a_script_is_reported_rather_than_guessed_at() {
         let not_json = MotionScript::decode("{not json").expect_err("it is not json");
@@ -1108,12 +1256,12 @@ mod tests {
             r#"{"type":"motion-script","pod":"reachy00","steps":[],"timeout_ms":30000}"#,
             r#"{"type":"motion-script","pod":"reachy00","seq":1,"timeout_ms":30000}"#,
             r#"{"type":"motion-script","pod":"reachy00","seq":1,"steps":[]}"#,
-            // A posture outside the vocabulary.
+            // A pose that is not a string.
             r#"{"type":"motion-script","pod":"reachy00","seq":1,
-                "steps":[{"after_ms":0,"posture":"lurking"}],"timeout_ms":30000}"#,
+                "steps":[{"after_ms":0,"pose":7}],"timeout_ms":30000}"#,
             // A step missing its offset.
             r#"{"type":"motion-script","pod":"reachy00","seq":1,
-                "steps":[{"posture":"up"}],"timeout_ms":30000}"#,
+                "steps":[{"pose":"neutral"}],"timeout_ms":30000}"#,
             // Numbers that are not counts.
             r#"{"type":"motion-script","pod":"reachy00","seq":-1,"steps":[],"timeout_ms":30000}"#,
             r#"{"type":"motion-script","pod":"reachy00","seq":1,"steps":[],"timeout_ms":-1}"#,
@@ -1123,6 +1271,26 @@ mod tests {
                 matches!(refused, DecodeError::Malformed { .. }),
                 "{text}: {refused}"
             );
+        }
+
+        // The retired spelling. `posture` is an unknown field, so the step
+        // names no action — and the refusal has to say that, because a
+        // publisher on the old vocabulary has nothing else to read: the
+        // variant alone is what a missing `pod` reports too.
+        for text in [
+            r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                "steps":[{"after_ms":0,"posture":"up"}],"timeout_ms":30000}"#,
+            r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                "steps":[{"after_ms":0,"posture":"stow"}],"timeout_ms":30000}"#,
+        ] {
+            let refused = MotionScript::decode(text).expect_err("the step names no action");
+            assert!(
+                matches!(refused, DecodeError::Malformed { .. }),
+                "{text}: {refused}"
+            );
+            let printed = refused.to_string();
+            assert!(printed.contains("a step names 0 of"), "{printed}");
+            assert!(printed.contains("does exactly one of them"), "{printed}");
         }
     }
 
@@ -1143,8 +1311,8 @@ mod tests {
         );
 
         let backwards = r#"{"type":"motion-script","pod":"reachy00","seq":1,
-                            "steps":[{"after_ms":500,"posture":"up"},
-                                     {"after_ms":200,"posture":"stow"}],
+                            "steps":[{"after_ms":500,"pose":"neutral"},
+                                     {"after_ms":200,"pose":"stow"}],
                             "timeout_ms":30000}"#;
         assert_eq!(
             MotionScript::decode(backwards).expect_err("out of order"),
@@ -1161,7 +1329,7 @@ mod tests {
             MotionScript::new(
                 "reachy00",
                 1,
-                vec![Step::new(0, Posture::Up), Step::new(0, Posture::Stow)],
+                vec![Step::new(0, NEUTRAL), Step::new(0, STOW_POSE)],
                 30_000,
             )
             .expect_err("simultaneous"),
@@ -1196,25 +1364,25 @@ mod tests {
     /// The timeline resolved at an instant: nothing before the first step, the
     /// last due step once several have passed, and the last step forever after.
     #[test]
-    fn the_posture_is_the_last_step_that_has_come_due() {
+    fn the_base_is_the_last_step_that_has_come_due() {
         let script = script(
-            vec![Step::new(500, Posture::Up), Step::new(6740, Posture::Stow)],
+            vec![Step::new(500, NEUTRAL), Step::new(6740, STOW_POSE)],
             30_000,
         );
 
         assert_eq!(script.base_at(0), None, "nothing is due yet");
         assert_eq!(script.base_at(499), None);
-        assert_eq!(script.base_at(500), Some(Base::Posture(Posture::Up)));
-        assert_eq!(script.base_at(6739), Some(Base::Posture(Posture::Up)));
-        assert_eq!(script.base_at(6740), Some(Base::Posture(Posture::Stow)));
-        assert_eq!(script.base_at(600_000), Some(Base::Posture(Posture::Stow)));
+        assert_eq!(script.base_at(500), Some(&pose_base(NEUTRAL)));
+        assert_eq!(script.base_at(6739), Some(&pose_base(NEUTRAL)));
+        assert_eq!(script.base_at(6740), Some(&pose_base(STOW_POSE)));
+        assert_eq!(script.base_at(600_000), Some(&pose_base(STOW_POSE)));
 
-        // A script that landed late collapses to the one posture that matters
+        // A script that landed late collapses to the one pose that matters
         // rather than replaying its timeline.
-        assert_eq!(script.base_at(10_000), Some(Base::Posture(Posture::Stow)));
+        assert_eq!(script.base_at(10_000), Some(&pose_base(STOW_POSE)));
     }
 
-    /// An empty timeline never asks for a posture. It is a lawful script whose
+    /// An empty timeline never asks for a base step. It is a lawful script whose
     /// whole content is its timeout.
     #[test]
     fn an_empty_timeline_commands_nothing() {
@@ -1230,7 +1398,7 @@ mod tests {
     #[test]
     fn the_next_step_and_the_expiry_are_both_offsets() {
         let script = script(
-            vec![Step::new(500, Posture::Up), Step::new(6740, Posture::Stow)],
+            vec![Step::new(500, NEUTRAL), Step::new(6740, STOW_POSE)],
             30_000,
         );
 
@@ -1247,8 +1415,8 @@ mod tests {
     fn the_expiry_is_the_timeout_the_script_named() {
         for steps in [
             vec![],
-            vec![Step::new(0, Posture::Up)],
-            vec![Step::new(0, Posture::Up), Step::new(29_999, Posture::Stow)],
+            vec![Step::new(0, NEUTRAL)],
+            vec![Step::new(0, NEUTRAL), Step::new(29_999, STOW_POSE)],
         ] {
             assert_eq!(script(steps, 30_000).expiry_ms(), 30_000);
         }
@@ -1263,7 +1431,7 @@ mod tests {
             MotionScript::new(
                 "reachy00",
                 1,
-                vec![Step::new(0, Posture::Up), Step::new(9_000, Posture::Stow)],
+                vec![Step::new(0, NEUTRAL), Step::new(9_000, STOW_POSE)],
                 5_000,
             )
             .expect_err("the timeline outruns the bound it states"),
@@ -1274,7 +1442,7 @@ mod tests {
         );
 
         let level = r#"{"type":"motion-script","pod":"reachy00","seq":1,
-                        "steps":[{"after_ms":5000,"posture":"stow"}],
+                        "steps":[{"after_ms":5000,"pose":"stow"}],
                         "timeout_ms":5000}"#;
         assert_eq!(
             MotionScript::decode(level).expect_err("level with the lapse"),
@@ -1285,8 +1453,8 @@ mod tests {
         );
 
         // One millisecond inside is lawful, and the step resolves.
-        let inside = script(vec![Step::new(4_999, Posture::Stow)], 5_000);
-        assert_eq!(inside.base_at(4_999), Some(Base::Posture(Posture::Stow)));
+        let inside = script(vec![Step::new(4_999, STOW_POSE)], 5_000);
+        assert_eq!(inside.base_at(4_999), Some(&pose_base(STOW_POSE)));
 
         // A timeline out of order is reported as out of order rather than as a
         // timeline past its timeout: "the last step" means nothing until the
@@ -1295,7 +1463,7 @@ mod tests {
             MotionScript::new(
                 "reachy00",
                 1,
-                vec![Step::new(9_000, Posture::Up), Step::new(10, Posture::Stow)],
+                vec![Step::new(9_000, NEUTRAL), Step::new(10, STOW_POSE)],
                 5_000,
             )
             .expect_err("out of order"),
@@ -1323,8 +1491,8 @@ mod tests {
         // The seconds-for-milliseconds accident: an hour-long exposure under a
         // timeline that agrees with it perfectly.
         let slipped = r#"{"type":"motion-script","pod":"reachy00","seq":1,
-                          "steps":[{"after_ms":0,"posture":"up"},
-                                   {"after_ms":3600000,"posture":"stow"}],
+                          "steps":[{"after_ms":0,"pose":"neutral"},
+                                   {"after_ms":3600000,"pose":"stow"}],
                           "timeout_ms":3605000}"#;
         assert_eq!(
             MotionScript::decode(slipped).expect_err("an hour is nobody's turn"),
@@ -1335,7 +1503,7 @@ mod tests {
 
         // The ceiling itself is lawful; it is a bound, not a limit to stay
         // under.
-        let at_ceiling = script(vec![Step::new(0, Posture::Up)], MAX_TIMEOUT_MS);
+        let at_ceiling = script(vec![Step::new(0, NEUTRAL)], MAX_TIMEOUT_MS);
         assert_eq!(at_ceiling.expiry_ms(), MAX_TIMEOUT_MS);
     }
 
@@ -1368,11 +1536,11 @@ mod tests {
             "reachy00",
             7,
             vec![
-                Step::new(0, Posture::Up),
+                Step::new(0, NEUTRAL),
                 Step::play(400, Play::at_speed("pollen/emotions/loving1", 1.5)),
                 Step::keep(2_000),
                 Step::play(2_100, Play::new("pod/wiggle")),
-                Step::new(9_000, Posture::Stow),
+                Step::new(9_000, STOW_POSE),
             ],
             30_000,
         )
@@ -1384,14 +1552,14 @@ mod tests {
         );
     }
 
-    /// The encoded shape of base and play steps, spelled out: a posture step
-    /// encodes as before, `keep` rides the same field, and a play step carries
-    /// no `posture` at all — which is how an older daemon comes to refuse it.
+    /// The encoded shape of base and play steps, spelled out: a pose step
+    /// carries its name, `keep` is its own boolean field, a play step carries
+    /// neither, and no step carries two of the three.
     #[test]
     fn the_layered_encoding_is_the_documented_one() {
         let script = script(
             vec![
-                Step::new(0, Posture::Up),
+                Step::new(0, NEUTRAL),
                 Step::play(400, Play::at_speed("pollen/emotions/loving1", 1.5)),
                 Step::keep(2_000),
                 Step::play(2_100, Play::new("pod/wiggle")),
@@ -1400,16 +1568,18 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_str(&script.encode()).expect("it is json");
 
-        assert_eq!(value["steps"][0]["posture"], "up");
+        assert_eq!(value["steps"][0]["pose"], "neutral");
         assert!(value["steps"][0].get("play").is_none());
+        assert!(value["steps"][0].get("keep").is_none());
         assert_eq!(value["steps"][1]["after_ms"], 400);
         assert_eq!(value["steps"][1]["play"]["name"], "pollen/emotions/loving1");
         assert_eq!(value["steps"][1]["play"]["speed"], 1.5);
         assert!(
-            value["steps"][1].get("posture").is_none(),
-            "an older daemon refuses this step because there is no posture in it"
+            value["steps"][1].get("pose").is_none(),
+            "a play step names no pose; exactly one field is set"
         );
-        assert_eq!(value["steps"][2]["posture"], "keep");
+        assert_eq!(value["steps"][2]["keep"], true);
+        assert!(value["steps"][2].get("pose").is_none());
         assert_eq!(value["steps"][3]["play"]["speed"], 1.0);
     }
 
@@ -1418,7 +1588,8 @@ mod tests {
     #[test]
     fn a_captured_step_is_the_wire_shape() {
         let steps = vec![
-            Step::new(0, Posture::Up),
+            Step::new(0, NEUTRAL),
+            Step::timed(1_000, "peek", 600),
             Step::keep(2_000),
             Step::play(2_100, Play::at_speed("pod/wiggle", 1.5)),
         ];
@@ -1431,19 +1602,220 @@ mod tests {
         }
     }
 
-    /// `keep` is a base command and never a posture. The daemon's posture state,
-    /// its target sets, and its captures are all typed on [`Posture`], and this
-    /// is what keeps `keep` out of them.
+    /// `keep` is a base command and never a pose. It has no target set in any
+    /// library, so it rides its own field and answers `None` to the question
+    /// every consumer asks a base step: which pose is this.
     #[test]
-    fn keep_is_a_base_command_and_not_a_posture() {
+    fn keep_is_a_base_command_and_not_a_pose() {
         let script = script(vec![Step::keep(0)], 30_000);
-        assert_eq!(script.base_at(0), Some(Base::Keep));
-        assert_eq!(script.base_at(0).and_then(Base::posture), None);
+        assert_eq!(script.base_at(0), Some(&Base::Keep));
+        assert_eq!(script.base_at(0).and_then(Base::pose), None);
 
-        serde_json::from_str::<Posture>("\"keep\"")
-            .expect_err("the posture vocabulary is still two values");
-        assert_eq!(Base::Keep.as_str(), "keep");
-        assert_eq!(Base::Keep.to_string(), "keep");
+        assert_eq!(Base::Keep.as_str(), KEEP_BASE);
+        assert_eq!(Base::Keep.to_string(), KEEP_BASE);
+
+        // And a pose *named* `keep` is refused, so the two spellings can never
+        // mean two things.
+        assert_eq!(
+            MotionScript::new("reachy00", 1, vec![Step::new(0, KEEP_BASE)], 30_000)
+                .expect_err("a hold is not a pose"),
+            ScriptError::NameUnusable {
+                index: 0,
+                name: KEEP_BASE.to_owned(),
+            }
+        );
+        let named = r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                        "steps":[{"after_ms":0,"pose":"keep"}],"timeout_ms":30000}"#;
+        assert_eq!(
+            MotionScript::decode(named).expect_err("a hold is not a pose"),
+            DecodeError::Invalid(ScriptError::NameUnusable {
+                index: 0,
+                name: KEEP_BASE.to_owned(),
+            })
+        );
+    }
+
+    /// A pose name no library could hold is the publisher's bug, refused
+    /// without one — the same rule and the same variant the motion names are
+    /// held to, under the same bound.
+    #[test]
+    fn a_pose_name_no_library_could_hold_is_refused() {
+        for name in [String::new(), "a".repeat(MAX_ASSET_NAME_LEN + 1)] {
+            assert_eq!(
+                MotionScript::new("reachy00", 1, vec![Step::new(0, name.clone())], 30_000)
+                    .expect_err("no library holds that"),
+                ScriptError::NameUnusable { index: 0, name }
+            );
+        }
+
+        // The step the publisher has to go and fix is the one named, not the
+        // first one: the refusal is raised from a walk over every base step.
+        assert_eq!(
+            MotionScript::new(
+                "reachy00",
+                1,
+                vec![Step::new(0, NEUTRAL), Step::new(1_000, "")],
+                30_000,
+            )
+            .expect_err("no library holds that"),
+            ScriptError::NameUnusable {
+                index: 1,
+                name: String::new(),
+            }
+        );
+        let later = r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                        "steps":[{"after_ms":0,"pose":"neutral"},
+                                 {"after_ms":1000,"pose":"keep"}],"timeout_ms":30000}"#;
+        assert_eq!(
+            MotionScript::decode(later).expect_err("no library holds that"),
+            DecodeError::Invalid(ScriptError::NameUnusable {
+                index: 1,
+                name: KEEP_BASE.to_owned(),
+            })
+        );
+
+        // The bound itself is lawful, and so is any spelling inside it: the
+        // charset belongs to the library, and a name in a wrong alphabet is
+        // refused there rather than here.
+        script(vec![Step::new(0, "a".repeat(MAX_ASSET_NAME_LEN))], 30_000);
+        script(vec![Step::new(0, "Peek 2!")], 30_000);
+
+        let printed = ScriptError::NameUnusable {
+            index: 3,
+            name: "keep".to_owned(),
+        }
+        .to_string();
+        assert!(printed.contains("keep"), "{printed}");
+        assert!(printed.contains("128"), "{printed}");
+        assert!(printed.contains("step 3"), "{printed}");
+    }
+
+    /// A base step may state the pace of its own move, and the pace rides the
+    /// pose rather than the step: a publisher that states none gets the
+    /// library's, and the field is absent from the wire rather than spelled as
+    /// a zero nobody could tell from an instruction.
+    #[test]
+    fn a_base_step_may_state_the_pace_of_its_move() {
+        let script = script(
+            vec![Step::timed(0, "peek", 600), Step::new(2_000, STOW_POSE)],
+            30_000,
+        );
+        assert_eq!(
+            script.base_at(0),
+            Some(&Base::Pose {
+                name: "peek".to_owned(),
+                move_ms: Some(600),
+            })
+        );
+        assert_eq!(script.base_at(0).and_then(Base::move_ms), Some(600));
+        assert_eq!(script.base_at(2_000).and_then(Base::move_ms), None);
+        // The pace is not part of the name, so the spelling a consumer logs is
+        // the pose either way.
+        assert_eq!(script.base_at(0).map(Base::as_str), Some("peek"));
+
+        let value: serde_json::Value = serde_json::from_str(&script.encode()).expect("it is json");
+        assert_eq!(value["steps"][0]["pose"], "peek");
+        assert_eq!(value["steps"][0]["move_ms"], 600);
+        assert!(
+            value["steps"][1].get("move_ms").is_none(),
+            "an unstated pace is absent, not zero"
+        );
+        assert_eq!(
+            MotionScript::decode(&script.encode()).expect("it decodes"),
+            script
+        );
+        assert_eq!(Base::Keep.move_ms(), None);
+    }
+
+    /// A pace on a step with nowhere to go is refused at decode rather than
+    /// dropped: a hold has no destination, and an overlay's clock is its speed,
+    /// so a publisher that wrote one meant something this vocabulary does not
+    /// carry.
+    #[test]
+    fn a_pace_without_a_destination_is_refused() {
+        for text in [
+            r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                "steps":[{"after_ms":0,"keep":true,"move_ms":600}],"timeout_ms":30000}"#,
+            r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                "steps":[{"after_ms":0,"pose":"neutral"},
+                         {"after_ms":10,"play":{"name":"nod"},"move_ms":600}],
+                "timeout_ms":30000}"#,
+        ] {
+            let refused = MotionScript::decode(text).expect_err("nowhere to go");
+            assert!(
+                matches!(refused, DecodeError::Malformed { .. }),
+                "{text}: {refused}"
+            );
+            let printed = refused.to_string();
+            assert!(printed.contains("move_ms"), "{printed}");
+            assert!(printed.contains("pose"), "{printed}");
+        }
+    }
+
+    /// The pace's own bounds, refused at both doors. A move of no time is a
+    /// jump; one past the script ceiling is longer than any script may last.
+    #[test]
+    fn a_pace_outside_the_bounds_is_refused_by_both_doors() {
+        for move_ms in [0, MAX_TIMEOUT_MS + 1] {
+            assert_eq!(
+                MotionScript::new(
+                    "reachy00",
+                    1,
+                    vec![Step::new(0, NEUTRAL), Step::timed(10, "peek", move_ms)],
+                    30_000,
+                )
+                .expect_err("not a move"),
+                ScriptError::MoveOutOfBounds { index: 1, move_ms }
+            );
+            let text = format!(
+                r#"{{"type":"motion-script","pod":"reachy00","seq":1,
+                    "steps":[{{"after_ms":0,"pose":"neutral"}},
+                             {{"after_ms":10,"pose":"peek","move_ms":{move_ms}}}],
+                    "timeout_ms":30000}}"#
+            );
+            assert_eq!(
+                MotionScript::decode(&text).expect_err("not a move"),
+                DecodeError::Invalid(ScriptError::MoveOutOfBounds { index: 1, move_ms })
+            );
+        }
+
+        // The bounds themselves are lawful, the ceiling included: a pace is not
+        // held against the script's own timeout, which bounds the timeline.
+        script(vec![Step::timed(0, "peek", 1)], 30_000);
+        script(vec![Step::timed(0, "peek", MAX_TIMEOUT_MS)], 30_000);
+
+        let printed = ScriptError::MoveOutOfBounds {
+            index: 2,
+            move_ms: 0,
+        }
+        .to_string();
+        assert!(printed.contains("step 2"), "{printed}");
+        assert!(printed.contains("0 ms"), "{printed}");
+    }
+
+    /// `keep` is a hold, and its only lawful value is the one that says so. A
+    /// `false` there is a publisher having built a step it could not have
+    /// meant, and reading it as "no keep" would turn that into a step that does
+    /// nothing.
+    #[test]
+    fn a_keep_that_is_not_a_keep_is_refused() {
+        let text = r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                       "steps":[{"after_ms":0,"keep":false}],"timeout_ms":30000}"#;
+        let refused = MotionScript::decode(text).expect_err("`keep` is a hold");
+        assert!(
+            matches!(refused, DecodeError::Malformed { .. }),
+            "{refused}"
+        );
+        let printed = refused.to_string();
+        assert!(printed.contains(KEEP_BASE), "{printed}");
+        assert!(printed.contains("its only value is true"), "{printed}");
+
+        let lawful = r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                         "steps":[{"after_ms":0,"keep":true}],"timeout_ms":30000}"#;
+        assert_eq!(
+            MotionScript::decode(lawful).expect("a lawful hold").steps(),
+            [Step::keep(0)]
+        );
     }
 
     /// The base collapses across a mixed timeline: play steps are not part of
@@ -1453,38 +1825,52 @@ mod tests {
     fn the_base_collapses_past_the_play_steps_between() {
         let script = script(
             vec![
-                Step::new(500, Posture::Up),
+                Step::new(500, NEUTRAL),
                 Step::play(600, Play::new("pod/nod")),
                 Step::play(1_200, Play::new("pod/wiggle")),
                 Step::keep(2_000),
                 Step::play(2_100, Play::new("pod/nod")),
-                Step::new(9_000, Posture::Stow),
+                Step::new(9_000, STOW_POSE),
             ],
             30_000,
         );
 
         assert_eq!(script.base_at(499), None);
-        assert_eq!(script.base_at(500), Some(Base::Posture(Posture::Up)));
-        assert_eq!(script.base_at(1_999), Some(Base::Posture(Posture::Up)));
-        assert_eq!(script.base_at(2_000), Some(Base::Keep));
-        assert_eq!(script.base_at(2_100), Some(Base::Keep));
-        assert_eq!(script.base_at(9_000), Some(Base::Posture(Posture::Stow)));
+        assert_eq!(script.base_at(500), Some(&pose_base(NEUTRAL)));
+        assert_eq!(script.base_at(1_999), Some(&pose_base(NEUTRAL)));
+        assert_eq!(script.base_at(2_000), Some(&Base::Keep));
+        assert_eq!(script.base_at(2_100), Some(&Base::Keep));
+        assert_eq!(script.base_at(9_000), Some(&pose_base(STOW_POSE)));
 
         // A daemon that woke late reads one base, not a replay of three.
-        assert_eq!(script.base_at(20_000), Some(Base::Posture(Posture::Stow)));
+        assert_eq!(script.base_at(20_000), Some(&pose_base(STOW_POSE)));
 
         // And a play step still moves the clock the executor waits on.
         assert_eq!(script.next_step_ms(500), Some(600));
     }
 
-    /// A step does exactly one thing. Both fields or neither is the publisher
-    /// having built a step it could not have meant, and either is refused where
-    /// the body is read rather than resolved by a precedence rule.
+    /// A step does exactly one thing. Any two of `pose`, `keep` and `play`, all
+    /// three, or none of them is the publisher having built a step it could not
+    /// have meant, and each is refused where the body is read rather than
+    /// resolved by a precedence rule. The refusal names the count it saw,
+    /// because that is what tells the publisher which end of the rule it broke.
     #[test]
     fn a_step_that_is_not_exactly_one_action_is_refused() {
-        for steps in [
-            r#"[{"after_ms":0,"posture":"up","play":{"name":"pod/nod"}}]"#,
-            r#"[{"after_ms":0}]"#,
+        for (steps, named) in [
+            (
+                r#"[{"after_ms":0,"pose":"neutral","play":{"name":"pod/nod"}}]"#,
+                2,
+            ),
+            (r#"[{"after_ms":0,"pose":"neutral","keep":true}]"#, 2),
+            (
+                r#"[{"after_ms":0,"keep":true,"play":{"name":"pod/nod"}}]"#,
+                2,
+            ),
+            (
+                r#"[{"after_ms":0,"pose":"neutral","keep":true,"play":{"name":"pod/nod"}}]"#,
+                3,
+            ),
+            (r#"[{"after_ms":0}]"#, 0),
         ] {
             let text = format!(
                 r#"{{"type":"motion-script","pod":"reachy00","seq":1,
@@ -1494,6 +1880,13 @@ mod tests {
             assert!(
                 matches!(refused, DecodeError::Malformed { .. }),
                 "{steps}: {refused}"
+            );
+            // The count is the diagnosis, so it is asserted rather than the
+            // variant alone: `Malformed` is also what a missing `pod` produces.
+            let printed = refused.to_string();
+            assert!(
+                printed.contains(&format!("a step names {named} of")),
+                "{steps}: {printed}"
             );
         }
     }
@@ -1510,7 +1903,7 @@ mod tests {
                 1,
                 vec![
                     Step::play(0, Play::new("pod/wiggle")),
-                    Step::new(10, Posture::Up),
+                    Step::new(10, NEUTRAL),
                 ],
                 30_000,
             )
@@ -1548,7 +1941,7 @@ mod tests {
             vec![Step::keep(0), Step::play(10, Play::new("pod/wiggle"))],
             30_000,
         );
-        assert_eq!(keep_first.base_at(10), Some(Base::Keep));
+        assert_eq!(keep_first.base_at(10), Some(&Base::Keep));
     }
 
     /// The speed bounds are checked by both doors, and the default is the
@@ -1562,7 +1955,7 @@ mod tests {
                 "reachy00",
                 1,
                 vec![
-                    Step::new(0, Posture::Up),
+                    Step::new(0, NEUTRAL),
                     Step::play(10, Play::at_speed("pod/nod", speed)),
                 ],
                 30_000,
@@ -1579,21 +1972,21 @@ mod tests {
         for speed in [MIN_SPEED, MAX_SPEED] {
             script(
                 vec![
-                    Step::new(0, Posture::Up),
+                    Step::new(0, NEUTRAL),
                     Step::play(10, Play::at_speed("pod/nod", speed)),
                 ],
                 30_000,
             );
         }
         let defaulted = r#"{"type":"motion-script","pod":"reachy00","seq":1,
-                            "steps":[{"after_ms":0,"posture":"up"},
+                            "steps":[{"after_ms":0,"pose":"neutral"},
                                      {"after_ms":10,"play":{"name":"pod/nod"}}],
                             "timeout_ms":30000}"#;
         let decoded = MotionScript::decode(defaulted).expect("a lawful script");
         assert_eq!(decoded.steps()[1].action.play().expect("a play").speed, 1.0);
 
         let over = r#"{"type":"motion-script","pod":"reachy00","seq":1,
-                       "steps":[{"after_ms":0,"posture":"up"},
+                       "steps":[{"after_ms":0,"pose":"neutral"},
                                 {"after_ms":10,"play":{"name":"pod/nod","speed":9.0}}],
                        "timeout_ms":30000}"#;
         assert!(matches!(
@@ -1602,29 +1995,40 @@ mod tests {
         ));
     }
 
-    /// A name that cannot join against any library is the publisher's bug, not
-    /// a missing asset, and is refused without one.
+    /// A motion name that cannot join against any library is the publisher's
+    /// bug, not a missing asset, and is refused without one — by the same
+    /// variant a pose name is, since the step at the named index says which
+    /// kind of asset it was.
     #[test]
-    fn a_name_no_library_could_hold_is_refused() {
-        for name in [String::new(), "a".repeat(MAX_MOTION_NAME_LEN + 1)] {
-            let len = name.len();
+    fn a_motion_name_no_library_could_hold_is_refused() {
+        for name in [String::new(), "a".repeat(MAX_ASSET_NAME_LEN + 1)] {
             assert_eq!(
                 MotionScript::new(
                     "reachy00",
                     1,
-                    vec![Step::new(0, Posture::Up), Step::play(10, Play::new(name))],
+                    vec![
+                        Step::new(0, NEUTRAL),
+                        Step::play(10, Play::new(name.clone()))
+                    ],
                     30_000,
                 )
                 .expect_err("no library holds that"),
-                ScriptError::MotionNameUnusable { index: 1, len }
+                ScriptError::NameUnusable { index: 1, name }
             );
         }
+
+        // `keep` is a lawful motion name: an overlay is invoked in its own
+        // field, so the reserved base spelling cannot collide there.
+        script(
+            vec![Step::new(0, NEUTRAL), Step::play(10, Play::new(KEEP_BASE))],
+            30_000,
+        );
 
         // The bound itself is lawful.
         script(
             vec![
-                Step::new(0, Posture::Up),
-                Step::play(10, Play::new("a".repeat(MAX_MOTION_NAME_LEN))),
+                Step::new(0, NEUTRAL),
+                Step::play(10, Play::new("a".repeat(MAX_ASSET_NAME_LEN))),
             ],
             30_000,
         );
@@ -1662,7 +2066,7 @@ mod tests {
     fn overlays_resolve_as_windows_in_step_order() {
         let script = script(
             vec![
-                Step::new(0, Posture::Up),
+                Step::new(0, NEUTRAL),
                 Step::play(1_000, Play::new("pod/nod")),
                 Step::play(1_500, Play::new("pod/wiggle")),
             ],
@@ -1734,7 +2138,7 @@ mod tests {
     /// the refusal names the instant it was reached.
     #[test]
     fn the_concurrency_cap_counts_overlapping_windows() {
-        let mut steps = vec![Step::new(0, Posture::Up)];
+        let mut steps = vec![Step::new(0, NEUTRAL)];
         for index in 0..MAX_CONCURRENT_OVERLAYS {
             steps.push(Step::play(1_000 + index as u64 * 10, Play::new("pod/nod")));
         }
@@ -1753,7 +2157,7 @@ mod tests {
         );
 
         // The same five, spread out so none of them overlaps, are fine.
-        let mut spread = vec![Step::new(0, Posture::Up)];
+        let mut spread = vec![Step::new(0, NEUTRAL)];
         for index in 0..=MAX_CONCURRENT_OVERLAYS {
             spread.push(Step::play(
                 1_000 + index as u64 * 3_000,
@@ -1809,29 +2213,30 @@ mod tests {
         assert_eq!(Play::new("pod/nod").to_string(), "play pod/nod");
     }
 
-    /// A posture-only script round-trips unchanged: the encoding is
-    /// byte-compatible with the shape that carried only postures.
+    /// A base-only script round-trips as exactly the two fields a base step
+    /// carries, and nothing else: the ordinary conversation is this shape, and
+    /// the far end of the channel is written against the text.
     #[test]
-    fn an_old_posture_only_script_is_unchanged_in_both_directions() {
-        let old = r#"{"type":"motion-script","pod":"reachy00","seq":1,
-                      "steps":[{"after_ms":0,"posture":"up"},
-                               {"after_ms":6740,"posture":"stow"}],
-                      "timeout_ms":30000}"#;
-        let decoded = MotionScript::decode(old).expect("a lawful script");
+    fn a_base_only_script_is_two_fields_a_step_in_both_directions() {
+        let text = r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                       "steps":[{"after_ms":0,"pose":"neutral"},
+                                {"after_ms":6740,"pose":"stow"}],
+                       "timeout_ms":30000}"#;
+        let decoded = MotionScript::decode(text).expect("a lawful script");
         assert_eq!(
             decoded.steps(),
-            [Step::new(0, Posture::Up), Step::new(6740, Posture::Stow)]
+            [Step::new(0, NEUTRAL), Step::new(6740, STOW_POSE)]
         );
-        assert_eq!(decoded.base_at(0), Some(Base::Posture(Posture::Up)));
+        assert_eq!(decoded.base_at(0), Some(&pose_base(NEUTRAL)));
         assert!(decoded.overlays_at(0, window(2_000, 200)).is_empty());
         assert_eq!(decoded.check_overlays(|_| None), Ok(()));
 
         let value: serde_json::Value = serde_json::from_str(&decoded.encode()).expect("it is json");
-        assert_eq!(value["steps"][0], json_step(0, "up"));
-        assert_eq!(value["steps"][1], json_step(6740, "stow"));
+        assert_eq!(value["steps"][0], json_step(0, NEUTRAL));
+        assert_eq!(value["steps"][1], json_step(6740, STOW_POSE));
     }
 
-    fn json_step(after_ms: u64, posture: &str) -> serde_json::Value {
-        serde_json::json!({ "after_ms": after_ms, "posture": posture })
+    fn json_step(after_ms: u64, pose: &str) -> serde_json::Value {
+        serde_json::json!({ "after_ms": after_ms, "pose": pose })
     }
 }

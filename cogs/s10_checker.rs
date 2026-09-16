@@ -17,7 +17,6 @@ use brenn_reachy__driver__health_clk_rs::EventKind;
 use brenn_reachy__motion__faults_clk_rs::{FaultKindWire, ResponseKindWire};
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
-use reachy_motion::postures::neutral_targets;
 use reachy_motion::tick::ResponseKind;
 use scenario::check;
 use scenario::read::Run;
@@ -175,7 +174,7 @@ fn check_arrived_before_the_outage(run: &Run, failures: &mut Vec<String>) {
         run,
         "upright",
         outage_cycle() - 1,
-        &neutral_targets(),
+        &scenario::neutral_pose(),
         failures,
     );
     check::room(

@@ -84,13 +84,13 @@ pub mod resume;
 mod testutil;
 
 pub mod arm;
+pub mod asset_name;
 pub mod cells;
 pub mod disarm;
 pub mod fault;
 pub mod joints;
 pub mod phase;
 pub mod plant;
-pub mod postures;
 pub mod record;
 pub mod segments;
 pub mod seq;
@@ -110,9 +110,7 @@ pub use arm::{
     ProvisionExpect, ProvisionTable, Rail, VENDOR_HOMING_OFFSETS, engage_gates, pin_goals,
     rest_pose_seeds,
 };
-pub use disarm::{
-    DisarmConfig, DisarmSequencer, DisarmSummary, ReleaseForm, at_stow, stow_targets,
-};
+pub use disarm::{DisarmConfig, DisarmSequencer, DisarmSummary, ReleaseForm, at_stow};
 pub use fault::{FaultError, FaultKind};
 pub use joints::{JointGroup, JointRef, JointStep, JointTargets, JointVector, ServoHealth};
 pub use phase::{
@@ -124,7 +122,6 @@ pub use plant::{
     PROFILE_ACCELERATION_MAX, PlantError, PlantModel, Predicted, RESPONSE_DEAD_SAMPLES,
     SHIPPED_PERIOD_NS, SHIPPED_PROFILES,
 };
-pub use postures::{NEUTRAL_ANTENNAS, neutral_targets, stow_pose_targets};
 pub use resume::{GAINS_PROFILE_WRITES, PROVISION_CELLS, ResumeError};
 pub use segments::{
     DRIFT_SAMPLES, HISTORY_SAMPLES, JointSample, MIN_STILL, MOVING_RAD_PER_S, MotionSegmenter,

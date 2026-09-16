@@ -18,7 +18,17 @@
 //! gesture that can be edited without a case failing is a harness whose verdict
 //! stops meaning what the analyzer says it means.
 
-use motion_proto::{MotionScript, Posture, Step};
+use motion_proto::{MotionScript, STOW_POSE, Step};
+use reachy_edge::PoseTable;
+
+/// The names sidecar of the two libraries this build emits.
+///
+/// Embedded rather than read at run time: the harness stands its edge up
+/// without being handed a library, and the numbering a script must carry is the
+/// numbering of the assets it was built beside. Library, sidecar and this binary
+/// travel to a unit as one payload, so the emit compiled in here is the emit the
+/// box binds.
+const LIBRARY_NAMES: &str = include_str!(env!("ASK_LIBRARY_NAMES"));
 
 /// Whose head the harness asks about.
 ///
@@ -27,6 +37,50 @@ use motion_proto::{MotionScript, Posture, Step};
 /// knob. A real pod name would invite the harness to be pointed at a machine
 /// whose own host is running.
 pub const ASK_POD: &str = "reachy-ask";
+
+/// The pose the harness raises to.
+///
+/// The machine's attending pose, named as the deployed library names it. Not
+/// the reserved stow name, which the wire contract states for both ends; this
+/// one is content, and a machine whose library lacks it refuses the gesture at
+/// the compile rather than moving somewhere else.
+///
+/// Which pose the harness asks for is the harness's own choice, so it is named
+/// here; that the emitted library holds it under this spelling is a case below.
+pub const NEUTRAL_POSE: &str = "neutral";
+
+/// The poses the deployed library holds, as the embedded sidecar numbers them.
+///
+/// Read once for the process and handed out by reference. The motions half of
+/// the same sidecar is dropped here: the motions this binary plays come from
+/// the file an operator names on the command line, and the poses are the half a
+/// script has to resolve through.
+///
+/// # Panics
+///
+/// If the emitted sidecar does not read, or holds no stow. Neither is reachable
+/// from a tree `make check` passed: the generator refuses a library without a
+/// stow, and the drift test refuses a sidecar that is not this emit's.
+#[must_use]
+pub fn poses() -> &'static PoseTable {
+    static POSES: std::sync::OnceLock<PoseTable> = std::sync::OnceLock::new();
+    POSES.get_or_init(|| {
+        reachy_edge::parse(LIBRARY_NAMES)
+            .expect("the sidecar this binary was built beside")
+            .1
+    })
+}
+
+/// How long the closing stow of a harness script takes, milliseconds.
+///
+/// The harness writes its own timeline — where the raise sits, where the fold
+/// sits, and the timeout the fold ends on — and that arithmetic needs the pace
+/// the machine will actually fold at. The number is the deployed library's pace
+/// for the stow, restated here because a pinned timeline is arithmetic over
+/// constants rather than over a lookup;
+/// `the_harness_timeline_is_paced_as_the_deployed_library_paces_it` holds it to
+/// the sidecar this binary was built beside.
+pub const STOW_DURATION_MS: u32 = 2000;
 
 /// The ordering number the one script carries.
 ///
@@ -65,7 +119,7 @@ pub const STOW_AFTER_MS: u64 = 16_000;
 /// on the stow rather than past it: the edge ends a stow-terminal script at the
 /// stow, and this timeout is that instant exactly — the legal boundary case,
 /// not one past it.
-pub const TIMEOUT_MS: u64 = 19_000;
+pub const TIMEOUT_MS: u64 = 18_000;
 
 /// The gesture as a script.
 ///
@@ -79,8 +133,8 @@ pub fn gesture(pod: &str) -> MotionScript {
         pod,
         ASK_SEQ,
         vec![
-            Step::new(UP_AFTER_MS, Posture::Up),
-            Step::new(STOW_AFTER_MS, Posture::Stow),
+            Step::new(UP_AFTER_MS, NEUTRAL_POSE),
+            Step::new(STOW_AFTER_MS, STOW_POSE),
         ],
         TIMEOUT_MS,
     )
@@ -100,10 +154,12 @@ pub fn body(pod: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use brenn_reachy__cogs__schedule_clk_rs::{PostureWire, StepKindWire};
+    use brenn_reachy__cogs__schedule_clk_rs::StepKindWire;
     use clockwork_rs::SyncTime;
-    use motion_proto::{MotionScript, Posture};
-    use reachy_edge::{Edge, EdgeConfig, MotionTable, STOW_DURATION_MS};
+    use motion_proto::{MotionScript, STOW_POSE};
+    use reachy_edge::{Edge, EdgeConfig, MotionTable};
+
+    use super::{STOW_DURATION_MS, poses};
 
     use reachy_motion::StillnessConfig;
     use scenario::{PERIOD_NS, engage_allowance_cycles, unjudgeable_step, up_clocks};
@@ -119,21 +175,21 @@ mod tests {
         assert_eq!(script.pod(), ASK_POD);
         assert_eq!(script.seq(), ASK_SEQ);
         assert_eq!(script.timeout_ms(), TIMEOUT_MS);
-        let offsets: Vec<(u64, Option<Posture>)> = script
+        let offsets: Vec<(u64, Option<&str>)> = script
             .steps()
             .iter()
             .map(|step| {
                 (
                     step.after_ms,
-                    step.action.base().and_then(motion_proto::Base::posture),
+                    step.action.base().and_then(motion_proto::Base::pose),
                 )
             })
             .collect();
         assert_eq!(
             offsets,
             vec![
-                (UP_AFTER_MS, Some(Posture::Up)),
-                (STOW_AFTER_MS, Some(Posture::Stow)),
+                (UP_AFTER_MS, Some(super::NEUTRAL_POSE)),
+                (STOW_AFTER_MS, Some(STOW_POSE)),
             ],
             "the analyzer reads a raise and a fold out of the log, in that order",
         );
@@ -236,7 +292,11 @@ mod tests {
 
     #[test]
     fn the_edge_compiles_it_into_the_schedule_the_analyzer_expects() {
-        let mut edge = Edge::new(EdgeConfig::for_pod(ASK_POD), MotionTable::default());
+        let mut edge = Edge::new(
+            EdgeConfig::for_pod(ASK_POD),
+            MotionTable::default(),
+            poses().clone(),
+        );
         let accepted = edge
             .accept(body(ASK_POD).as_bytes(), SyncTime::from_nanos(ARRIVAL_NS))
             .expect("the harness gesture passes every screen of the edge it drives");
@@ -244,7 +304,8 @@ mod tests {
         assert_eq!(accepted.seq, ASK_SEQ);
         assert_eq!(accepted.message.arrival(), SyncTime::from_nanos(ARRIVAL_NS));
 
-        let rows: Vec<(u32, u32, StepKindWire, PostureWire)> = accepted
+        let table = poses();
+        let rows: Vec<(u32, u32, StepKindWire, u16)> = accepted
             .message
             .steps()
             .iter()
@@ -253,15 +314,28 @@ mod tests {
                     step.after_ms(),
                     step.duration_ms(),
                     step.kind(),
-                    step.posture(),
+                    step.pose_id(),
                 )
             })
             .collect();
         assert_eq!(
             rows,
             vec![
-                (8000, 8000, StepKindWire::BASE_POSTURE, PostureWire::UP),
-                (16_000, 3000, StepKindWire::BASE_POSTURE, PostureWire::STOW),
+                (
+                    8000,
+                    8000,
+                    StepKindWire::BASE_POSTURE,
+                    table
+                        .resolve(super::NEUTRAL_POSE)
+                        .expect("the raise pose")
+                        .pose_id,
+                ),
+                (
+                    16_000,
+                    STOW_DURATION_MS,
+                    StepKindWire::BASE_POSTURE,
+                    table.stow().pose_id,
+                ),
             ],
             "raise at the arming budget, hold eight seconds so the hold can be judged, fold on \
              the configured stow, and end at the timeout",
@@ -272,9 +346,30 @@ mod tests {
         );
     }
 
+    /// The two numbers the gesture's timeline is arithmetic over, against the
+    /// library the payload carries.
+    ///
+    /// The harness states them as constants because a pinned timeline is what
+    /// its verdict means; that they are the machine's own paces is this case's
+    /// business, so a re-paced `stow.textproto` fails here rather than as a
+    /// hardware run whose fold ran past its step.
+    #[test]
+    fn the_harness_timeline_is_paced_as_the_deployed_library_paces_it() {
+        let table = poses();
+        assert_eq!(table.stow().duration_ms, STOW_DURATION_MS);
+        assert!(
+            table.resolve(super::NEUTRAL_POSE).is_some(),
+            "the emitted library holds the pose the harness raises to",
+        );
+    }
+
     #[test]
     fn a_second_ask_under_the_same_number_is_stale() {
-        let mut edge = Edge::new(EdgeConfig::for_pod(ASK_POD), MotionTable::default());
+        let mut edge = Edge::new(
+            EdgeConfig::for_pod(ASK_POD),
+            MotionTable::default(),
+            poses().clone(),
+        );
         let text = body(ASK_POD);
         edge.accept(text.as_bytes(), SyncTime::from_nanos(ARRIVAL_NS))
             .expect("the first ask");
