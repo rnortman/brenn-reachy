@@ -233,6 +233,11 @@ crate.spec(
 # spawns under -- so this tree fills in the seam and asks about it through the
 # one crate, rather than spelling either against a pin.
 #
+# `speech-surface` at this revision authors its scripts in the vocabulary
+# `//crates/motion-proto` states -- a base step names a pose in the deployed
+# library and may state its own pace -- which is what this tree's daemon
+# decodes.
+#
 # At this revision `speech-surface` takes `motion-proto` from an earlier
 # published brenn-reachy revision, so the fetched closure carries a second copy
 # of the wire contract beside `//crates/motion-proto` -- the same contract, some
@@ -254,7 +259,7 @@ crate.spec(
 # read.
 BRENN_POD_GIT = "https://github.com/rnortman/brenn-pod.git"
 
-BRENN_POD_REV = "ea6e0e4a08f5f0f8b40d49cd3de329dd3b50a481"
+BRENN_POD_REV = "4c35e60ffb3ac5cf68f2b0cf36b46cde7674a2b7"
 
 # Developing a seam that lands on both sides of this dependency arrow: replace
 # each spec's `git`/`rev` pair with `path = "../brenn-pod/<crate path>"` to

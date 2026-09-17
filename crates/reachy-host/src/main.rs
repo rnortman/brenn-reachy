@@ -541,18 +541,8 @@ fn follow(
 /// two opinions about which emit it is holding.
 fn names(settings: &HostSettings) -> Result<(MotionTable, PoseTable), String> {
     let path: &Path = &settings.library_names;
-    let text = std::fs::read_to_string(path).map_err(|error| {
-        format!(
-            "reading the library name table at {}: {error}",
-            path.display()
-        )
-    })?;
-    reachy_edge::parse(&text).map_err(|error| {
-        format!(
-            "the library name table at {} is not one this build can resolve names through: {error}",
-            path.display()
-        )
-    })
+    check::name_tables(path)
+        .map_err(|detail| format!("the library name table at {} {detail}", path.display()))
 }
 
 /// What this host is, as the first line of its stream.
@@ -1026,7 +1016,7 @@ mod tests {
         assert!(refused.contains("--check"), "{refused}");
     }
 
-    /// A host configuration this build reads, in `dir`, with its clip table.
+    /// A host configuration this build reads, in `dir`, with its name table.
     ///
     /// Named relative to `dir`, which is the base the cases below hand the
     /// check: what a payload's own configuration names, resolved the way the
@@ -1040,7 +1030,7 @@ mod tests {
              library_names_path: \"library.names.json\"\n",
         )
         .expect("a file");
-        std::fs::write(dir.join("library.names.json"), "{\"names\": []}\n").expect("a file");
+        std::fs::write(dir.join("library.names.json"), pose_fixture::SIDECAR).expect("a file");
         path
     }
 
@@ -1116,6 +1106,32 @@ mod tests {
                 .contains("brenn.bridge.token_file"),
             "{verdict}",
         );
+    }
+
+    #[test]
+    fn a_name_table_the_run_cannot_read_names_the_file_and_what_the_reader_said() {
+        // The sentence the run exits on, composed from the path this host was
+        // configured with and the loader's own fragment. The preflight says the
+        // same thing about the same file, so the two halves of the fragment have
+        // to read as one sentence wherever it is composed.
+        let dir = scratch_dir("reachy-host-names-unreadable");
+        let path = dir.join("library.names.json");
+        let settings = reachy_host::params::parse(&format!(
+            "pod: \"{POD}\"\nbody_cap_bytes: 8192\nlibrary_names_path: \"{}\"\n",
+            path.display(),
+        ))
+        .expect("a lawful parameter set");
+
+        let refusal = super::names(&settings).expect_err("no table is there to read");
+        assert!(
+            refusal.starts_with(&format!("the library name table at {} ", path.display())),
+            "{refusal}",
+        );
+        assert!(refusal.contains("cannot be read"), "{refusal}");
+
+        std::fs::write(&path, pose_fixture::SIDECAR).expect("a file");
+        let (_, poses) = super::names(&settings).expect("the fixture's own library");
+        assert!(poses.resolve(NEUTRAL_POSE).is_some(), "{poses:?}");
     }
 
     #[test]

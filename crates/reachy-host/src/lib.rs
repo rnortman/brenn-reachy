@@ -42,7 +42,7 @@ pub mod sinks;
 pub mod voice;
 pub mod words;
 
-pub use check::{Conclusion, conclusion_line, inspect, settled};
+pub use check::{Conclusion, conclusion_line, inspect, name_tables, settled};
 pub use edge::{Console, Speaker, Unspoken};
 pub use intents::{INTENT_BACKLOG, Intents, NotOffered, Waiting, queue};
 pub use params::{HostSettings, ParamsError, ParamsErrorKind, load, parse};

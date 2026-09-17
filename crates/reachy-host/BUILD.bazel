@@ -179,10 +179,7 @@ rust_library(
     testonly = True,
     srcs = ["testing/pose_fixture.rs"],
     edition = "2024",
-    deps = [
-        "//crates/motion-proto:motion_proto",
-        "//crates/reachy-edge:reachy_edge",
-    ],
+    deps = ["//crates/reachy-edge:reachy_edge"],
 )
 
 # The voice pipeline's third-party closure, linked. Every other target in this

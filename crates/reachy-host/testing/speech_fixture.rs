@@ -33,34 +33,77 @@ impl Events<'_> {
     fn sink(self) -> String {
         match self {
             Events::Dropped => String::from("\"none\""),
-            Events::File(path) => quoted(path),
+            Events::File(path) => quoted_path(path),
         }
     }
 }
 
-/// `path` as a TOML basic string.
+/// `text` as a TOML basic string.
 ///
-/// Every path this fixture writes into a configuration goes through here, so a
-/// path the loader would read back as something else — or refuse — fails at the
-/// fixture, naming the path, instead of surfacing as a parse error in whatever
+/// Every value this fixture writes into a configuration goes through here, so a
+/// value the loader would read back as something else — or refuse — fails at the
+/// fixture, naming the value, instead of surfacing as a parse error in whatever
 /// case happened to compose it. Rust's `Debug` escaping and TOML's agree only
 /// for text that needs no escape at all, so anything needing one is refused
 /// rather than escaped: a temporary directory is the test machine's, and one
-/// carrying a quote, a backslash, a control character or non-UTF-8 bytes is a
-/// machine this fixture cannot write a configuration for.
+/// carrying a quote, a backslash or a control character is a machine this
+/// fixture cannot write a configuration for.
+///
+/// # Panics
+///
+/// If the text carries a character TOML would spell differently.
+fn quoted(text: &str) -> String {
+    assert!(
+        !text.contains(['"', '\\']) && !text.contains(char::is_control),
+        "a value this fixture can write into TOML unescaped: {text:?}"
+    );
+    format!("\"{text}\"")
+}
+
+/// `path` as a TOML basic string, by [`quoted`]'s rule.
 ///
 /// # Panics
 ///
 /// If the path is not UTF-8 or carries a character TOML would spell differently.
-fn quoted(path: &Path) -> String {
+fn quoted_path(path: &Path) -> String {
     let text = path
         .to_str()
         .unwrap_or_else(|| panic!("a path this fixture can write into TOML: {path:?}"));
+    quoted(text)
+}
+
+/// Replace `anchor` with `replacement` in the configuration at `config`.
+///
+/// Every case that gives a written fixture something it did not ask for rewrites
+/// it this way, so the read-assert-replace-write shape is stated once. The
+/// anchor is asserted rather than assumed: a case that turns a setting on and
+/// silently gets a fixture without it still passes wherever it asserts the
+/// *absence* of a conclusion.
+///
+/// # Panics
+///
+/// If the file cannot be read back and rewritten, or does not carry the anchor.
+fn rewrite(config: &Path, anchor: &str, replacement: &str) {
+    let text = std::fs::read_to_string(config).expect("the fixture");
     assert!(
-        !text.contains(['"', '\\']) && !text.contains(char::is_control),
-        "a path this fixture can write into TOML unescaped: {text:?}"
+        text.contains(anchor),
+        "a fixture carrying {anchor:?} for this edit to land in: {config:?}"
     );
-    format!("\"{text}\"")
+    let text = text.replace(anchor, replacement);
+    std::fs::write(config, text).expect("a file");
+}
+
+/// Write `keys` into the fixture's `[table]`.
+///
+/// Into the table rather than appended to the file: a key after the last table
+/// belongs to that table, which is rarely the one a case means.
+///
+/// # Panics
+///
+/// If the file cannot be read back and rewritten, or carries no such table.
+fn into_table(config: &Path, table: &str, keys: &str) {
+    let header = format!("[{table}]\n");
+    rewrite(config, &header, &format!("{header}{keys}"));
 }
 
 /// How a fixture spells the paths of the files it names.
@@ -84,7 +127,7 @@ impl Naming {
     /// inside the fixture's directory.
     fn spell(self, path: &Path, name: &str) -> String {
         match self {
-            Naming::Absolute => quoted(path),
+            Naming::Absolute => quoted_path(path),
             Naming::PayloadRelative => format!("\"{name}\""),
         }
     }
@@ -241,45 +284,57 @@ const RECORDING_OFF: &str = "[record]\nenabled = false\n";
 /// block for the switch to go into, or if `dir` is a path this fixture cannot
 /// write into TOML.
 pub fn records(config: &Path, dir: &Path, cap_bytes: u64) {
-    let text = std::fs::read_to_string(config).expect("the fixture");
-    let recording = format!(
-        "[record]\nenabled = true\ndir = {}\ncap_bytes = {cap_bytes}\n",
-        quoted(dir),
+    // The switch itself is the anchor, not the table header: what a case asks
+    // for here is the block turned on, and a fixture already recording is not
+    // one this can write over.
+    rewrite(
+        config,
+        RECORDING_OFF,
+        &format!(
+            "[record]\nenabled = true\ndir = {}\ncap_bytes = {cap_bytes}\n",
+            quoted_path(dir),
+        ),
     );
-    // The anchor is asserted rather than assumed: a case that turns recording
-    // on and silently gets a fixture recording nothing still passes wherever it
-    // asserts the *absence* of a conclusion, which is what the two cases
-    // guarding the flash-write refusal do.
-    assert!(
-        text.contains(RECORDING_OFF),
-        "a fixture with a recording block to turn on: {config:?}"
-    );
-    let text = text.replace(RECORDING_OFF, &recording);
-    std::fs::write(config, text).expect("a file");
 }
 
 /// Give a written fixture's `[stt]` table the optional secondary gate.
 ///
 /// The floor is off by default, so the sentence a preflight prints about the
-/// gate has two shapes and this is what a case asks for the second one. Written
-/// into the table rather than appended to the file: a key after the last table
-/// belongs to that table, which here would be the bridge's.
+/// gate has two shapes and this is what a case asks for the second one.
 ///
 /// # Panics
 ///
 /// If the file cannot be read back and rewritten, or if it carries no `[stt]`
 /// table for the key to go into.
 pub fn declining_below(config: &Path, avg_logprob_min: f32) {
-    let text = std::fs::read_to_string(config).expect("the fixture");
-    assert!(
-        text.contains("[stt]\n"),
-        "a fixture with an [stt] table to put a gate floor in: {config:?}"
+    into_table(
+        config,
+        "stt",
+        &format!("avg_logprob_min = {avg_logprob_min:?}\n"),
     );
-    let text = text.replace(
-        "[stt]\n",
-        &format!("[stt]\navg_logprob_min = {avg_logprob_min:?}\n"),
+}
+
+/// Name the poses a written fixture's presence path raises to.
+///
+/// The two keys default to the same pose, so a fixture that says nothing names
+/// one pose twice and a case about a name the library lacks has nothing to
+/// change.
+///
+/// # Panics
+///
+/// If the file cannot be read back and rewritten, if it carries no `[brenn]`
+/// table for the keys to go into, or if either name is one TOML would read back
+/// as something else.
+pub fn presence_poses(config: &Path, wake: &str, turn: &str) {
+    into_table(
+        config,
+        "brenn",
+        &format!(
+            "presence_wake_pose = {}\npresence_turn_pose = {}\n",
+            quoted(wake),
+            quoted(turn),
+        ),
     );
-    std::fs::write(config, text).expect("a file");
 }
 
 /// The same fixture with a bus brain: the deployment whose alerts travel.

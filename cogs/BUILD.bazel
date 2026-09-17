@@ -1330,8 +1330,8 @@ merge_simplelaunch_config(
 #
 # Hand-written for the reason the harness twin is: the build updater renders the
 # production config from the system module and knows about no other. Three `srcs`
-# and no `data`: this composition wants no `proc`, `logger_proc` or prelaunch
-# entry, so the renderer's output is not a source here.
+# and no `data`: this composition wants no `proc`, `logger_proc` or Clockwork
+# prelaunch. The pod fragment supplies its chip reboot before these apps start.
 merge_simplelaunch_config(
     name = "robotcpu_record.textproto",
     srcs = [

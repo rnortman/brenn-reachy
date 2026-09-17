@@ -286,12 +286,24 @@ app {
   name: "pod"
   executable: "reachy_pod"
   args: "run"
+  args: "--chip-rebooted"
 }
 pre_launch {
   name: "clockwork_prelaunch"
   executable: "clockwork/launch/clockwork_prelaunch.sh"
 }
+pre_launch {
+  name: "pod_reboot_chip"
+  executable: "reachy_pod"
+  args: "reboot-chip"
+}
 CONFIG
+		if [ -n "${POD_NO_REBOOT:-}" ]; then
+			sed -i 's/name: "pod_reboot_chip"/name: "wrong_step"/' bazel-out/bin/robotcpu.textproto
+		fi
+		if [ -n "${POD_BARE_RUN:-}" ]; then
+			sed -i '/args: "--chip-rebooted"/d' bazel-out/bin/robotcpu.textproto
+		fi
 		cat >bazel-out/bin/robotcpu_harness.textproto <<CONFIG
 app {
   name: "${APP_CONTROL:-proc}"
@@ -329,8 +341,8 @@ pre_launch {
   executable: "clockwork/launch/clockwork_prelaunch.sh"
 }
 CONFIG
-		# The recording config: three apps and no prelaunch entry, because no
-		# Clockwork process runs in it and there is nothing to prepare.
+		# The recording config has no Clockwork prelaunch, but its pod still
+		# reboots the chip before the three apps start.
 		cat >bazel-out/bin/robotcpu_record.textproto <<'CONFIG'
 app {
   name: "recorder"
@@ -349,8 +361,17 @@ app {
   name: "pod"
   executable: "reachy_pod"
   args: "run"
+  args: "--chip-rebooted"
+}
+pre_launch {
+  name: "pod_reboot_chip"
+  executable: "reachy_pod"
+  args: "reboot-chip"
 }
 CONFIG
+		if [ -n "${RECORD_NO_REBOOT:-}" ]; then
+			sed -i 's/name: "pod_reboot_chip"/name: "wrong_step"/' bazel-out/bin/robotcpu_record.textproto
+		fi
 		if [ -n "${RECORD_MOTORD:-}" ]; then
 			cat >>bazel-out/bin/robotcpu_record.textproto <<'CONFIG'
 app {
@@ -2093,6 +2114,38 @@ APP_CONTROL=""
 result=$(build)
 assert_status "and the rendered names build" 0 "$(status_of "$result")"
 
+# The startup contract spans two launcher phases. A bare `run` reboots the
+# board under servo commissioning; a missing prelaunch skips the reset.
+mark_payload
+export POD_NO_REBOOT=1
+result=$(build)
+assert_status "production without the chip prelaunch refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the missing startup step" "$(output_of "$result")" \
+	"robotcpu.textproto starts the pod"
+assert_unstaged "a production startup race stages nothing"
+POD_NO_REBOOT=""
+
+mark_payload
+export POD_BARE_RUN=1
+result=$(build)
+assert_status "production that reboots twice refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the bare pod run" "$(output_of "$result")" \
+	"app pod reachy_pod run"
+assert_unstaged "a second reboot stages nothing"
+POD_BARE_RUN=""
+
+mark_payload
+export RECORD_NO_REBOOT=1
+result=$(build)
+assert_status "recording without the chip prelaunch refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the recording config" "$(output_of "$result")" \
+	"robotcpu_record.textproto starts the pod"
+assert_unstaged "an unreset recording payload stages nothing"
+RECORD_NO_REBOOT=""
+
+result=$(build)
+assert_status "both speech launchers with a single reset build" 0 "$(status_of "$result")"
+
 # The twin's whole reason for existing: it must not name the host. `--run`
 # starts the intent source itself, and a host merged into this config would bind
 # 7409 and 7410 alongside it, leaving the run's verdict to the kernel.
@@ -2745,8 +2798,8 @@ every_app=$(printf '%s\n%s\n' "$shipped_apps" "$record_shipped_apps" | tr ' ' '\
 for entry in host/host_launch.textproto driver/motord_launch.textproto \
 	pod/pod_launch.textproto host/host_record_launch.textproto \
 	bench/record_launch.textproto; do
-	app_name=$(sed -n 's/^ *name: "\([^"]*\)"$/\1/p' -- "${real_repo}/${entry}")
-	app_exe=$(sed -n 's/^ *executable: "\([^"]*\)"$/\1/p' -- "${real_repo}/${entry}")
+	app_name=$(sed -n '/^app {$/,/^}$/s/^ *name: "\([^"]*\)"$/\1/p' -- "${real_repo}/${entry}")
+	app_exe=$(sed -n '/^app {$/,/^}$/s/^ *executable: "\([^"]*\)"$/\1/p' -- "${real_repo}/${entry}")
 	if [ -z "$app_name" ] || [ -z "$app_exe" ]; then
 		fail "${entry} states an app name and an executable" \
 			"read name='${app_name}' executable='${app_exe}' -- the field spelling has moved"

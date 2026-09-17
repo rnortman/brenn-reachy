@@ -30,6 +30,13 @@
 //! for the whole run. Neither loader can see that; both files load. This is the
 //! only place before a robot where the two names meet.
 //!
+//! The presence poses are the same kind of comparison, across the same seam and
+//! in the other direction: the speech configuration names the pose each presence
+//! event takes, and the deployed library's name table — the file the host's own
+//! configuration points at — is what those names resolve through. A pose the
+//! library does not hold is a refused script at every raise, and neither side
+//! can see it alone.
+//!
 //! One rule here is stricter than the loader's: a path in the speech
 //! configuration must be relative. Every file that configuration names travels
 //! inside the payload and is named payload-relative, so an absolute path is a
@@ -48,9 +55,31 @@
 use std::path::{Path, PathBuf};
 
 use clockwork_rs::SyncTime;
+use reachy_edge::{MotionTable, PoseTable};
 use serde_json::json;
 
 use crate::params;
+
+/// The asset libraries' name tables at `path`, or a fragment saying why there
+/// are none.
+///
+/// One loader for the run and for the preflight. The sidecar is the seam this
+/// preflight exists to police, so a second reader of it — one refusing what the
+/// other admits, or saying it differently — is a preflight that can pass a file
+/// the run then refuses to start on.
+///
+/// The refusal is a sentence fragment naming no path: the caller knows which
+/// file it asked for and says so in its own voice.
+///
+/// # Errors
+///
+/// If the file cannot be read, or is not a document this build resolves names
+/// through.
+pub fn name_tables(path: &Path) -> Result<(MotionTable, PoseTable), String> {
+    let text = std::fs::read_to_string(path).map_err(|error| format!("cannot be read: {error}"))?;
+    reachy_edge::parse(&text)
+        .map_err(|error| format!("is not one this build resolves names through: {error}"))
+}
 
 /// One thing the check looked at, and what it found.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +159,12 @@ pub fn inspect(config: &Path, speech_config: Option<&Path>, base: &Path) -> Vec<
     // conclusion, and there is no second name to compare the first against.
     if let (Some(host), Some(voice)) = (host.as_ref(), voice.as_ref()) {
         found.push(addressee(host.edge.pod(), voice));
+        // Only a configuration with a `[brenn]` table runs the presence path,
+        // and only that path names poses. A host without one authors no raise
+        // and has nothing here to resolve.
+        if let Some(brenn) = voice.brenn.as_ref() {
+            found.push(commandable(&host.library_names, brenn, base));
+        }
     }
 
     let verdict = verdict(&found);
@@ -159,8 +194,7 @@ fn addressee(pod: &str, voice: &speech_surface::Config) -> Conclusion {
             ),
         };
     }
-    let listed: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
-    let listed = listed.join(", ");
+    let listed = listed(&names);
     if names.contains(&pod) {
         return Conclusion {
             kind: "addressee",
@@ -183,6 +217,104 @@ fn addressee(pod: &str, voice: &speech_surface::Config) -> Conclusion {
              script it authors"
         ),
     }
+}
+
+/// The subject of the conclusion about the presence poses.
+const PRESENCE_POSES: &str = "presence poses";
+
+/// Whether the poses the presence path names are ones the deployed library
+/// holds.
+///
+/// The scripter names a pose for each presence event and the edge resolves that
+/// name against the sidecar the two libraries were numbered by. A name the
+/// library does not hold is `CompileError::UnknownPose` at every raise: the head
+/// never moves, for the whole run, and nothing before this reads the two files
+/// together — the speech configuration validates only what the wire bounds, and
+/// the sidecar knows nothing about which names a scripter will ask for.
+///
+/// The sidecar is read here rather than taken from the caller because this is
+/// the only conclusion that needs its contents; `library_names_path`'s own
+/// conclusion above says whether the file is there, and this one says whether
+/// what is in it answers to the configuration beside it.
+fn commandable(
+    library_names: &Path,
+    brenn: &speech_surface::config::BrennConfig,
+    base: &Path,
+) -> Conclusion {
+    let at = base.join(library_names);
+    let named = [
+        ("presence_wake_pose", brenn.presence_wake_pose.as_str()),
+        ("presence_turn_pose", brenn.presence_turn_pose.as_str()),
+    ];
+    let poses = match read_poses(&at) {
+        Ok(poses) => poses,
+        Err(detail) => {
+            return Conclusion {
+                kind: "poses",
+                subject: PRESENCE_POSES.to_owned(),
+                held: false,
+                says: format!(
+                    "{}, and both resolve through {} — which {detail}",
+                    named
+                        .iter()
+                        .map(|(field, name)| format!("`{field}` names `{name}`"))
+                        .collect::<Vec<String>>()
+                        .join(" and "),
+                    at.display(),
+                ),
+            };
+        }
+    };
+    let missing: Vec<String> = named
+        .iter()
+        .filter(|(_, name)| poses.resolve(name).is_none())
+        .map(|(field, name)| format!("`{field}` names `{name}`"))
+        .collect();
+    if missing.is_empty() {
+        let resolved: Vec<String> = named
+            .iter()
+            .map(|(field, name)| {
+                let entry = poses.resolve(name).expect("a pose none of them missed");
+                format!("`{field}` names `{name}`, pose {}", entry.pose_id)
+            })
+            .collect();
+        return Conclusion {
+            kind: "poses",
+            subject: PRESENCE_POSES.to_owned(),
+            held: true,
+            says: format!("{}; {} numbers both", resolved.join(" and "), at.display(),),
+        };
+    }
+    let holds: Vec<&str> = poses.entries().map(|(name, _)| name).collect();
+    Conclusion {
+        kind: "poses",
+        subject: PRESENCE_POSES.to_owned(),
+        held: false,
+        says: format!(
+            "{}, which {} does not hold — it holds {}. The edge refuses a script naming a pose \
+             the deployed library lacks, so every raise this configuration authors would be \
+             refused and the head would not move all run",
+            missing.join(" and "),
+            at.display(),
+            listed(&holds),
+        ),
+    }
+}
+
+/// The pose table the sidecar at `at` states, or why there is none.
+///
+/// Through the loader the run itself uses, so the two never disagree about
+/// which documents resolve. Both failures read the same way to an operator —
+/// the run will not resolve a name through this file — so they are one sentence
+/// fragment rather than two conclusions.
+fn read_poses(at: &Path) -> Result<PoseTable, String> {
+    name_tables(at).map(|(_, poses)| poses)
+}
+
+/// `names` as a sentence lists them, each in backticks.
+fn listed(names: &[&str]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("`{name}`")).collect();
+    quoted.join(", ")
 }
 
 /// Whether every conclusion held.
@@ -477,10 +609,13 @@ mod tests {
         path
     }
 
-    /// A clip name table, at `name` inside `dir`.
+    /// The deployed libraries' name table, at `name` inside `dir`.
+    ///
+    /// The fixture's own two poses, which is what a configuration naming the
+    /// default `neutral` resolves against.
     fn library_names(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, "{\"names\": []}\n").expect("a file");
+        std::fs::write(&path, pose_fixture::SIDECAR).expect("a file");
         path
     }
 
@@ -1148,6 +1283,197 @@ mod tests {
             about(&found, "library_names_path")
                 .says
                 .contains("names names.json"),
+            "{found:?}",
+        );
+    }
+
+    #[test]
+    fn the_poses_the_presence_path_raises_to_are_looked_for_in_the_deployed_library() {
+        // Both keys named, and named differently, so a check that read one
+        // field twice says a pose this case did not ask about.
+        let dir = scratch_dir("reachy-host-check-poses");
+        let config = params(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        speech_fixture::presence_poses(&speech, "stow", pose_fixture::NEUTRAL_POSE);
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(settled(&found), "{found:?}");
+        let poses = about(&found, "presence poses");
+        assert_eq!(poses.kind, "poses", "{poses:?}");
+        assert!(
+            poses
+                .says
+                .contains("`presence_wake_pose` names `stow`, pose 2"),
+            "{poses:?}",
+        );
+        assert!(
+            poses
+                .says
+                .contains("`presence_turn_pose` names `neutral`, pose 0"),
+            "{poses:?}",
+        );
+    }
+
+    #[test]
+    fn a_presence_pose_the_deployed_library_does_not_hold_is_a_finding() {
+        // The failure this conclusion exists for: both files load, and every
+        // raise the run authors is refused at the edge.
+        let dir = scratch_dir("reachy-host-check-pose-missing");
+        let config = params(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        speech_fixture::presence_poses(&speech, "peek", pose_fixture::NEUTRAL_POSE);
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(!settled(&found), "{found:?}");
+        let poses = about(&found, "presence poses");
+        assert!(!poses.held, "{poses:?}");
+        assert!(
+            poses.says.contains("`presence_wake_pose` names `peek`"),
+            "{poses:?}",
+        );
+        // What the library does hold, so the operator's next edit is informed.
+        assert!(poses.says.contains("`neutral`, `stow`"), "{poses:?}");
+        assert!(
+            !poses.says.contains("`presence_turn_pose`"),
+            "the pose that resolves is not among the findings: {poses:?}",
+        );
+    }
+
+    #[test]
+    fn a_library_holding_neither_presence_pose_is_a_finding_naming_both() {
+        // The shape a deployment that renamed its whole library produces. Both
+        // keys are named, so the operator's next edit fixes both rather than
+        // finding the second one on the re-run.
+        let dir = scratch_dir("reachy-host-check-poses-missing-both");
+        let config = params(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        speech_fixture::presence_poses(&speech, "peek", "attentive");
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(!settled(&found), "{found:?}");
+        let poses = about(&found, "presence poses");
+        assert!(!poses.held, "{poses:?}");
+        assert!(
+            poses.says.contains(
+                "`presence_wake_pose` names `peek` and `presence_turn_pose` names `attentive`"
+            ),
+            "both missing names, joined: {poses:?}",
+        );
+        assert!(poses.says.contains("`neutral`, `stow`"), "{poses:?}");
+    }
+
+    #[test]
+    fn a_configuration_naming_no_presence_pose_is_checked_at_the_default() {
+        // The shipped shape: neither key set, so both events raise to the
+        // default pose and the conclusion is about that name twice.
+        let dir = scratch_dir("reachy-host-check-poses-default");
+        let config = params(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(settled(&found), "{found:?}");
+        let poses = about(&found, "presence poses");
+        assert!(poses.held, "{poses:?}");
+        assert!(
+            poses.says.contains(&format!(
+                "`presence_wake_pose` names `{name}`, pose 0 and `presence_turn_pose` names \
+                 `{name}`, pose 0",
+                name = pose_fixture::NEUTRAL_POSE,
+            )),
+            "{poses:?}",
+        );
+    }
+
+    #[test]
+    fn a_name_table_that_cannot_be_read_at_all_is_a_finding_about_the_poses_too() {
+        // No file where `library_names_path` names one: the conclusion about
+        // the path says so, and this one says which raises are unanswerable
+        // because of it, in the reader's own words.
+        let dir = scratch_dir("reachy-host-check-poses-unreadable");
+        let config = params(dir.as_ref(), "names.json");
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(!settled(&found), "{found:?}");
+        let poses = about(&found, "presence poses");
+        assert!(!poses.held, "{poses:?}");
+        assert!(
+            poses.says.contains("cannot be read"),
+            "the reader's own fragment: {poses:?}",
+        );
+        assert!(
+            poses
+                .says
+                .contains(&dir.join("names.json").display().to_string()),
+            "the file the raises would have resolved through: {poses:?}",
+        );
+    }
+
+    #[test]
+    fn a_name_table_the_poses_cannot_be_read_out_of_is_a_finding() {
+        // The file is there — `library_names_path` holds — and it is not a
+        // table this build resolves poses through. Nothing else looks inside
+        // it before a run.
+        let dir = scratch_dir("reachy-host-check-pose-table");
+        let config = params(dir.as_ref(), "names.json");
+        std::fs::write(dir.join("names.json"), "{\"motions\": []}\n").expect("a file");
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(!settled(&found), "{found:?}");
+        assert!(about(&found, "library_names_path").held, "{found:?}");
+        let poses = about(&found, "presence poses");
+        assert!(!poses.held, "{poses:?}");
+        assert!(poses.says.contains("resolves names through"), "{poses:?}",);
+    }
+
+    #[test]
+    fn a_configuration_with_no_presence_path_names_no_poses() {
+        // No `[brenn]` table, so nothing authors a raise and there is no name
+        // for this conclusion to be about.
+        let dir = scratch_dir("reachy-host-check-poseless");
+        let config = params(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::runnable_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+
+        let found = inspect(&config, Some(&speech), dir.as_ref());
+        assert!(settled(&found), "{found:?}");
+        assert!(
+            !found
+                .iter()
+                .any(|conclusion| conclusion.subject == "presence poses"),
             "{found:?}",
         );
     }

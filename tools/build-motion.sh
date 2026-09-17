@@ -296,6 +296,33 @@ check_launcher_apps() {
 		"a composition, or an app merged in under another name, has to be renamed there too."
 }
 
+# The chip reset must finish before the launcher starts any app, and the pod's
+# app must not reset it again. Read the rendered configs: checking only the
+# hand-written fragment would miss a merge that dropped its pre-launch half.
+check_pod_launch() {
+	local config=$1 wanted=$2 found
+	found=$(awk '
+		/^[[:space:]]*(app|pre_launch)[[:space:]]*\{/ {
+			kind = $1; name = ""; executable = ""; args = ""; inside = 1; next
+		}
+		inside && /^[[:space:]]*(name|executable|args):[[:space:]]*"/ {
+			value = $2; gsub(/"/, "", value)
+			if ($1 == "name:") name = value
+			if ($1 == "executable:") executable = value
+			if ($1 == "args:") args = args " " value
+		}
+		inside && /^[[:space:]]*\}/ {
+			if (name == "pod" || name == "pod_reboot_chip" || executable == "reachy_pod")
+				print kind " " name " " executable args
+			inside = 0
+		}
+	' "$config" | sort)
+	[ "$found" = "$wanted" ] || die \
+		"${config##*/} starts the pod as '${found:-nothing}'; expected '${wanted:-nothing}'." \
+		"Reboot the audio chip as a blocking pre-launch step, then attach without" \
+		"another reset; a reset under servo commissioning parks the machine."
+}
+
 # Everything Bazel knows about where the payload's files are, in two questions
 # through lib.sh's `bazel_files`.
 #
@@ -823,6 +850,10 @@ resolve_models
 check_launcher_apps "$launch_config_out" "${launcher_apps[@]}"
 check_launcher_apps "$harness_config_out" "${harness_apps[@]}"
 check_launcher_apps "$record_config_out" "${record_apps[@]}"
+pod_steps=$'app pod reachy_pod run --chip-rebooted\npre_launch pod_reboot_chip reachy_pod reboot-chip'
+check_pod_launch "$launch_config_out" "$pod_steps"
+check_pod_launch "$harness_config_out" ""
+check_pod_launch "$record_config_out" "$pod_steps"
 verify_aarch64 "$motord_out"
 verify_aarch64 "$host_out"
 # Asked of the pod binary the same way, and it is the one where the answer is in

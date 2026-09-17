@@ -271,7 +271,11 @@ Nothing has been released, and nothing here has driven a motor.
   edits before this build is deployed**: the host refuses a configuration that
   still names the removed field, and one that names no `library_names_path` at
   all. The edge now also refuses a script naming a pose the deployed library
-  does not hold, by the name the sidecar gives it.
+  does not hold, by the name the sidecar gives it --- and `reachy_host --check`
+  says so before the run starts: the preflight resolves the poses the speech
+  configuration's `presence_wake_pose` and `presence_turn_pose` name against
+  that sidecar, and refuses a payload whose two halves disagree about which
+  poses exist.
 
 - **The vendor's sleep pose is no longer the machine's stow.**
   `reachy_kin::stow_head_pose()` is renamed `sleep_head_pose()` and kept only
@@ -285,6 +289,17 @@ Nothing has been released, and nothing here has driven a motor.
 - **The head's envelope clearance floor is tighter.** The minimum toggle margin
   drops from 3 mm to 1.5 mm, half the worst rest settle measured on this unit.
   The recorded stow clears at 2.66 mm.
+
+- **The voice host names the head's pose for each presence event.**
+  `BRENN_POD_REV` moves to a host whose scripter authors base steps in the pose
+  vocabulary this tree publishes: a step names a pose the deployed library
+  holds and may state its own pace. Five optional `[brenn]` keys choose them
+  --- `presence_wake_pose` and `presence_turn_pose` for the poses a wake and a
+  dispatched utterance raise to, `presence_wake_move_ms`,
+  `presence_turn_move_ms` and `presence_stow_move_ms` for the pace of each,
+  absent which the library's own pace applies. The defaults are both
+  `neutral` with no stated pace, which is the behaviour of the revision before
+  it. Re-resolving `MODULE.bazel.lock` for this pin moved no third-party crate.
 
 - **The voice host barges in on the wake word, and wants the phrase written
   out.** `BRENN_POD_REV` moves to a host whose default barge-in rule cuts an
