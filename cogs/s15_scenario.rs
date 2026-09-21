@@ -42,7 +42,6 @@ use scenario::author::{Overlay, Step};
 use scenario::{ARRIVAL_SETTLE_CYCLES, LAG_K, cycle_at, run_end_cycle};
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
-use reachy_motion::ANTENNA_OUTBOARD;
 use reachy_motion::joints::{JointGroup, JointTargets};
 
 // The shape of an ordinary run, stated once for every scenario: where a run
@@ -157,7 +156,10 @@ pub fn antenna_rows() -> JointFlags {
 #[must_use]
 pub fn held_poses() -> [(&'static str, [f64; 2]); 3] {
     [
-        ("outboard", ANTENNA_OUTBOARD),
+        (
+            "outboard",
+            [-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2],
+        ),
         ("folded", scenario::pose_library().stow().1.antennas),
         ("raised again", scenario::neutral_pose().antennas),
     ]

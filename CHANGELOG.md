@@ -7,9 +7,71 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ## [Unreleased]
 
-Nothing has been released, and nothing here has driven a motor.
+Nothing has been released.
 
 ### Changed
+
+- **The command clearance floor is derived at 0.56 mm** from the largest
+  end-of-move leg residual measured over the committed pose library. Two
+  dedicated settle-evidence scripts walk every directed transition; the report
+  enforces an inclusive 18-count bound on those residuals per leg. The previous
+  1.5 mm figure was a de-torque settle measurement that answered a different
+  question; the derivation and evidence are in the source.
+
+- **Planned antenna moves take the shortest representable arc.** The previous
+  policy sent planned sweeps past the antenna's sideways point the long way
+  round, on the premise that the inboard arc was harmless. In use the inboard
+  arc is where antennas meet each other and the head, and it turned a small
+  change of direction into most of a full turn --- the mechanism behind the
+  demo's `antenna_obstructed` fault. Interference-aware planning waits on the
+  vendor's 3-D geometry; until then the shortest path is the honest policy and
+  content owns the allowed directions. The stow fold moves to the symmetric
+  evidenced directions at -3.32/3.32 rad.
+
+- **Two derived recorded poses and a directed transition gate.** `peek_tilt`
+  is the S007 recording lifted 2 mm; `hello` is S013 scaled 0.98 toward
+  neutral. Both are derived by the authoring tool, with the derivation in
+  the document. A transition matrix tests every 20 ms sample of every directed
+  minimum-jerk path between committed poses.
+
+- **Fault reports name which envelope checks failed.** `TickFault` carries a
+  16-bit evidence field encoding the individual violations --- per-leg
+  reachability, per-leg travel windows, toggle margin, body yaw, relative yaw,
+  head cone --- so a refusal says *which* check, not only how many.
+
+- **The brenn-pod cue pin advances to `46a4e5c`.** The voice surface can now
+  cue names from the deployed pose and motion library, preserve an active
+  motion through a reply, and withhold a stow while one plays. The
+  re-resolution moved `cc` 1.4.6 to 1.4.7, `find-msvc-tools` 0.1.12 to
+  0.1.13, and `unicode-ident` 1.0.25 to 1.0.26.
+
+### Added
+
+- **Declared clip bases.** A clip document may name the pose its frames are
+  authored over (a "posed" clip). Composition at full blend weight targets the
+  declared pose independently of whatever base the head happens to stand on,
+  so the same frames produce the same motion after any pose. A clip without a
+  declared base is an overlay, composed relative to the standing base as
+  before. The emitter resolves and bakes the anchor at emit time; a base
+  naming no committed pose refuses the emit.
+
+- **Arbitrary motion-script rehearsal.** `reachy-ask --script FILE` sends one
+  caller-supplied script through the real edge, with `--script-budget` printing
+  the launcher's backstop. The host harness and device runner carry the mode
+  end to end. A supplied-script report compares the run's commanded schedule
+  against the original request and measures settle per leg; fetched records
+  retain the names table the script was compiled against.
+
+- Four clips join the library: `hello_wave` (a posed whole-greeting recording
+  over `neutral`), `dance` (a 13-second posed recording with body-yaw sways
+  and mirrored antenna beats), and `wave_left` / `wave_right` (mirrored
+  antenna-only overlays that ride the standing base).
+
+- Posed antenna channels retain the representative and whole-turn choice made
+  when the channel comes in, holding it until fade-out; re-anchoring preserves
+  the posed base while unwinding unposed overlays. Clip provenance is tracked
+  per channel after sequence flattening, and posed samples fold before unposed
+  ones regardless of row order.
 
 - **The wake head is a site file, not a build fetch.** The wake gate's
   phrase-specific model --- the one that decides which words a unit answers to
@@ -21,8 +83,6 @@ Nothing has been released, and nothing here has driven a motor.
   phrase-independent openWakeWord graphs (melspectrogram, embedding) and Silero
   stay build-fetched. A recording configuration is held to agree with the site's
   on both `[wake]` keys, so a half-done swap is refused before it builds.
-
-### Added
 
 - **The speech run report says whether the servo bus answered.** On any run the
   driver counted a `read_misses`, a `blind_cycle` or a `health_miss`, the report
@@ -259,8 +319,6 @@ Nothing has been released, and nothing here has driven a motor.
   audible end, pairs starts and finishes by reply id, and correctly marks
   echo-overlapping carves. The underlying timing fix is in brenn-pod; this
   side carries the consumer changes and the pin bump.
-
-### Changed
 
 - **The voice host's name table carries the poses, and the stow clock is no
   longer a host parameter.** `host_params.textproto` renames `clip_names_path`

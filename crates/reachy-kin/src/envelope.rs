@@ -41,13 +41,25 @@
 //!
 //! ## The margin baseline
 //!
-//! The clearance floor is a floor on *commanded* poses, but the machine can
-//! come to rest below it — one documented resting configuration sits at 0.141 mm
-//! of clearance, a tenth of the floor. Refusing every command from there
-//! would leave the head stuck at its tightest. So a caller that knows the
-//! present pose's clearance passes it as `margin_baseline`, and a pose that
-//! strictly increases clearance is admissible even below the floor. Motion
-//! toward a singular configuration stays refused at every margin.
+//! Zero margin is an IK-root merge/dead centre. The 0.56 mm floor buys at least
+//! 7.9° at the outer merge and 13.2° at the inner merge. The largest end-of-
+//! move residual over every directed transition of the committed library at
+//! its committed pace was 17.4 counts: the six per-leg maxima were 16.7,
+//! 15.0, 16.1, 17.4, 15.5, and 7.4 counts, with a worst hold-end value of
+//! 13.7 counts and an armed-rest value of 9 counts. The 18-count (1.58°) bound
+//! makes the outer clearance five times the bound.
+//!
+//! The head was in contact with the body during those runs. No model in this
+//! tree detects that contact, so these are observed residuals of those machine
+//! runs, not a servo positioning-error measurement. Leg positioning error
+//! remains unmeasured. The separate 2-count figure belongs to the antennas'
+//! unloaded loop.
+//!
+//! The baked rest is the tightest configuration on record at 0.141 mm, but is
+//! outside four crank windows. Normal arming pins those cranks and leaves the
+//! held pose at 0.842 mm, above this floor. The baseline remains for an
+//! off-axis machine that arms inside every window below the floor: only strict
+//! improvement is admitted, while holding or tightening remains refused.
 
 use nalgebra::Isometry3;
 use thiserror::Error;
@@ -71,6 +83,9 @@ use crate::ik::{LegAngles, min_margin, solve_leg};
 /// modelled by any check in this crate. Collision geometry is published in the
 /// vendor's descriptions at three fidelities; until it is used, the relative
 /// yaw cap is what keeps commands far away from that band's interior.
+///
+/// TODO(head-body-interference): nothing here bounds the head against the body.
+/// The envelope needs the vendor's head/body geometry and a distance test.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EnvelopeConfig {
     /// Per-leg crank travel windows, radians, `(lower, upper)`, in servo order
@@ -89,17 +104,8 @@ pub struct EnvelopeConfig {
 
 impl Default for EnvelopeConfig {
     /// The vendor's published figures, with the tighter of the two relative-yaw
-    /// candidates, and a clearance floor of 1.5 mm.
-    ///
-    /// The floor is the clearance this tree has already reviewed a rest
-    /// against: half of the worst settle measured on this unit, which is the
-    /// same 1.5 mm the bench's resting-pose check was given. A rest the bench
-    /// accepts as sanely assembled is a pose the envelope admits commanding;
-    /// the two floors ask different questions and stay separate constants, so
-    /// this one states its own figure. It is also above the 1.17 mm
-    /// the crank stops leave at the top of vertical travel, so the floor is
-    /// what binds there rather than the stops. This machine's own rest sits
-    /// below it at 0.141 mm, which is what the margin baseline is for.
+    /// candidates, and a clearance floor of 0.56 mm. See the module-level
+    /// margin-baseline section for the derivation.
     fn default() -> Self {
         Self {
             crank_windows: core::array::from_fn(|leg| {
@@ -114,7 +120,7 @@ impl Default for EnvelopeConfig {
             // tighter one is the working cap until the axis is measured.
             relative_yaw_limit: 55.0_f64.to_radians(),
             head_cone_limit: 35.0_f64.to_radians(),
-            min_toggle_margin: 0.0015,
+            min_toggle_margin: 0.00056,
         }
     }
 }
@@ -149,6 +155,35 @@ impl EnvelopeViolations {
             || self.body_yaw
             || self.relative_yaw
             || self.cone
+    }
+
+    /// Encode each possible envelope failure as one stable bit.
+    #[must_use]
+    pub fn bits(&self) -> u16 {
+        let mut bits = 0;
+        for (index, failed) in self.unreachable.iter().enumerate() {
+            bits |= u16::from(*failed) << index;
+        }
+        for (index, failed) in self.window.iter().enumerate() {
+            bits |= u16::from(*failed) << (6 + index);
+        }
+        bits | (u16::from(self.margin) << 12)
+            | (u16::from(self.body_yaw) << 13)
+            | (u16::from(self.relative_yaw) << 14)
+            | (u16::from(self.cone) << 15)
+    }
+
+    /// Decode the stable bit layout emitted by [`Self::bits`].
+    #[must_use]
+    pub fn from_bits(bits: u16) -> Self {
+        Self {
+            unreachable: core::array::from_fn(|index| bits & (1 << index) != 0),
+            window: core::array::from_fn(|index| bits & (1 << (6 + index)) != 0),
+            margin: bits & (1 << 12) != 0,
+            body_yaw: bits & (1 << 13) != 0,
+            relative_yaw: bits & (1 << 14) != 0,
+            cone: bits & (1 << 15) != 0,
+        }
     }
 }
 
@@ -261,8 +296,9 @@ fn magnitude_outside(value: f64, limit: f64) -> bool {
 /// `head_pose_body` is the head pose relative to the body at zero yaw; a
 /// world-frame command composes through [`crate::yaw`] first. `margin_baseline`,
 /// when supplied, is the toggle margin of the pose the machine is presently at:
-/// a command whose margin strictly exceeds it is admitted even below the floor,
-/// which is what lets the head lift off a rest tighter than the floor.
+/// a command whose margin strictly exceeds it is admitted even below the floor.
+/// The baseline excuses only this margin check; windows and all other bounds
+/// remain independently enforced.
 ///
 /// The antennas are not arguments: nothing here bounds them, and a check that
 /// took them and said nothing about them would read like one that did.
@@ -364,8 +400,8 @@ mod tests {
     }
 
     /// The recorded tight resting configuration, raised or lowered by `dz`
-    /// metres. At `dz = 0` it carries 0.141 mm of clearance, far below the
-    /// floor.
+    /// metres. At `dz = 0` it carries 0.141 mm of clearance and four window
+    /// violations; the arming pin changes the held pose before commanding.
     fn rest_shifted(dz: f64) -> Isometry3<f64> {
         let mut pose = rest_head_pose();
         pose.translation.z += dz;
@@ -465,28 +501,23 @@ mod tests {
         assert_eq!(report.violations.unreachable, [false; 6]);
     }
 
-    /// The margin floor binds before the crank stops do on the way up: a height
-    /// inside every window is still refused for clearance alone.
+    /// At the top of vertical travel the crank windows bind before the floor.
     #[test]
-    fn the_clearance_floor_binds_before_the_crank_stops() {
+    fn the_top_pose_is_window_refused_with_margin_above_the_floor() {
         let floor = EnvelopeConfig::default().min_toggle_margin;
-        let (verdict, report) = check(&at_height(0.2000), 0.0, None);
+        let (verdict, report) = check(&at_height(0.2005), 0.0, None);
         assert!(verdict.is_err());
-        assert!(report.violations.margin);
-        assert_eq!(report.violations.window, [false; 6]);
+        assert!(!report.violations.margin);
+        assert!(report.violations.window.iter().any(|failed| *failed));
         assert_eq!(report.violations.unreachable, [false; 6]);
-        assert!(
-            report.min_margin > 0.0 && report.min_margin < floor,
-            "margin {}",
-            report.min_margin
-        );
+        assert!(report.min_margin > floor, "margin {}", report.min_margin);
     }
 
-    /// The baseline policy, on the configuration it exists for. From a rest at
-    /// 0.141 mm of clearance every command is below the floor, and the machine
-    /// would be stuck there without it.
+    /// The baked rest is refused by its margin and four crank windows, even if
+    /// its own margin is supplied as a baseline. A baseline never excuses a
+    /// window violation.
     #[test]
-    fn the_baseline_admits_a_lift_and_refuses_a_tightening() {
+    fn the_baked_rest_is_refused_for_margin_and_windows() {
         let floor = EnvelopeConfig::default().min_toggle_margin;
         let rest = rest_shifted(0.0);
         let baseline = min_pose_margin(&HeadGeometry::default(), &rest);
@@ -499,38 +530,79 @@ mod tests {
         let (verdict, report) = check(&rest, 0.0, None);
         assert!(verdict.is_err());
         assert!(report.violations.margin);
-
-        // A pose 1 mm higher is still far below the floor, but improves on the
-        // baseline, so it is admitted.
-        let lift = rest_shifted(0.001);
-        let (verdict, report) = check(&lift, 0.0, Some(baseline));
-        assert!(verdict.is_ok(), "{:?}", report.violations);
-        assert!(
-            report.min_margin > baseline && report.min_margin < floor,
-            "lifted margin {}",
-            report.min_margin
+        assert_eq!(
+            report.violations.window,
+            [true, true, false, false, true, true]
         );
 
-        // The same pose without the baseline is refused: the floor alone
-        // governs a target validated against nothing.
-        assert!(check(&lift, 0.0, None).0.is_err());
-
-        // Holding exactly still does not improve on the baseline and buys
-        // nothing, so it stays refused even with one.
         let (verdict, report) = check(&rest, 0.0, Some(baseline));
         assert!(verdict.is_err());
         assert!(report.violations.margin);
+        assert_eq!(
+            report.violations.window,
+            [true, true, false, false, true, true]
+        );
+
+        let lift = rest_shifted(0.001);
+        let (verdict, report) = check(&lift, 0.0, None);
+        assert!(verdict.is_ok(), "{:?}", report.violations);
+        assert_eq!(report.violations.window, [false; 6]);
+        assert!(
+            report.min_margin > floor,
+            "lifted margin {}",
+            report.min_margin
+        );
     }
 
-    /// A baseline never excuses anything but the clearance floor: dropping the
-    /// same distance the lift rose is refused, and a reach violation is refused
-    /// with a baseline as readily as without one.
+    /// The strict-improvement rule uses an explicit 1.5 mm fixture floor because
+    /// the default floor cannot host the required below-floor band.
     #[test]
-    fn the_baseline_excuses_only_the_clearance_floor() {
-        let drop = rest_shifted(-0.001);
-        let (verdict, report) = check(&drop, 0.0, Some(0.001));
-        assert!(verdict.is_err());
-        assert!(report.violations.margin);
+    fn the_baseline_admits_only_strict_improvement() {
+        let env = EnvelopeConfig {
+            min_toggle_margin: 0.0015,
+            ..EnvelopeConfig::default()
+        };
+        let geom = HeadGeometry::default();
+        let baseline_pose = rest_shifted(0.001);
+        let baseline = min_pose_margin(&geom, &baseline_pose);
+        let lift = rest_shifted(0.0011);
+        let tighten = rest_shifted(0.00099);
+        let check_fixture = |pose: &Isometry3<f64>| {
+            let mut report = EnvelopeReport::default();
+            check_envelope(&geom, &env, pose, 0.0, None, &mut report).ok();
+            assert_eq!(report.violations.unreachable, [false; 6]);
+            assert_eq!(report.violations.window, [false; 6]);
+            assert!(
+                !report.violations.body_yaw
+                    && !report.violations.relative_yaw
+                    && !report.violations.cone
+            );
+            assert!(baseline < env.min_toggle_margin);
+            report
+        };
+        let baseline_report = check_fixture(&baseline_pose);
+        let lift_report = check_fixture(&lift);
+        let tighten_report = check_fixture(&tighten);
+        assert!((baseline_report.min_margin - baseline).abs() < 1e-12);
+        assert!(
+            lift_report.min_margin > baseline && lift_report.min_margin < env.min_toggle_margin
+        );
+        assert!(tighten_report.min_margin < baseline);
+
+        let mut report = EnvelopeReport::default();
+        assert!(check_envelope(&geom, &env, &lift, 0.0, Some(baseline), &mut report).is_ok());
+        assert!(
+            check_envelope(
+                &geom,
+                &env,
+                &baseline_pose,
+                0.0,
+                Some(baseline),
+                &mut report
+            )
+            .is_err()
+        );
+        assert!(check_envelope(&geom, &env, &tighten, 0.0, Some(baseline), &mut report).is_err());
 
         let (verdict, report) = check(&at_height(0.2015), 0.0, Some(1.0));
         assert!(verdict.is_err());
@@ -751,7 +823,7 @@ mod tests {
                 "leg 1 outside its travel window",
             ),
             (
-                check(&at_height(0.2000), 0.0, None).1.violations,
+                check(&rest_shifted(0.00005), 0.0, None).1.violations,
                 "toggle margin below the floor",
             ),
             (
@@ -785,5 +857,74 @@ mod tests {
         assert_eq!(error.violations, report.violations);
         assert!(error.to_string().contains("leg 6 unreachable"));
         assert!(error.to_string().contains("toggle margin below the floor"));
+    }
+
+    #[test]
+    fn the_clearance_floor_has_the_stated_outer_merge_angle() {
+        let margin = EnvelopeConfig::default().min_toggle_margin;
+        let a = baked::CRANK_LEN;
+        let r = baked::ROD_LEN;
+        let rho = a + r - margin;
+        let angle = ((a * a + rho * rho - r * r) / (2.0 * a * rho)).acos();
+        assert!(
+            angle >= 7.9_f64.to_radians(),
+            "outer merge angle {angle} rad ({}) with margin {margin}",
+            angle.to_degrees()
+        );
+        let inner_rho = r - a + margin;
+        let inner_angle = ((a * a + inner_rho * inner_rho - r * r) / (2.0 * a * inner_rho)).acos();
+        let inner = (180.0 - inner_angle.to_degrees()).abs();
+        assert!(
+            (inner - 13.15).abs() < 0.02,
+            "inner merge angle {inner} degrees with margin {margin}"
+        );
+    }
+
+    #[test]
+    fn violation_bits_round_trip_every_layout() {
+        for bit in 0..16 {
+            let violations = EnvelopeViolations::from_bits(1 << bit);
+            assert_eq!(violations.bits(), 1 << bit);
+            let fields = [
+                violations.unreachable.iter().filter(|v| **v).count(),
+                violations.window.iter().filter(|v| **v).count(),
+                usize::from(violations.margin),
+                usize::from(violations.body_yaw),
+                usize::from(violations.relative_yaw),
+                usize::from(violations.cone),
+            ];
+            assert_eq!(fields.iter().sum::<usize>(), 1, "mask {bit}");
+        }
+        for bits in [0, 0b1010_0101_0011_1100, u16::MAX] {
+            assert_eq!(EnvelopeViolations::from_bits(bits).bits(), bits);
+        }
+        let mixed = EnvelopeViolations {
+            unreachable: [true, false, true, false, false, true],
+            window: [false, true, false, true, true, false],
+            margin: true,
+            body_yaw: false,
+            relative_yaw: true,
+            cone: false,
+        };
+        assert_eq!(EnvelopeViolations::from_bits(mixed.bits()), mixed);
+    }
+
+    #[test]
+    fn every_violation_bit_has_its_named_one_hot_field() {
+        for bit in 0..16 {
+            let mut expected = EnvelopeViolations::default();
+            match bit {
+                0..=5 => expected.unreachable[bit] = true,
+                6..=11 => expected.window[bit - 6] = true,
+                12 => expected.margin = true,
+                13 => expected.body_yaw = true,
+                14 => expected.relative_yaw = true,
+                15 => expected.cone = true,
+                _ => unreachable!(),
+            }
+            let mask = 1u16 << bit;
+            assert_eq!(expected.bits(), mask);
+            assert_eq!(EnvelopeViolations::from_bits(mask), expected);
+        }
     }
 }

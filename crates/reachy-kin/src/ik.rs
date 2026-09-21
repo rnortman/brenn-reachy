@@ -536,7 +536,10 @@ mod tests {
         assert!((min - 0.000_141_133).abs() < 1e-9, "min margin {min}");
 
         let sleep_min = min_pose_margin(&geom, &sleep_head_pose());
-        assert!(sleep_min > 40.0 * min, "sleep {sleep_min} vs rest {min}");
+        assert!(
+            sleep_min > 40.0 * min,
+            "sleep {sleep_min} vs the tight recorded rest {min}"
+        );
     }
 
     /// The angles this crate hands to the servos actually close the linkage:

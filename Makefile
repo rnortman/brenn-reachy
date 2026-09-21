@@ -91,6 +91,7 @@ help:
 	@echo "  make library-config  regenerate the clip and pose library assets from their documents"
 	@echo "  make clip-import   convert the fetched vendor recording sets (EMOTIONS=, DANCES=)"
 	@echo "  make motion-host-run  run the online system here, against the simulated plant"
+	@echo "  make motion-host-script SCRIPT=... [SETTLE_EVIDENCE=1]  rehearse one supplied script here"
 	@echo ""
 	@echo "Device targets — real hardware, no part of any gate. Need bazel, and a"
 	@echo "REACHY_HOST naming a reachable unit:"
@@ -105,6 +106,7 @@ help:
 	@echo "  make motion-fetch    bring a run's .olog directories back, timestamped"
 	@echo "  make library-run     play every motion in the library on the unit and judge it"
 	@echo "  make motion-probe    play one motion (MOTION=...) on the unit and judge it"
+	@echo "  make motion-script SCRIPT=... [SETTLE_EVIDENCE=1]  rehearse one supplied script on the unit"
 	@echo "  make speech-run      provision, build, push, run the voice pipeline; ^C ends it"
 	@echo "  make speech-provision  the pod's link credentials alone, via brenn-pod"
 	@echo "  make speech-fetch    bring a speech run's records back, timestamped"
@@ -589,6 +591,23 @@ motion-deploy: device-host motion-build
 .PHONY: motion-run
 motion-run: device-host motion-deploy require-bazel
 	tools/deploy-motion.sh $(REACHY_HOST) --run $(MOTION_RECORDS)
+
+.PHONY: motion-host-script
+motion-host-script:
+	@[ -z "$(SETTLE_EVIDENCE)" ] || [ "$(SETTLE_EVIDENCE)" = 1 ] || { echo "SETTLE_EVIDENCE must be empty or 1." >&2; exit 1; }
+	@[ -n "$(SCRIPT)" ] || { echo "SCRIPT is not set." >&2; exit 1; }
+	tools/host-motion-run.sh --script "$(SCRIPT)" $(if $(filter 1,$(SETTLE_EVIDENCE)),--settle-evidence,)
+
+.PHONY: motion-script
+motion-script: device-host require-bazel
+	@[ -z "$(SETTLE_EVIDENCE)" ] || [ "$(SETTLE_EVIDENCE)" = 1 ] || { echo "SETTLE_EVIDENCE must be empty or 1." >&2; exit 1; }
+	$(MAKE) require-motion-script
+	$(MAKE) motion-deploy
+	tools/deploy-motion.sh $(REACHY_HOST) --script $(MOTION_RECORDS) "$(SCRIPT)" $(if $(filter 1,$(SETTLE_EVIDENCE)),--settle-evidence,)
+
+.PHONY: require-motion-script
+require-motion-script:
+	@[ -n "$(SCRIPT)" ] || { echo "SCRIPT is not set, so there is no script to run." >&2; exit 1; }
 
 # Play the whole clip library on the unit at recorded pace, fetch and judge.
 #

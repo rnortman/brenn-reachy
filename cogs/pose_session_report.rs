@@ -58,13 +58,13 @@
 //! the envelope will not.
 //!
 //! `--as-pose` writes the same hold as a **pose** document instead: a whole base
-//! configuration rather than a delta, the antennas reduced to the directions
-//! they name, and the pace left at zero for the author to state. Holds only — a
-//! move has no place the machine stood. The envelope's verdict on the extracted
-//! pose is printed beside the draft, per leg and against the clearance floor,
-//! because whether a recorded rest is a pose this machine may be commanded to
-//! is the question the author is answering at that moment, and the answer is
-//! never an edited figure.
+//! configuration rather than a delta, and the antennas reduced to the
+//! directions they name. A derived pose carries its authored pace. Holds only —
+//! a move has no place the machine stood. The static envelope and, for a paced
+//! pose, directed transition verdicts are printed beside the draft, per leg and
+//! against the clearance floor, because whether a recorded rest is a pose this
+//! machine may be commanded to is the question the author is answering at that
+//! moment, and the answer is never an edited figure.
 //!
 //! The verdict is permissive in the way the speech analyzer's is. What an
 //! operator did with their hands decides what is in the stream, and this tool
@@ -80,6 +80,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use committed_poses::{Candidate, transition_verdict};
 use dxl_proto::conv::counts_to_rad;
 use nalgebra::Isometry3;
 use reachy_bench::poselog::{
@@ -1749,6 +1750,19 @@ struct Extract {
     /// another one: a base the recorder did not stand at is a draft nothing
     /// downstream can tell from a correct one.
     poses: PathBuf,
+    /// An optional authoring transformation applied to a still pose.
+    derivation: Option<PoseDerivation>,
+    /// The required pace for a derived pose.
+    duration_ms: Option<u32>,
+}
+
+/// A transformation from a recorded still to an authored pose.
+#[derive(Clone, Debug, PartialEq)]
+enum PoseDerivation {
+    /// Raise only the recorded head translation's Z coordinate.
+    Lift { mm: f64, spelling: String },
+    /// Scale translation and rotation toward the neutral pose.
+    Scale { factor: f64, spelling: String },
 }
 
 /// The default directory the `neutral` document is read from.
@@ -1790,6 +1804,8 @@ enum Extraction {
         doc: PoseDoc,
         /// What the envelope says about the pose, for the operator's terminal.
         verdict: String,
+        /// The transition verdict, rendered after the static envelope verdict.
+        transition: Option<String>,
     },
 }
 
@@ -1838,11 +1854,17 @@ impl Extraction {
             Self::Clip { doc, .. } => {
                 format!("{:?}, {} frame(s)", doc.name, doc.frames.len())
             }
-            Self::Pose { doc, verdict, .. } => {
-                format!(
-                    "{:?}, a pose; set duration_ms before committing it\n{verdict}",
-                    doc.name
-                )
+            Self::Pose {
+                doc,
+                verdict,
+                transition,
+                ..
+            } => {
+                let transition = transition
+                    .as_deref()
+                    .map(|text| format!("\n{text}"))
+                    .unwrap_or_default();
+                format!("{:?}, a pose\n{verdict}{transition}", doc.name)
             }
         }
     }
@@ -2009,11 +2031,61 @@ fn extract(
         check_asset_name(&doc.name).map_err(|error| {
             format!("pose name {name:?} is unusable: {error}. Name the draft yourself with --name")
         })?;
+        let mut doc = doc;
+        let mut transition = None;
+        if let Some(derivation) = &ask.derivation {
+            let session = records
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "session".to_owned());
+            match derivation {
+                PoseDerivation::Lift { mm, spelling } => {
+                    doc.dt[2] += mm / 1000.0;
+                    doc.description =
+                        format!("{} of {}, lifted {} mm", ask.segment, session, spelling);
+                }
+                PoseDerivation::Scale { factor, spelling } => {
+                    doc.dt.iter_mut().for_each(|value| *value *= factor);
+                    let rotation = doc.relative().rotation;
+                    let scaled = nalgebra::UnitQuaternion::identity().slerp(&rotation, *factor);
+                    let q = scaled.quaternion();
+                    doc.dq = [q.w, q.i, q.j, q.k];
+                    doc.description = format!(
+                        "{} of {}, head displacement scaled {} toward neutral",
+                        ask.segment, session, spelling
+                    );
+                }
+            }
+        }
+        if let Some(duration_ms) = ask.duration_ms {
+            doc.duration_ms = duration_ms;
+            let targets = JointTargets {
+                head_pose_body: doc.head_pose_body(),
+                body_yaw: doc.body_yaw,
+                antennas: doc.antennas,
+            };
+            let candidate = Candidate {
+                name: doc.name.clone(),
+                targets,
+                pace: std::time::Duration::from_millis(u64::from(doc.duration_ms)),
+            };
+            transition = Some(
+                match transition_verdict(
+                    committed_poses::library(),
+                    &committed_poses::tables().1,
+                    Some(&candidate),
+                ) {
+                    Ok(()) => "transition: ok".to_owned(),
+                    Err(error) => format!("transition: {error}"),
+                },
+            );
+        }
         let verdict = envelope_verdict(&doc);
         return Ok(Extraction::Pose {
             file: format!("pose-{}.textproto", ask.segment),
             doc,
             verdict,
+            transition,
         });
     }
     let frames: Vec<RecordedFrame> = if still {
@@ -2427,7 +2499,7 @@ fn invocation(args: impl Iterator<Item = String>) -> Result<Invocation, String> 
     const USAGE: &str = "usage: pose_session_report <records> --out <dir> \
 [--speed-window-ms MS] [--still-rad-s RAD_S] [--moving-rad-s RAD_S] [--min-still-ms MS] \
 [--extract <segment-id> [--name <asset name>] [--channels head,antennas,body_yaw] [--as-pose] \
-[--poses <dir>]]";
+[--lift-mm <mm> | --scale <k>] [--duration-ms <ms>] [--poses <dir>]]";
     let mut args = args.peekable();
     let records = args
         .next_if(|word| !word.starts_with("--"))
@@ -2439,6 +2511,9 @@ fn invocation(args: impl Iterator<Item = String>) -> Result<Invocation, String> 
     let mut channels: Option<ChannelMask> = None;
     let mut as_pose = false;
     let mut poses: Option<String> = None;
+    let mut lift: Option<(f64, String)> = None;
+    let mut scale: Option<(f64, String)> = None;
+    let mut duration_ms: Option<u32> = None;
     while let Some(flag) = args.next() {
         // No value argument: consumed before the next arm demands one.
         if flag == "--as-pose" {
@@ -2457,6 +2532,19 @@ fn invocation(args: impl Iterator<Item = String>) -> Result<Invocation, String> 
             "--extract" => segment = Some(value),
             "--name" => name = Some(value),
             "--poses" => poses = Some(value),
+            "--lift-mm" => lift = Some((number(&flag, &value)?, value)),
+            "--scale" => scale = Some((number(&flag, &value)?, value)),
+            "--duration-ms" => {
+                let parsed = value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        format!("--duration-ms wants positive whole milliseconds, not {value:?}")
+                    })?;
+                duration_ms = Some(parsed);
+            }
             // The channel spellings are the format's own, parsed by the format:
             // a tool with its own list parser is a tool that disagrees with the
             // document it writes.
@@ -2477,9 +2565,17 @@ fn invocation(args: impl Iterator<Item = String>) -> Result<Invocation, String> 
     // A draft's name and its mask mean nothing without a segment to cut, and a
     // run that quietly ignored them would write a session document the operator
     // then reads as a failed extraction.
-    if segment.is_none() && (name.is_some() || channels.is_some() || as_pose || poses.is_some()) {
+    let derivation_count = usize::from(lift.is_some()) + usize::from(scale.is_some());
+    if segment.is_none()
+        && (name.is_some()
+            || channels.is_some()
+            || as_pose
+            || poses.is_some()
+            || derivation_count > 0
+            || duration_ms.is_some())
+    {
         return Err(format!(
-            "--name, --channels, --as-pose and --poses are --extract's\n{USAGE}"
+            "--name, --channels, --as-pose and --poses are --extract's; --lift-mm, --scale and --duration-ms are too\n{USAGE}"
         ));
     }
     // A pose states every channel, so a mask is not something it can carry: a
@@ -2489,6 +2585,20 @@ fn invocation(args: impl Iterator<Item = String>) -> Result<Invocation, String> 
         return Err(format!(
             "--channels is a clip draft's; a pose states every channel\n{USAGE}"
         ));
+    }
+    if derivation_count > 1 {
+        return Err(format!(
+            "--lift-mm and --scale are mutually exclusive\n{USAGE}"
+        ));
+    }
+    if derivation_count > 0 && !as_pose {
+        return Err(format!("--lift-mm and --scale require --as-pose\n{USAGE}"));
+    }
+    if duration_ms.is_some() && !as_pose {
+        return Err(format!("--duration-ms requires --as-pose\n{USAGE}"));
+    }
+    if derivation_count > 0 && duration_ms.is_none() {
+        return Err(format!("a derived pose requires --duration-ms\n{USAGE}"));
     }
     Ok(Invocation {
         records: PathBuf::from(records),
@@ -2502,6 +2612,12 @@ fn invocation(args: impl Iterator<Item = String>) -> Result<Invocation, String> 
             channels: channels.unwrap_or_else(ChannelMask::all),
             as_pose,
             poses: poses.map_or_else(|| PathBuf::from(POSE_DIR), PathBuf::from),
+            derivation: lift
+                .map(|(mm, spelling)| PoseDerivation::Lift { mm, spelling })
+                .or_else(|| {
+                    scale.map(|(factor, spelling)| PoseDerivation::Scale { factor, spelling })
+                }),
+            duration_ms,
         }),
     })
 }
@@ -2672,8 +2788,9 @@ mod tests {
 
     use super::{
         Analysis, ChannelMask, DocKind, Document, Endpointer, Extract, Extraction, Hole,
-        Invocation, PERIOD_MS, POSE_DIR, ROW_COUNT, Sample, Stream, Voice, analyze, base_pose,
-        hole_in, holes, invocation, off_grid_frame, run, stamp, timeline, write_draft, write_out,
+        Invocation, PERIOD_MS, POSE_DIR, PoseDerivation, ROW_COUNT, Sample, Stream, Voice, analyze,
+        base_pose, hole_in, holes, invocation, off_grid_frame, run, stamp, timeline, write_draft,
+        write_out,
     };
 
     /// Where the committed pose documents are for a test run: the directory
@@ -2952,6 +3069,8 @@ mod tests {
                 channels: ChannelMask::all(),
                 as_pose: false,
                 poses: pose_dir(),
+                derivation: None,
+                duration_ms: None,
             }),
         )
         .extraction
@@ -2969,6 +3088,8 @@ mod tests {
                 channels: ChannelMask::all(),
                 as_pose: true,
                 poses: pose_dir(),
+                derivation: None,
+                duration_ms: None,
             }),
         )
         .extraction
@@ -4338,6 +4459,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn derived_pose_flags_are_parsed_and_restricted() {
+        for derivation in ["--lift-mm", "--scale"] {
+            let missing = invocation(
+                [
+                    "records",
+                    "--out",
+                    "somewhere",
+                    "--extract",
+                    "S001",
+                    "--as-pose",
+                    derivation,
+                    "2",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .err()
+            .expect("a derived pose needs a pace");
+            assert!(missing.contains("requires --duration-ms"), "{missing}");
+        }
+        let both = invocation(
+            [
+                "records",
+                "--out",
+                "somewhere",
+                "--extract",
+                "S001",
+                "--as-pose",
+                "--lift-mm",
+                "2",
+                "--scale",
+                "0.9",
+                "--duration-ms",
+                "1000",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .err()
+        .expect("both derivations are refused");
+        assert!(both.contains("mutually exclusive"), "{both}");
+
+        let parsed = invocation(
+            [
+                "records",
+                "--out",
+                "somewhere",
+                "--extract",
+                "S001",
+                "--as-pose",
+                "--scale",
+                "0.98",
+                "--duration-ms",
+                "1000",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("a derived pose is valid");
+        let ask = parsed.extract.expect("the extraction is present");
+        assert_eq!(ask.duration_ms, Some(1000));
+        assert_eq!(
+            ask.derivation,
+            Some(PoseDerivation::Scale {
+                factor: 0.98,
+                spelling: "0.98".to_owned()
+            })
+        );
+    }
+
     /// The timeline's own clock, which every line of the artefact an operator
     /// reads first is stamped with — and which no fixture session runs long
     /// enough to exercise past five seconds.
@@ -5062,11 +5254,21 @@ mod tests {
     fn a_hold_outside_the_envelope_drafts_with_its_violation() {
         let at = scratch_dir("pose-session-draft-pose-refused");
         let records = at.join("session");
-        // Near the top of vertical travel, where the linkage's clearance falls
-        // under the floor a document is held to: reachable, and not a pose this
-        // machine may be commanded to.
-        let tight = Isometry3::translation(0.0, 0.0, 0.2000);
-        session_holding(&records, &tight, Extras::default());
+        // Keep this fixture still so its synthetic move does not require a
+        // second pose outside the solver's recorded branch.
+        let mut tight = reachy_kin::rest_head_pose();
+        tight.translation.z += 0.0001;
+        let mut held = neutral_reading();
+        held.legs = cranks_at(&tight).legs;
+        fixture_with(
+            &records,
+            &held,
+            &held,
+            Extras {
+                no_hole: true,
+                ..Extras::default()
+            },
+        );
 
         let drafted =
             as_pose(&records, "S001", Some("tight")).expect("a refused pose still drafts");
@@ -5074,6 +5276,10 @@ mod tests {
         assert!(
             verdict.contains("clearance") || verdict.contains("margin"),
             "the verdict names the violation: {verdict}"
+        );
+        assert!(
+            verdict.contains("travel window"),
+            "the verdict names windows: {verdict}"
         );
         assert!(!verdict.contains("envelope: ok"), "{verdict}");
         let margin = reachy_kin::ik::min_pose_margin(default_geometry(), &doc.head_pose_body());
@@ -5157,6 +5363,8 @@ mod tests {
                 channels: ChannelMask::all(),
                 as_pose: false,
                 poses: pose_dir(),
+                derivation: None,
+                duration_ms: None,
             }),
         );
         let drafted = analysis
@@ -5176,6 +5384,7 @@ mod tests {
             "one frame per reading of the move"
         );
         assert_eq!(drafted.clip().name, "recorded/wake/raise", "--name is used");
+        assert_eq!(drafted.clip().base, None);
         assert!(
             drafted
                 .clip()
@@ -5241,6 +5450,8 @@ mod tests {
                 channels: ChannelMask::of(Channel::Antennas),
                 as_pose: false,
                 poses: pose_dir(),
+                derivation: None,
+                duration_ms: None,
             }),
         )
         .extraction
@@ -5280,6 +5491,8 @@ mod tests {
                 channels: ChannelMask::all(),
                 as_pose: false,
                 poses: empty.as_ref().to_path_buf(),
+                derivation: None,
+                duration_ms: None,
             }),
         )
         .extraction
@@ -5302,6 +5515,8 @@ mod tests {
                 channels: ChannelMask::all(),
                 as_pose: false,
                 poses: garbled.as_ref().to_path_buf(),
+                derivation: None,
+                duration_ms: None,
             }),
         )
         .extraction
@@ -5345,6 +5560,8 @@ mod tests {
                 channels: ChannelMask::all(),
                 as_pose: false,
                 poses: pose_dir(),
+                derivation: None,
+                duration_ms: None,
             }),
         )
         .extraction
@@ -6268,6 +6485,8 @@ mod tests {
                 channels: ChannelMask::all(),
                 as_pose: false,
                 poses: pose_dir(),
+                derivation: None,
+                duration_ms: None,
             }),
         };
 

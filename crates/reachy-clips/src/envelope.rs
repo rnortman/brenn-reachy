@@ -1,15 +1,15 @@
 //! The import-time envelope walk: what a clip's frames have to satisfy before
 //! the clip loads at all.
 //!
-//! One pass over the frame track, every frame taken over a **static neutral
-//! base**, which is the context a recording was made in. Two questions per
-//! frame, both geometric:
+//! One pass over the frame track. Unposed frames are screened over a **static
+//! neutral base**; posed frames use their declared base only for the channels
+//! they drive. Two questions per frame, both geometric:
 //!
-//! - does the frame's head pose, at the frame's body yaw, pass the envelope
+//! - does a frame that drives head or body yaw pass the coupled head envelope
 //!   check — reachable, every crank inside its travel window, clear of the
 //!   linkage's singular configurations, inside the yaw cap and the attitude
 //!   cone;
-//! - is every antenna angle one a goal register can represent.
+//! - when present, is every antenna angle one a goal register can represent.
 //!
 //! A frame that fails either is a pose this machine cannot hold standing still,
 //! so the clip is refused. Nothing is projected, trimmed or slowed to make it
@@ -24,6 +24,8 @@
 //! composed setpoint is commanded as asked, and the envelope above is the only
 //! screen content faces.
 //!
+//! Full-weight screening is exact only when both coupled head/yaw channels are
+//! driven. Blends and masked pairs remain protected by the per-tick check.
 //! What the envelope does not answer is play-time: a delta that is inside the
 //! envelope over neutral can be outside it over a lifted or yawed base, and the
 //! per-tick envelope check on the composed target is what holds there.
@@ -73,7 +75,7 @@ impl ClipLimits {
 /// Each of these refuses the whole clip. They are content faults: the recording
 /// asks for something this machine cannot hold even standing still, so no ramp
 /// and no playback makes it reachable.
-#[derive(Clone, Copy, Debug, Error, PartialEq)]
+#[derive(Clone, Debug, Error, PartialEq)]
 pub enum FrameError {
     /// A frame's deltas, applied to the neutral base, leave the envelope.
     #[error("frame {frame} leaves the envelope over the neutral base: {violations}")]
@@ -81,6 +83,13 @@ pub enum FrameError {
         /// Which frame.
         frame: usize,
         /// Everything that frame's pose failed.
+        violations: EnvelopeViolations,
+    },
+    /// A posed frame leaves the envelope over its authored base.
+    #[error("frame {frame} leaves the envelope over base {base:?}: {violations}")]
+    AnchoredEnvelope {
+        frame: usize,
+        base: String,
         violations: EnvelopeViolations,
     },
     /// A frame asks an antenna for an angle no goal register represents.
@@ -93,9 +102,19 @@ pub enum FrameError {
         /// The commanded angle, radians.
         angle: f64,
     },
+    /// A posed frame asks an antenna for an unrepresentable absolute angle.
+    #[error(
+        "frame {frame} over base {base:?} commands antenna {side} to {angle} rad, which has no goal count"
+    )]
+    AnchoredAntennaGoal {
+        frame: usize,
+        base: String,
+        side: usize,
+        angle: f64,
+    },
 }
 
-/// Walk a clip's frames over the neutral base, refusing the clip on the first
+/// Walk a clip's frames over their base, refusing the clip on the first
 /// frame this machine could not hold there.
 ///
 /// `frames` must be non-empty and must carry exactly the channels the clip masks
@@ -104,56 +123,84 @@ pub enum FrameError {
 /// # Panics
 ///
 /// If `frames` is empty.
-pub fn check_frames(frames: &[DeltaFrame], limits: &ClipLimits) -> Result<(), FrameError> {
+pub fn check_frames(
+    frames: &[DeltaFrame],
+    anchor: Option<&crate::format::ResolvedAnchor>,
+    limits: &ClipLimits,
+) -> Result<(), FrameError> {
     assert!(!frames.is_empty(), "a clip has frames");
 
     for (index, frame) in frames.iter().enumerate() {
-        check_frame(index, frame, limits)?;
+        check_frame(index, frame, anchor, limits)?;
     }
     Ok(())
 }
 
-/// One frame over the neutral base, refusing a frame this machine could not hold
-/// there.
-fn check_frame(index: usize, frame: &DeltaFrame, limits: &ClipLimits) -> Result<(), FrameError> {
-    let body_yaw = frame.body_yaw.unwrap_or(0.0);
-    let antennas = frame.antennas.unwrap_or([0.0, 0.0]);
-    for (side, angle) in antennas.iter().enumerate() {
-        if !(ANTENNA_GOAL_MIN_RAD..=ANTENNA_GOAL_MAX_RAD).contains(angle) {
-            return Err(FrameError::AntennaGoal {
-                frame: index,
-                side,
-                angle: *angle,
-            });
+/// One frame over its base, refusing a frame this machine could not hold there.
+fn check_frame(
+    index: usize,
+    frame: &DeltaFrame,
+    anchor: Option<&crate::format::ResolvedAnchor>,
+    limits: &ClipLimits,
+) -> Result<(), FrameError> {
+    let (base_name, base_head, base_yaw, base_antennas) = match anchor {
+        Some(anchor) => (
+            Some(anchor.name().to_owned()),
+            anchor.targets().head_pose_body,
+            anchor.targets().body_yaw,
+            anchor.targets().antennas,
+        ),
+        None => (None, neutral_head_pose(), 0.0, [0.0, 0.0]),
+    };
+    if let Some(antennas) = frame.antennas {
+        for (side, delta) in antennas.iter().enumerate() {
+            let angle = base_antennas[side] + delta;
+            if !(ANTENNA_GOAL_MIN_RAD..=ANTENNA_GOAL_MAX_RAD).contains(&angle) {
+                return Err(match base_name {
+                    Some(base) => FrameError::AnchoredAntennaGoal {
+                        frame: index,
+                        base,
+                        side,
+                        angle,
+                    },
+                    None => FrameError::AntennaGoal {
+                        frame: index,
+                        side,
+                        angle,
+                    },
+                });
+            }
         }
     }
+    if frame.head.is_none() && frame.body_yaw.is_none() {
+        return Ok(());
+    }
+    let pose = frame.head.map_or(base_head, |head| {
+        base_head * interpolate_pose(&Isometry3::identity(), &head, 1.0)
+    });
+    let absolute_yaw = base_yaw + frame.body_yaw.unwrap_or(0.0);
 
     let mut report = EnvelopeReport::default();
-    let pose = pose_at(frame);
     match check_envelope(
         &limits.geom,
         &limits.env,
         &pose,
-        body_yaw,
+        absolute_yaw,
         None,
         &mut report,
     ) {
         Ok(()) => Ok(()),
-        Err(error) => Err(FrameError::Envelope {
-            frame: index,
-            violations: error.violations,
+        Err(error) => Err(match base_name {
+            Some(base) => FrameError::AnchoredEnvelope {
+                frame: index,
+                base,
+                violations: error.violations,
+            },
+            None => FrameError::Envelope {
+                frame: index,
+                violations: error.violations,
+            },
         }),
-    }
-}
-
-/// The head pose one frame's delta puts the head at over the neutral base.
-///
-/// The same right-multiplication [`crate::compose`] performs, against the one
-/// base the walk knows about.
-fn pose_at(frame: &DeltaFrame) -> Isometry3<f64> {
-    match frame.head {
-        Some(head) => neutral_head_pose() * interpolate_pose(&Isometry3::identity(), &head, 1.0),
-        None => neutral_head_pose(),
     }
 }
 
@@ -205,7 +252,8 @@ mod tests {
     fn a_frame_outside_the_envelope_refuses_the_clip() {
         // Well past the 35° cone bound.
         let frames = [pitch(0.0), pitch(80.0)];
-        let error = check_frames(&frames, &ClipLimits::default()).expect_err("outside the cone");
+        let error =
+            check_frames(&frames, None, &ClipLimits::default()).expect_err("outside the cone");
         match error {
             FrameError::Envelope { frame, violations } => {
                 assert_eq!(frame, 1);
@@ -218,7 +266,8 @@ mod tests {
     #[test]
     fn a_body_yaw_past_its_bound_refuses_the_clip() {
         let frames = [yaw(0.0), yaw(3.0)];
-        let error = check_frames(&frames, &ClipLimits::default()).expect_err("past the yaw bound");
+        let error =
+            check_frames(&frames, None, &ClipLimits::default()).expect_err("past the yaw bound");
         assert!(matches!(
             error,
             FrameError::Envelope { frame: 1, violations } if violations.body_yaw
@@ -231,7 +280,7 @@ mod tests {
             antennas(0.0, 0.0),
             antennas(ANTENNA_GOAL_MAX_RAD * 2.0, 0.0),
         ];
-        let error = check_frames(&frames, &ClipLimits::default()).expect_err("no goal count");
+        let error = check_frames(&frames, None, &ClipLimits::default()).expect_err("no goal count");
         assert!(matches!(
             error,
             FrameError::AntennaGoal {
@@ -247,7 +296,7 @@ mod tests {
     #[test]
     fn a_track_that_moves_faster_than_our_own_moves_do_still_walks() {
         let frames = [antennas(0.0, 0.0), antennas(1.2, -1.2), lift(0.01)];
-        check_frames(&frames, &ClipLimits::default()).expect("inside the envelope");
+        check_frames(&frames, None, &ClipLimits::default()).expect("inside the envelope");
     }
 
     /// A frame the linkage cannot reach at all is refused as such, whatever the
@@ -255,8 +304,8 @@ mod tests {
     #[test]
     fn a_frame_with_no_crank_solution_refuses_the_clip() {
         let frames = [lift(0.5)];
-        let error =
-            check_frames(&frames, &ClipLimits::default()).expect_err("the linkage cannot reach it");
+        let error = check_frames(&frames, None, &ClipLimits::default())
+            .expect_err("the linkage cannot reach it");
         assert!(matches!(error, FrameError::Envelope { frame: 0, .. }));
     }
 
@@ -267,15 +316,58 @@ mod tests {
     #[test]
     fn the_walk_answers_to_the_limits_it_is_handed() {
         let frames = [pitch(20.0)];
-        check_frames(&frames, &ClipLimits::default()).expect("inside the shipped cone");
+        check_frames(&frames, None, &ClipLimits::default()).expect("inside the shipped cone");
 
         let mut cfg = MotionConfig::default();
         cfg.env.head_cone_limit = 10.0_f64.to_radians();
         let tight = ClipLimits::from_motion_config(&cfg);
-        let error = check_frames(&frames, &tight).expect_err("outside the configured cone");
+        let error = check_frames(&frames, None, &tight).expect_err("outside the configured cone");
         assert!(matches!(
             error,
             FrameError::Envelope { frame: 0, violations } if violations.cone
+        ));
+    }
+
+    #[test]
+    fn posed_screening_checks_only_driven_channels_and_their_coupled_base() {
+        let invalid_head = reachy_kin::geometry::rest_head_pose();
+        let antenna_anchor = crate::format::ResolvedAnchor {
+            name: "antennas-only".to_owned(),
+            targets: reachy_motion::JointTargets {
+                head_pose_body: invalid_head,
+                antennas: [0.0, 0.0],
+                ..Default::default()
+            },
+        };
+        check_frames(
+            &[antennas(0.0, 0.0)],
+            Some(&antenna_anchor),
+            &ClipLimits::default(),
+        )
+        .expect("an antennas-only frame does not screen the anchor head");
+
+        let head_anchor = crate::format::ResolvedAnchor {
+            name: "head-only".to_owned(),
+            targets: reachy_motion::JointTargets {
+                antennas: [ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD],
+                ..Default::default()
+            },
+        };
+        check_frames(&[lift(0.0)], Some(&head_anchor), &ClipLimits::default())
+            .expect("a head-only frame does not screen anchor antennas");
+
+        let yaw_anchor = crate::format::ResolvedAnchor {
+            name: "yaw-only".to_owned(),
+            targets: reachy_motion::JointTargets {
+                head_pose_body: invalid_head,
+                ..Default::default()
+            },
+        };
+        let error = check_frames(&[yaw(0.0)], Some(&yaw_anchor), &ClipLimits::default())
+            .expect_err("yaw drives the coupled head check using its anchor head");
+        assert!(matches!(
+            error,
+            FrameError::AnchoredEnvelope { frame: 0, base, .. } if base == "yaw-only"
         ));
     }
 
@@ -285,6 +377,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "a clip has frames")]
     fn a_walk_over_no_frames_is_a_caller_bug() {
-        let _ = check_frames(&[], &ClipLimits::default());
+        let _ = check_frames(&[], None, &ClipLimits::default());
     }
 }

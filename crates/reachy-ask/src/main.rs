@@ -39,6 +39,7 @@
 #![forbid(unsafe_code)]
 
 mod gesture;
+mod script;
 mod tour;
 mod watch;
 
@@ -59,6 +60,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 
 use gesture::{ASK_POD, body};
+use script::ScriptPlan;
 use tour::{
     END_MARGIN_MS, LAUNCHER_CONTROL, Leg, PROBE_PREFIX, QUIT_CONNECT_WINDOW, RELEASE_ALLOWANCE_MS,
     Tour, quit_launcher, select,
@@ -103,6 +105,10 @@ enum Mode {
     /// sidecar holds, and exit. Runs on the workstation, where there is no
     /// machine.
     Table(PathBuf),
+    /// One caller-supplied script.
+    Script(PathBuf),
+    /// Print one caller-supplied script's launcher budget.
+    ScriptBudget(PathBuf),
 }
 
 /// What the invocation asked for.
@@ -143,6 +149,8 @@ fn usage() -> String {
          \x20      reachy-ask --tour SIDECAR [--motion NAME] [--resting-timeout SECONDS]\n\
          \x20      reachy-ask --tour-budget SIDECAR [--motion NAME]\n\
          \x20      reachy-ask --tour-table SIDECAR [--motion NAME]\n\
+         \x20      reachy-ask --script FILE [--resting-timeout SECONDS]\n\
+         \x20      reachy-ask --script-budget FILE\n\
          \n\
          Binds {REPORTS_OUT_PORT} on loopback, waits for the session to narrate that it\n\
          commissioned, sends compiled scripts to {SCRIPTS_IN_PORT}, and narrates the story.\n\
@@ -192,6 +200,8 @@ fn main() -> ExitCode {
                 Mode::Tour(sidecar) => tour_run(&options, sidecar),
                 Mode::Budget(sidecar) => budget(sidecar, options.motion.as_deref()),
                 Mode::Table(sidecar) => emit_table(sidecar, options.motion.as_deref()),
+                Mode::Script(path) => script_run(&options, path),
+                Mode::ScriptBudget(path) => script_budget(path),
             };
             match ended {
                 Ok(()) => ExitCode::SUCCESS,
@@ -226,22 +236,24 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut args = args;
     while let Some(word) = args.next() {
         match word.as_str() {
-            "--tour" | "--tour-budget" | "--tour-table" => {
-                let path = args
-                    .next()
-                    .ok_or_else(|| format!("{word} needs the path of a names sidecar"))?;
+            "--tour" | "--tour-budget" | "--tour-table" | "--script" | "--script-budget" => {
+                let noun = if word.starts_with("--script") {
+                    "the path of a script file"
+                } else {
+                    "the path of a names sidecar"
+                };
+                let path = args.next().ok_or_else(|| format!("{word} needs {noun}"))?;
                 if mode_given {
-                    return Err(
-                        "--tour, --tour-budget and --tour-table each name the one run this is"
-                            .to_owned(),
-                    );
+                    return Err("the run selector flags each name the one run this is".to_owned());
                 }
                 mode_given = true;
                 let path = PathBuf::from(path);
                 options.mode = match word.as_str() {
                     "--tour" => Mode::Tour(path),
                     "--tour-budget" => Mode::Budget(path),
-                    _ => Mode::Table(path),
+                    "--tour-table" => Mode::Table(path),
+                    "--script" => Mode::Script(path),
+                    _ => Mode::ScriptBudget(path),
                 };
             }
             "--resting-timeout" => {
@@ -281,6 +293,12 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
              with --tour, --tour-budget or --tour-table"
                 .to_owned(),
         );
+    }
+    if matches!(options.mode, Mode::Script(_) | Mode::ScriptBudget(_)) && options.motion.is_some() {
+        return Err("--motion is not valid with a script".to_owned());
+    }
+    if matches!(options.mode, Mode::ScriptBudget(_)) && (resting_given || window_given) {
+        return Err("--script-budget refuses run-only flags".to_owned());
     }
     if window_given && options.mode != Mode::Gesture {
         return Err(
@@ -630,6 +648,145 @@ fn tour_run(options: &Options, path: &Path) -> Result<(), String> {
     settle(ending, control, QUIT_CONNECT_WINDOW, &stop)
 }
 
+fn script_budget(path: &Path) -> Result<(), String> {
+    let plan = ScriptPlan::read(path)?;
+    println!("{}", plan.launcher_budget()?);
+    Ok(())
+}
+
+fn script_run(options: &Options, path: &Path) -> Result<(), String> {
+    let control: SocketAddr = LAUNCHER_CONTROL.parse().expect("launcher address");
+    let installed = stop_flag();
+    let stop = installed
+        .clone()
+        .unwrap_or_else(|_| Arc::new(AtomicBool::new(false)));
+    let ending = match installed {
+        Err(message) => Ending::Told(Err(message)),
+        Ok(_) => script_ending(options, path, &stop),
+    };
+    settle(ending, control, QUIT_CONNECT_WINDOW, &stop)
+}
+
+fn script_ending(options: &Options, path: &Path, stop: &AtomicBool) -> Ending {
+    let started = (|| {
+        let plan = ScriptPlan::read(path)?;
+        let ports = Ports::bind()?;
+        Ok((plan, ports))
+    })();
+    match started {
+        Err(message) => Ending::Told(Err(message)),
+        Ok((plan, ports)) => script_conduct(options, &plan, &ports, stop, &mut Console),
+    }
+}
+
+fn script_conduct(
+    options: &Options,
+    plan: &ScriptPlan,
+    ports: &Ports,
+    stop: &AtomicBool,
+    surface: &mut impl Surface,
+) -> Ending {
+    script_conduct_inner(options, plan, ports, stop, surface, None)
+}
+
+fn script_conduct_inner(
+    options: &Options,
+    plan: &ScriptPlan,
+    ports: &Ports,
+    stop: &AtomicBool,
+    surface: &mut impl Surface,
+    deadline_override: Option<Duration>,
+) -> Ending {
+    let mut host = HostEdge::new(
+        EdgeConfig::for_pod(ASK_POD),
+        gesture::motions().clone(),
+        gesture::poses().clone(),
+    );
+    let mut buffer = vec![0u8; DATAGRAM_CAP];
+    let mut watch = Watch::new();
+    let mut accepted = false;
+    let mut deadline = Instant::now() + options.resting_timeout;
+    let mut asked_id = None;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ending::Stopped("stopped before the script returned to rest".to_owned());
+        }
+        let at = Instant::now();
+        if at >= deadline {
+            return Ending::Told(Err(if accepted {
+                "the script did not end at rest before its deadline".to_owned()
+            } else {
+                format!(
+                    "no commissioning row in {}s",
+                    options.resting_timeout.as_secs()
+                )
+            }));
+        }
+        let Some(update) = (match heard(ports, &mut host, &mut buffer, surface) {
+            Ok(update) => update,
+            Err(message) => return Ending::Told(Err(message)),
+        }) else {
+            continue;
+        };
+
+        if !watch.asked() && watch.should_ask(&update.rows) {
+            let (script_id, arrival) = match offer_and_post(
+                &mut host,
+                ports,
+                surface,
+                plan.body().as_bytes(),
+                "the supplied script",
+            ) {
+                Ok(value) => value,
+                Err(message) => return Ending::Told(Err(message)),
+            };
+            accepted = false;
+            asked_id = Some(script_id);
+            let sender_window = match deadline_override {
+                Some(window) => window,
+                None => match plan.sender_deadline() {
+                    Ok(window) => window,
+                    Err(message) => return Ending::Told(Err(message)),
+                },
+            };
+            deadline = at + sender_window;
+            surface.say(
+                serde_json::json!({
+                    "stream": "edge", "at_ns": arrival.as_nanos(), "kind": "asked",
+                    "source": plan.path(), "script_id": script_id,
+                    "timeout_ms": plan.timeout_ms(),
+                    "deadline_ms": sender_window.as_millis(),
+                })
+                .to_string(),
+            );
+        }
+        if !watch.asked() {
+            continue;
+        }
+        for row in &update.rows {
+            let kind = row.kind();
+            if kind == brenn_reachy__motion__reports_clk_rs::ReportKindWire::SCRIPT_ACCEPTED
+                && Some(row.a()) == asked_id
+            {
+                accepted = true;
+            }
+            if kind == brenn_reachy__motion__reports_clk_rs::ReportKindWire::SCRIPT_REFUSED
+                || kind == brenn_reachy__motion__reports_clk_rs::ReportKindWire::FAULT_RECORDED
+            {
+                return Ending::Told(Err(format!(
+                    "session narrated {:?} with a={} b={}",
+                    kind,
+                    row.a(),
+                    row.b()
+                )));
+            }
+            if accepted && is_released(row) {
+                return Ending::Told(Ok(()));
+            }
+        }
+    }
+}
+
 /// The tour's own ending: the plan, the ports, the loop.
 ///
 /// Every failure here is `Told` — a sidecar that will not read is as much the
@@ -839,7 +996,8 @@ mod tests {
     use reachy_edge::{Alert, LOOPBACK, Surface};
 
     use super::{
-        Console, Ending, Mode, Options, Ports, Tour, conduct, parse, plan, settle, verdict,
+        Console, Ending, Mode, Options, Ports, ScriptPlan, Tour, conduct, parse, plan,
+        script_conduct, script_conduct_inner, settle, verdict,
     };
 
     /// The invocation, as words.
@@ -906,6 +1064,34 @@ mod tests {
         let refused =
             parsed(&["--run-window", "9", "--run-window", "9"]).expect_err("one window, once");
         assert!(refused.contains("twice"), "{refused}");
+    }
+
+    #[test]
+    fn script_selectors_are_mutually_exclusive_and_require_values() {
+        assert!(parsed(&["--script"]).is_err());
+        assert!(parsed(&["--script-budget"]).is_err());
+        assert!(parsed(&["--script", "a.json", "--script-budget", "b.json"]).is_err());
+        assert!(parsed(&["--script-budget", "a.json", "--script", "b.json"]).is_err());
+        assert!(parsed(&["--script", "a.json", "--resting-timeout"]).is_err());
+        assert!(parsed(&["--script", "a.json", "--run-window"]).is_err());
+        assert!(parsed(&["--script", "a.json", "--motion", "bench/nod"]).is_err());
+        assert!(parsed(&["--motion", "bench/nod", "--script", "a.json"]).is_err());
+        assert!(parsed(&["--run-window", "5", "--script", "a.json"]).is_err());
+        assert!(parsed(&["--script-budget", "a.json", "--resting-timeout", "5"]).is_err());
+        assert!(parsed(&["--script-budget", "a.json", "--run-window", "5"]).is_err());
+        assert!(parsed(&["--script-budget", "a.json", "--motion", "bench/nod"]).is_err());
+    }
+
+    #[test]
+    fn script_modes_keep_their_file() {
+        assert_eq!(
+            parsed(&["--script", "a file.json"]).expect("script").mode,
+            Mode::Script(PathBuf::from("a file.json"))
+        );
+        assert_eq!(
+            parsed(&["--script-budget", "a.json"]).expect("budget").mode,
+            Mode::ScriptBudget(PathBuf::from("a.json"))
+        );
     }
 
     #[test]
@@ -1141,6 +1327,68 @@ mod tests {
         blob_as_bytes(&message).to_vec()
     }
 
+    fn report(kind: ReportKindWire, a: u32, b: u32) -> TimelineEntryWire {
+        let mut entry = TimelineEntryWire::new();
+        entry.set_kind(kind);
+        entry.set_a(a);
+        entry.set_b(b);
+        entry
+    }
+
+    fn script_plan(timeout_ms: u64) -> ScriptPlan {
+        let path = std::env::temp_dir().join(format!(
+            "reachy-ask-socket-{}-{}.json",
+            std::process::id(),
+            timeout_ms
+        ));
+        let script = motion_proto::MotionScript::new(
+            super::ASK_POD,
+            1,
+            vec![
+                motion_proto::Step::new(0, "neutral"),
+                motion_proto::Step::play(1, motion_proto::Play::new("bench/nod")),
+            ],
+            timeout_ms,
+        )
+        .expect("a valid embedded-asset script");
+        std::fs::write(&path, script.encode()).expect("script file");
+        ScriptPlan::read(path).expect("decoded script")
+    }
+
+    fn pose_only_plan(timeout_ms: u64, pose: &str) -> ScriptPlan {
+        let path = std::env::temp_dir().join(format!(
+            "reachy-ask-pose-only-{}-{}.json",
+            std::process::id(),
+            timeout_ms
+        ));
+        let script = motion_proto::MotionScript::new(
+            super::ASK_POD,
+            1,
+            vec![motion_proto::Step::new(0, pose)],
+            timeout_ms,
+        )
+        .expect("a valid pose-only script");
+        std::fs::write(&path, script.encode()).expect("script file");
+        ScriptPlan::read(path).expect("decoded script")
+    }
+
+    fn invalid_motion_plan() -> ScriptPlan {
+        let path =
+            std::env::temp_dir().join(format!("reachy-ask-invalid-{}.json", std::process::id()));
+        let script = motion_proto::MotionScript::new(
+            super::ASK_POD,
+            1,
+            vec![
+                motion_proto::Step::new(0, "neutral"),
+                motion_proto::Step::play(1, motion_proto::Play::new("unknown/motion")),
+            ],
+            600_000,
+        )
+        .expect("wire-valid unknown motion");
+        std::fs::write(&path, script.encode()).expect("script file");
+        ScriptPlan::read(path).expect("decoded script")
+    }
+
     /// The session having commissioned.
     fn commissioned() -> TimelineEntryWire {
         phase(SessionPhaseWire::RESTING, SessionPhaseWire::STARTING)
@@ -1149,6 +1397,210 @@ mod tests {
     /// The session having released.
     fn released() -> TimelineEntryWire {
         phase(SessionPhaseWire::RESTING, SessionPhaseWire::STOPPING)
+    }
+
+    #[test]
+    fn a_script_offer_is_once_and_acceptance_plus_release_is_green() {
+        let plan = script_plan(600_000);
+        assert_eq!(plan.timeout_ms(), 600_000);
+        let (ports, control, narrator, reports) = wiring();
+        let told = thread::spawn(move || {
+            narrator
+                .send_to(&story(&[commissioned()]), reports)
+                .expect("commissioning");
+            let mut buffer = vec![0u8; super::DATAGRAM_CAP];
+            control.recv_from(&mut buffer).expect("one offer");
+            narrator
+                .send_to(
+                    &story(&[
+                        commissioned(),
+                        report(ReportKindWire::SCRIPT_ACCEPTED, 1, 2),
+                    ]),
+                    reports,
+                )
+                .expect("acceptance");
+            narrator
+                .send_to(
+                    &story(&[
+                        commissioned(),
+                        report(ReportKindWire::SCRIPT_ACCEPTED, 1, 2),
+                        released(),
+                    ]),
+                    reports,
+                )
+                .expect("release");
+            assert!(control.recv_from(&mut buffer).is_err(), "one offer only");
+        });
+        let mut recorded = Recorded::default();
+        let ending = script_conduct(
+            &Options::default(),
+            &plan,
+            &ports,
+            &AtomicBool::new(false),
+            &mut recorded,
+        );
+        assert!(matches!(ending, Ending::Told(Ok(()))));
+        told.join().expect("session side");
+    }
+
+    #[test]
+    fn script_acceptance_must_name_this_offer() {
+        for (reported_id, green) in [(99, false), (1, true)] {
+            let plan = pose_only_plan(600_000, "neutral");
+            let (ports, control, narrator, reports) = wiring();
+            let told = thread::spawn(move || {
+                narrator
+                    .send_to(&story(&[commissioned()]), reports)
+                    .expect("commissioning");
+                let mut buffer = vec![0u8; super::DATAGRAM_CAP];
+                control.recv_from(&mut buffer).expect("one offer");
+                narrator
+                    .send_to(
+                        &story(&[
+                            commissioned(),
+                            report(ReportKindWire::SCRIPT_ACCEPTED, reported_id, 2),
+                            released(),
+                        ]),
+                        reports,
+                    )
+                    .expect("acceptance and release");
+            });
+            let ending = script_conduct_inner(
+                &Options::default(),
+                &plan,
+                &ports,
+                &AtomicBool::new(false),
+                &mut Recorded::default(),
+                Some(Duration::from_millis(20)),
+            );
+            assert_eq!(
+                matches!(ending, Ending::Told(Ok(()))),
+                green,
+                "id {reported_id}"
+            );
+            told.join().expect("session side");
+        }
+    }
+
+    #[test]
+    fn narrated_script_refusal_and_fault_are_red() {
+        for kind in [
+            ReportKindWire::SCRIPT_REFUSED,
+            ReportKindWire::FAULT_RECORDED,
+        ] {
+            let plan = script_plan(600_000);
+            let (ports, control, narrator, reports) = wiring();
+            let told = thread::spawn(move || {
+                narrator
+                    .send_to(&story(&[commissioned()]), reports)
+                    .expect("commissioning");
+                let mut buffer = vec![0u8; super::DATAGRAM_CAP];
+                control.recv_from(&mut buffer).expect("one offer");
+                narrator
+                    .send_to(&story(&[commissioned(), report(kind, 1, 7)]), reports)
+                    .expect("red narration");
+            });
+            let ending = script_conduct(
+                &Options::default(),
+                &plan,
+                &ports,
+                &AtomicBool::new(false),
+                &mut Recorded::default(),
+            );
+            assert!(matches!(ending, Ending::Told(Err(_))));
+            told.join().expect("session side");
+        }
+    }
+
+    #[test]
+    fn an_edge_refusal_is_red_and_sender_owned_endings_try_to_quit() {
+        let plan = invalid_motion_plan();
+        let (ports, control, narrator, reports) = wiring();
+        let told = thread::spawn(move || {
+            narrator
+                .send_to(&story(&[commissioned()]), reports)
+                .expect("commissioning");
+            drop(control);
+        });
+        let ending = script_conduct(
+            &Options::default(),
+            &plan,
+            &ports,
+            &AtomicBool::new(false),
+            &mut Recorded::default(),
+        );
+        assert!(matches!(ending, Ending::Told(Err(_))));
+        let (address, request) = launcher();
+        let red = settle(
+            ending,
+            address,
+            Duration::from_secs(1),
+            &AtomicBool::new(false),
+        );
+        assert!(red.is_err());
+        assert!(
+            request
+                .join()
+                .expect("quit request")
+                .starts_with("POST /quit")
+        );
+        told.join().expect("session side");
+    }
+
+    #[test]
+    fn a_script_deadline_without_release_is_red() {
+        let plan = pose_only_plan(600_000, "neutral");
+        let (ports, control, narrator, reports) = wiring();
+        let told = thread::spawn(move || {
+            narrator
+                .send_to(&story(&[commissioned()]), reports)
+                .expect("commissioning");
+            let mut buffer = vec![0u8; super::DATAGRAM_CAP];
+            control.recv_from(&mut buffer).expect("one offer");
+            narrator
+                .send_to(
+                    &story(&[
+                        commissioned(),
+                        report(ReportKindWire::SCRIPT_ACCEPTED, 1, 1),
+                    ]),
+                    reports,
+                )
+                .expect("acceptance");
+        });
+        let ending = script_conduct_inner(
+            &Options::default(),
+            &plan,
+            &ports,
+            &AtomicBool::new(false),
+            &mut Recorded::default(),
+            Some(Duration::from_millis(1)),
+        );
+        match ending {
+            Ending::Told(Err(message)) => {
+                assert!(message.contains("did not end at rest"), "{message}");
+            }
+            Ending::Told(Ok(())) => panic!("deadline unexpectedly green"),
+            Ending::Stopped(message) => panic!("unexpected stop: {message}"),
+        }
+        told.join().expect("session side");
+    }
+
+    #[test]
+    fn a_script_stop_signal_does_not_try_to_quit() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("launcher port");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let address = listener.local_addr().expect("launcher address");
+        let stopped = AtomicBool::new(false);
+        let result = settle(
+            Ending::Stopped("stopped".to_owned()),
+            address,
+            Duration::ZERO,
+            &stopped,
+        );
+        assert!(result.is_err());
+        assert!(listener.accept().is_err(), "a stop skips launcher quit");
     }
 
     /// The two sockets a case drives a run through: where the scripts land, and

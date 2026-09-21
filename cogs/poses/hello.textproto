@@ -1,0 +1,9 @@
+name: "hello"
+description: "S013 of record-log-20260917T114423Z, head displacement scaled 0.98 toward neutral; body yaw squared to 0.0 and right antenna direction -0.8303838173726208 is the accepted content choice."
+# Head relative to the neutral head pose: metres, unit quaternion [w, x, y, z].
+dt: [0.0006690716310147473, 0.011657214299538974, 0.011019355907297057]
+dq: [0.9727091900478038, 0.22862791097815877, 0.009840924041276438, 0.03833100745248598]
+body_yaw: 0.0
+# Right, then left; radians, a direction.
+antennas: [-0.8303838173726208, -0.23610866451374868]
+duration_ms: 1000

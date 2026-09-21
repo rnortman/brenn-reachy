@@ -24,9 +24,26 @@
 # quaternion; the antennas are directions in radians, right then left.
 #
 # pose_id  name
-#   0  neutral
-#   1  peek
-#   2  stow
+#   0  hello
+#   1  neutral
+#   2  peek
+#   3  peek_tilt
+#   4  stow
+
+# hello
+poses {
+  dx: 0.0006690716310147473
+  dy: 0.011657214299538974
+  dz: 0.011019355907297057
+  qw: 0.9727091900478038
+  qx: 0.22862791097815877
+  qy: 0.009840924041276438
+  qz: 0.03833100745248598
+  body_yaw: 0.0
+  antenna_right: -0.8303838173726208
+  antenna_left: -0.23610866451374868
+  duration_ns: 1000000000
+}
 
 # neutral
 poses {
@@ -58,6 +75,21 @@ poses {
   duration_ns: 800000000
 }
 
+# peek_tilt
+poses {
+  dx: 0.01049154187016598
+  dy: -0.02274613777854499
+  dz: -0.03565436059901819
+  qw: 0.9633281022256426
+  qx: -0.2644224296301334
+  qy: -0.012830615551910403
+  qz: 0.04376210090247122
+  body_yaw: 0.0
+  antenna_right: -0.8303838173726208
+  antenna_left: -0.5722637603039527
+  duration_ns: 1000000000
+}
+
 # stow
 poses {
   dx: -0.01819812459878709
@@ -68,10 +100,10 @@ poses {
   qy: 0.21471853903293098
   qz: -0.011657821495217886
   body_yaw: 0.0
-  antenna_right: -3.4591337364226646
-  antenna_left: 3.3596413158342777
+  antenna_right: -3.32
+  antenna_left: 3.32
   duration_ns: 2000000000
 }
 
 # where the machine rests: the pose named "stow"
-stow: 2
+stow: 4

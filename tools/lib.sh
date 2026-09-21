@@ -1492,3 +1492,11 @@ tour_report_target=//cogs:library_tour_report
 tour_verdict() {
 	analyzer_verdict "$tour_report_target" "$1" "$2"
 }
+
+script_report_target=//cogs:script_run_report
+
+script_verdict() {
+	local run_dir=$1 names=$2
+	shift 2
+	analyzer_verdict "$script_report_target" "$run_dir" "$names" "$@"
+}

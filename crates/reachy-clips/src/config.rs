@@ -44,6 +44,7 @@ use brenn_reachy__cogs__config_clk_rs::{
 use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire};
 use nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 use reachy_motion::FLOOR_TICK_HZ;
+use reachy_motion::joints::JointTargets;
 use reachy_motion::joints::{JointGroup, flags};
 use thiserror::Error;
 
@@ -71,6 +72,12 @@ pub const MAX_SEGMENTS: usize = 32;
 /// already on the box can be wrong about.
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
 pub enum ClipViewError {
+    /// An anchor field is not finite.
+    #[error("anchor field {key} is {value}, which is not finite")]
+    AnchorNonFinite { key: &'static str, value: f64 },
+    /// A configured anchor head rotation is not unit length.
+    #[error("anchor head rotation has norm {norm}, which is not 1")]
+    AnchorQuaternion { norm: f64 },
     /// The mask names bits that are not a whole channel's joints.
     ///
     /// A channel is a group of joints — the head is six cranks, the antennas are
@@ -279,6 +286,22 @@ pub fn write_clip(clip: &Clip, out: &mut ClipConfig) -> Result<(), LibraryWriteE
     out.frame_rate_hz = FLOOR_TICK_HZ;
     out.blend_in_ms = clip.blend_in_ms();
     out.blend_out_ms = clip.blend_out_ms();
+    let anchor = clip
+        .anchor()
+        .map(|anchor| anchor.targets())
+        .unwrap_or_default();
+    out.has_anchor = clip.anchor().is_some().into();
+    let q = anchor.head_pose_body.rotation.quaternion();
+    out.anchor_head_dx = anchor.head_pose_body.translation.vector.x;
+    out.anchor_head_dy = anchor.head_pose_body.translation.vector.y;
+    out.anchor_head_dz = anchor.head_pose_body.translation.vector.z;
+    out.anchor_head_qw = q.w;
+    out.anchor_head_qx = q.i;
+    out.anchor_head_qy = q.j;
+    out.anchor_head_qz = q.k;
+    out.anchor_body_yaw = anchor.body_yaw;
+    out.anchor_antenna_right = anchor.antennas[0];
+    out.anchor_antenna_left = anchor.antennas[1];
     out.frames.clear();
     for frame in frames {
         let slot = out
@@ -608,6 +631,23 @@ pub enum MotionViewError {
         /// The flattened speed.
         speed: f64,
     },
+
+    /// Two segments that drive a channel disagree about whether it is posed.
+    #[error(
+        "channel {channel} changes provenance from {first_provenance} at segment {first_segment} to {conflicting_provenance} at segment {conflicting_segment}"
+    )]
+    MixedProvenance {
+        /// The channel whose clips disagree.
+        channel: Channel,
+        /// The first segment that drove the channel.
+        first_segment: usize,
+        /// Whether the first segment carried an anchor.
+        first_provenance: bool,
+        /// The conflicting segment.
+        conflicting_segment: usize,
+        /// Whether the conflicting segment carried an anchor.
+        conflicting_provenance: bool,
+    },
 }
 
 /// Which asset of a library will not play, and why.
@@ -892,6 +932,7 @@ impl<'a> MotionView<'a> {
         }
         let mut mask = ChannelMask::empty();
         let mut duration_s = gap_s(motion.lead_gap_ms);
+        let mut provenance: [Option<(usize, bool)>; Channel::COUNT] = [None; Channel::COUNT];
         // The edges of the whole walk: a motion ramps in on the clip it starts
         // with and out of the one it ends on. The seams in between are stepped
         // across rather than blended.
@@ -915,6 +956,20 @@ impl<'a> MotionView<'a> {
             }
             for channel in Channel::ALL {
                 if clip.mask().contains(channel) {
+                    let posed = clip.anchor().is_some();
+                    if let Some((first_segment, first_provenance)) = provenance[channel.index()]
+                        && first_provenance != posed
+                    {
+                        return Err(MotionViewError::MixedProvenance {
+                            channel,
+                            first_segment,
+                            first_provenance,
+                            conflicting_segment: segment,
+                            conflicting_provenance: posed,
+                        });
+                    }
+                    provenance[channel.index()] =
+                        Some(provenance[channel.index()].unwrap_or((segment, posed)));
                     mask.insert(channel);
                 }
             }
@@ -1078,6 +1133,33 @@ impl<'a> ClipView<'a> {
         if clip.frames.is_empty() {
             return Err(ClipViewError::NoFrames);
         }
+        if bool::from(clip.has_anchor) {
+            let values = [
+                ("anchor_head_dx", clip.anchor_head_dx),
+                ("anchor_head_dy", clip.anchor_head_dy),
+                ("anchor_head_dz", clip.anchor_head_dz),
+                ("anchor_head_qw", clip.anchor_head_qw),
+                ("anchor_head_qx", clip.anchor_head_qx),
+                ("anchor_head_qy", clip.anchor_head_qy),
+                ("anchor_head_qz", clip.anchor_head_qz),
+                ("anchor_body_yaw", clip.anchor_body_yaw),
+                ("anchor_antenna_right", clip.anchor_antenna_right),
+                ("anchor_antenna_left", clip.anchor_antenna_left),
+            ];
+            for (key, value) in values {
+                if !value.is_finite() {
+                    return Err(ClipViewError::AnchorNonFinite { key, value });
+                }
+            }
+            let norm = (clip.anchor_head_qw * clip.anchor_head_qw
+                + clip.anchor_head_qx * clip.anchor_head_qx
+                + clip.anchor_head_qy * clip.anchor_head_qy
+                + clip.anchor_head_qz * clip.anchor_head_qz)
+                .sqrt();
+            if (norm - 1.0).abs() > QUAT_NORM_TOL {
+                return Err(ClipViewError::AnchorQuaternion { norm });
+            }
+        }
         Ok(Self { clip, mask })
     }
 
@@ -1109,6 +1191,66 @@ impl<'a> ClipView<'a> {
     #[must_use]
     pub fn blend_out_ms(&self) -> u32 {
         self.clip.blend_out_ms
+    }
+
+    /// The authored head pose, if this clip carries one.
+    #[must_use]
+    pub fn anchor_head(&self) -> Option<Isometry3<f64>> {
+        bool::from(self.clip.has_anchor).then(|| {
+            Isometry3::from_parts(
+                Translation3::new(
+                    self.clip.anchor_head_dx,
+                    self.clip.anchor_head_dy,
+                    self.clip.anchor_head_dz,
+                ),
+                UnitQuaternion::from_quaternion(Quaternion::new(
+                    self.clip.anchor_head_qw,
+                    self.clip.anchor_head_qx,
+                    self.clip.anchor_head_qy,
+                    self.clip.anchor_head_qz,
+                )),
+            )
+        })
+    }
+
+    /// The authored body yaw, if this clip carries one.
+    #[must_use]
+    pub fn anchor_body_yaw(&self) -> Option<f64> {
+        bool::from(self.clip.has_anchor).then_some(self.clip.anchor_body_yaw)
+    }
+
+    /// The authored antenna angles, if this clip carries one.
+    #[must_use]
+    pub fn anchor_antennas(&self) -> Option<[f64; 2]> {
+        bool::from(self.clip.has_anchor).then_some([
+            self.clip.anchor_antenna_right,
+            self.clip.anchor_antenna_left,
+        ])
+    }
+
+    /// The absolute pose this clip was authored over, if present.
+    #[must_use]
+    pub fn anchor(&self) -> Option<JointTargets> {
+        bool::from(self.clip.has_anchor).then(|| JointTargets {
+            head_pose_body: Isometry3::from_parts(
+                Translation3::new(
+                    self.clip.anchor_head_dx,
+                    self.clip.anchor_head_dy,
+                    self.clip.anchor_head_dz,
+                ),
+                UnitQuaternion::from_quaternion(Quaternion::new(
+                    self.clip.anchor_head_qw,
+                    self.clip.anchor_head_qx,
+                    self.clip.anchor_head_qy,
+                    self.clip.anchor_head_qz,
+                )),
+            ),
+            body_yaw: self.clip.anchor_body_yaw,
+            antennas: [
+                self.clip.anchor_antenna_right,
+                self.clip.anchor_antenna_left,
+            ],
+        })
     }
 
     /// Frame `frame` of the clip.
@@ -1159,6 +1301,21 @@ pub fn track_fingerprint(view: &ClipView<'_>) -> u64 {
     hash.eat(&[mask_bits(view.mask())]);
     hash.eat(&view.blend_in_ms().to_le_bytes());
     hash.eat(&view.blend_out_ms().to_le_bytes());
+    hash.eat(&[bool::from(view.clip.has_anchor) as u8]);
+    for value in [
+        view.clip.anchor_head_dx,
+        view.clip.anchor_head_dy,
+        view.clip.anchor_head_dz,
+        view.clip.anchor_head_qw,
+        view.clip.anchor_head_qx,
+        view.clip.anchor_head_qy,
+        view.clip.anchor_head_qz,
+        view.clip.anchor_body_yaw,
+        view.clip.anchor_antenna_right,
+        view.clip.anchor_antenna_left,
+    ] {
+        hash.eat(&value.to_bits().to_le_bytes());
+    }
     hash.finish()
 }
 
@@ -1290,6 +1447,7 @@ mod tests {
             version: 1,
             kind: "clip".to_owned(),
             name: name.to_owned(),
+            base: None,
             description: None,
             channels: vec![Channel::Head, Channel::BodyYaw, Channel::Antennas],
             frame_hz: FLOOR_TICK_HZ,
@@ -1401,6 +1559,67 @@ mod tests {
     #[test]
     fn an_empty_mask_drives_nothing_and_is_refused() {
         assert_eq!(mask_from_bits(0), Err(ClipViewError::NoChannels));
+    }
+
+    #[test]
+    fn configured_anchor_round_trips_validates_and_changes_fingerprint() {
+        let source = reachy_motion::joints::JointTargets {
+            head_pose_body: reachy_kin::neutral_head_pose()
+                * nalgebra::Isometry3::from_parts(
+                    nalgebra::Translation3::new(0.0013, -0.0011, 0.005),
+                    nalgebra::UnitQuaternion::from_scaled_axis(nalgebra::Vector3::new(
+                        0.01, 0.02, 0.03,
+                    )),
+                ),
+            body_yaw: 0.27,
+            antennas: [0.31, -0.42],
+        };
+        let doc = ClipDoc {
+            base: Some("neutral".to_owned()),
+            ..all_channels_doc("posed", 1)
+        };
+        let clip =
+            Clip::from_doc_resolved(doc, &limits(), |_| Some(source)).expect("posed clip loads");
+        let message = configured(&clip);
+        let view = ClipView::new(valid(&message)).expect("configured anchor validates");
+        let anchor = view.anchor().expect("anchor");
+        assert_eq!(
+            anchor.head_pose_body.translation.vector,
+            source.head_pose_body.translation.vector
+        );
+        assert!(
+            anchor
+                .head_pose_body
+                .rotation
+                .angle_to(&source.head_pose_body.rotation)
+                < 1e-12
+        );
+        assert_eq!(anchor.body_yaw, source.body_yaw);
+        assert_eq!(anchor.antennas, source.antennas);
+        let head = view.anchor_head().expect("head anchor accessor");
+        assert_eq!(
+            head.translation.vector,
+            source.head_pose_body.translation.vector
+        );
+        assert!(head.rotation.angle_to(&source.head_pose_body.rotation) < 1e-12);
+        assert_eq!(view.anchor_body_yaw(), Some(source.body_yaw));
+        assert_eq!(view.anchor_antennas(), Some(source.antennas));
+        let mut changed = message.clone();
+        changed.set_anchor_body_yaw(0.2);
+        let changed_view = ClipView::new(valid(&changed)).expect("changed anchor validates");
+        assert_ne!(track_fingerprint(&view), track_fingerprint(&changed_view));
+        let mut invalid = message.clone();
+        invalid.set_anchor_head_dx(f64::NAN);
+        assert!(matches!(
+            ClipView::new(valid(&invalid)),
+            Err(ClipViewError::AnchorNonFinite { key, .. }) if key == "anchor_head_dx"
+        ));
+        let mut non_unit = message;
+        non_unit.set_anchor_head_qw(2.0);
+        assert!(matches!(
+            ClipView::new(valid(&non_unit)),
+            Err(ClipViewError::AnchorQuaternion { .. })
+        ));
     }
 
     /// One crank without its five siblings is not a channel: the head moves as a
@@ -2266,6 +2485,35 @@ mod tests {
         );
         assert_eq!(motion.blend_in_ms(), a.blend_in_ms);
         assert_eq!(motion.blend_out_ms(), b.blend_out_ms);
+    }
+
+    #[test]
+    fn mixed_antenna_provenance_is_a_typed_motion_refusal() {
+        let mut message = composed_message();
+        let checked = message
+            .validate_mut()
+            .expect("the written library validates");
+        let clip = checked.clips.get_mut(1).expect("the second clip");
+        clip.has_anchor = true.into();
+        clip.anchor_head_qw = 1.0;
+        let library = valid_library(&message);
+        let refusal = ValidatedLibrary::of(library).expect_err("mixed provenance is refused");
+        assert_eq!(
+            refusal,
+            UnplayableAsset::Motion {
+                motion_id: 2,
+                source: MotionViewError::MixedProvenance {
+                    channel: Channel::Antennas,
+                    first_segment: 0,
+                    first_provenance: false,
+                    conflicting_segment: 1,
+                    conflicting_provenance: true,
+                },
+            }
+        );
+        let rendered = refusal.to_string();
+        assert!(rendered.contains("motion 2") && rendered.contains("antennas"));
+        assert!(rendered.contains("segment 0") && rendered.contains("segment 1"));
     }
 
     /// A channel is driven by the motion even if only one segment touches it:

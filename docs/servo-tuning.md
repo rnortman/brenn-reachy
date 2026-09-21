@@ -203,7 +203,7 @@ Two consequences worth knowing before an experiment:
   `probe/antenna-step-b` in the clip library. Two documents that drive the
   antennas and nothing else, so the head holds the raised base bit for bit
   while they play. Each visits three poses off that base — antennas up (the
-  rest lean itself), out to the sides (horizontal, `ANTENNA_OUTBOARD`), and
+  rest lean itself), out to the sides (horizontal), and
   down (stow, `±3.32`, leaning 10.2° inboard of straight down) — and each pose
   is authored as the difference of the two constants it puts the antennas at, so
   a retuned pose moves the probe with it. Each pose is reached in **one frame**
@@ -234,10 +234,9 @@ Two consequences worth knowing before an experiment:
   asked is what the antennas do when they are pointed down and stopped hard.
 
   Both antennas sweep through their **outboard** arc, each through its own
-  side's horizontal. That is the arc planned moves are routed away from,
-  because it sweeps the widest envelope around the machine exactly where
-  objects sit beside it; it is taken here so the pair cannot interfere with
-  each other mid-sweep, and it is why a probe run needs clear space beside the
+  side's horizontal. This is deliberately authored probe content; planned
+  moves take the shortest representable arc, and future interference-aware
+  planning needs the vendor geometry. A probe run needs clear space beside the
   head as well as above it.
 
   **How one is played.** `make motion-probe MOTION=probe/antenna-step-a`:
@@ -1264,7 +1263,7 @@ probe-run standard **[A]**. The head stands bit-for-bit at the raised base
 through every probe hold, so every hold below is head-still and judged. The four
 holds of a probe run are the engagement hold (where the driver took hold at
 arm-on; nothing drove the joint there) and the clip's three poses — sides at
-`ANTENNA_OUTBOARD`, down at the library's `stow` fold, up at its `neutral`
+the sideways probe pose, down at the library's `stow` fold, up at its `neutral`
 lean — each reached by a one-frame goal step and held 6.5 s.
 
 | rung | overlay | antennas | verdict |

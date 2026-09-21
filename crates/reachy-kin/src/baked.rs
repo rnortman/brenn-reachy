@@ -253,10 +253,10 @@ pub const SLEEP_PITCH: f64 = 0.425_634_609_124_168_34;
 ///
 /// A recorded observation, not a derivation: this is the configuration the
 /// vendor's simulated backends start from, and it sits 0.141 mm from a singular
-/// configuration of the linkage — a tenth of the clearance floor commands are
-/// held to. It is the configuration the clearance baseline exists for, so it is
-/// baked here once rather than retyped by each test that needs a rest tighter
-/// than the floor.
+/// configuration of the linkage. It is also outside four crank windows, so
+/// arming pins those goals before the held pose is used for commands. The
+/// clearance baseline is for a separately measured, in-window pose below the
+/// command floor.
 ///
 /// The same configuration is on record twice, as this pose and as
 /// [`REST_CRANK_ANGLES_DEG`], and **the two records disagree**: run through the

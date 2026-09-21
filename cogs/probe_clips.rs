@@ -9,7 +9,7 @@
 //!
 //! The poses are differences of where the machine's own antennas stand — the
 //! [`Folds`] the `neutral` and `stow` pose documents author, and
-//! [`ANTENNA_OUTBOARD`] — never literals: a document authored against a fold
+//! the sideways probe pose — never literals: a document authored against a fold
 //! the machine has since moved loads, emits and holds exactly as happily, and
 //! reads as the instrument it no longer is. Writing the frames from the library
 //! the machine is commanded through is what keeps that from being possible.
@@ -33,8 +33,9 @@ use std::fmt::Write as _;
 use anyhow::{Context as _, bail};
 
 use reachy_clips::format::{CLIP_KIND, Channel, ClipDoc, FORMAT_VERSION, FrameDoc};
-use reachy_motion::ANTENNA_OUTBOARD;
 use reachy_poses::format::Pose as LoadedPose;
+
+const SIDEWAYS_PROBE: [f64; 2] = [-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2];
 
 /// The frame rate every clip document is authored at: the tick rate.
 const FRAME_HZ: f64 = reachy_motion::FLOOR_TICK_HZ;
@@ -112,7 +113,7 @@ impl Pose {
         let delta = |target: [f64; 2]| [target[0] - folds.neutral[0], target[1] - folds.neutral[1]];
         match self {
             Self::Up => [0.0, 0.0],
-            Self::Sides => delta(ANTENNA_OUTBOARD),
+            Self::Sides => delta(SIDEWAYS_PROBE),
             Self::Down => delta(folds.stow),
             Self::HalfDown => {
                 let down = delta(folds.stow);
@@ -271,6 +272,7 @@ impl Probe {
     pub fn document(&self, folds: &Folds) -> anyhow::Result<String> {
         let frames = self.antenna_frames(folds)?;
         Ok(render(&ClipDoc {
+            base: None,
             version: FORMAT_VERSION,
             kind: CLIP_KIND.to_owned(),
             name: self.name.to_owned(),
@@ -507,8 +509,8 @@ mod tests {
         assert_eq!(
             Pose::Sides.antennas(&FOLDS),
             [
-                ANTENNA_OUTBOARD[0] - FOLDS.neutral[0],
-                ANTENNA_OUTBOARD[1] - FOLDS.neutral[1]
+                SIDEWAYS_PROBE[0] - FOLDS.neutral[0],
+                SIDEWAYS_PROBE[1] - FOLDS.neutral[1]
             ]
         );
         assert_eq!(

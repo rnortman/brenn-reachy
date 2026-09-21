@@ -17,6 +17,11 @@
 //! time yet. Both directions exist and are tested anyway, because a sign error
 //! here is invisible at zero yaw and grows with it: the wrong sign leaves the
 //! head at twice the body's yaw instead of at rest.
+// TODO(frame-aware-motion): Name the head, body, and base/world frames and their
+// transforms so camera or microphone targets can be commanded in the frame
+// where they were sensed and clips can express an antenna as world-upright
+// instead of baking a number for one head tilt. This needs a motion-system
+// frame model; the current clip remains numerically authored.
 
 use nalgebra::{Isometry3, Vector3};
 

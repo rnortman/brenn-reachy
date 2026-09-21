@@ -25,12 +25,14 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use reachy_motion::joints::JointTargets;
 use thiserror::Error;
 
 use crate::config::MAX_SEGMENTS;
 use crate::envelope::ClipLimits;
 use crate::format::{
-    CLIP_KIND, Clip, ClipError, ClipNote, MAX_SPEED, MIN_SPEED, SEQUENCE_KIND, document_kind,
+    CLIP_KIND, Channel, Clip, ClipError, ClipNote, MAX_SPEED, MIN_SPEED, SEQUENCE_KIND,
+    document_kind,
 };
 use crate::sequence::{Entry, Sequence, SequenceError};
 
@@ -236,6 +238,17 @@ pub enum ResolveError {
         /// The flattened speed.
         speed: f64,
     },
+
+    /// A channel changes between posed and unposed composition in one motion.
+    #[error(
+        "sequence {sequence:?} mixes posed clip {posed:?} and unposed clip {unposed:?} on {channel}"
+    )]
+    MixedProvenance {
+        sequence: String,
+        channel: Channel,
+        posed: String,
+        unposed: String,
+    },
 }
 
 /// Why a document was skipped at load.
@@ -365,9 +378,24 @@ impl Library {
         S: Into<String>,
         D: AsRef<str>,
     {
+        Self::load_resolved(documents, limits, |_| None)
+    }
+
+    /// Load every document, resolving posed clips through `resolve`.
+    pub fn load_resolved<I, S, D, F>(
+        documents: I,
+        limits: &ClipLimits,
+        resolve: F,
+    ) -> (Self, Vec<AssetSkip>)
+    where
+        I: IntoIterator<Item = (S, D)>,
+        S: Into<String>,
+        D: AsRef<str>,
+        F: Fn(&str) -> Option<JointTargets>,
+    {
         let mut builder = LibraryBuilder::new(limits.clone());
         for (source, document) in documents {
-            builder.add_document(source, document.as_ref());
+            builder.add_document_resolved(source, document.as_ref(), &resolve);
         }
         builder.build()
     }
@@ -464,6 +492,16 @@ impl LibraryBuilder {
     /// A document that will not load is recorded as a skip; the loader carries
     /// on with the rest.
     pub fn add_document<S: Into<String>>(&mut self, source: S, document: &str) {
+        self.add_document_resolved(source, document, &|_| None);
+    }
+
+    /// Read one document, resolving a posed clip against named pose targets.
+    pub fn add_document_resolved<S: Into<String>>(
+        &mut self,
+        source: S,
+        document: &str,
+        resolve: &dyn Fn(&str) -> Option<JointTargets>,
+    ) {
         let source = source.into();
         let kind = match document_kind(document) {
             Ok(kind) => kind,
@@ -474,7 +512,7 @@ impl LibraryBuilder {
         };
 
         match kind.as_str() {
-            CLIP_KIND => match Clip::from_json(document, &self.limits) {
+            CLIP_KIND => match Clip::from_json_resolved(document, &self.limits, resolve) {
                 Ok(clip) => {
                     let name = clip.name().to_owned();
                     if let Some(error) = self.duplicate(&name) {
@@ -715,6 +753,31 @@ fn flatten(
     }
     place_gap(&mut lead_gap_s, &mut segments, &mut pending_gap_s);
 
+    for channel in Channel::ALL {
+        let mut posed: Option<&str> = None;
+        let mut unposed: Option<&str> = None;
+        for segment in &segments {
+            let clip = &clips[&segment.clip];
+            if !clip.mask().contains(channel) {
+                continue;
+            }
+            let is_posed = clip.anchor().is_some();
+            if is_posed {
+                posed.get_or_insert(segment.clip.as_str());
+            } else {
+                unposed.get_or_insert(segment.clip.as_str());
+            }
+        }
+        if let (Some(posed), Some(unposed)) = (posed, unposed) {
+            return Err(ResolveError::MixedProvenance {
+                sequence: sequence.name().to_owned(),
+                channel,
+                posed: posed.to_owned(),
+                unposed: unposed.to_owned(),
+            });
+        }
+    }
+
     Ok(Motion {
         name: sequence.name().to_owned(),
         lead_gap_s,
@@ -924,6 +987,50 @@ mod tests {
         assert!((motion.segments()[0].speed() - 2.0).abs() < 1e-12);
         // The inner sequence's own hold is divided by the outer entry's speed.
         assert!((motion.segments()[0].gap_after_s() - 0.32).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_flattened_channel_cannot_flip_between_posed_and_unposed_provenance() {
+        let posed = head_lift_json("pod/posed", 0.001).replace(
+            "\"channels\": [\"head\"]",
+            "\"base\": \"neutral\", \"channels\": [\"head\"]",
+        );
+        let unposed = head_lift_json("pod/unposed", 0.001);
+        let cases = [
+            ("pod/direct", r#"{"ref":"pod/posed"},{"ref":"pod/unposed"}"#),
+            ("pod/nested", r#"{"ref":"pod/inner"},{"ref":"pod/unposed"}"#),
+        ];
+        for (name, entries) in cases {
+            let docs = [
+                ("posed.json", posed.clone()),
+                ("unposed.json", unposed.clone()),
+                (
+                    "inner.json",
+                    sequence_json("pod/inner", r#"{"ref":"pod/posed"}"#),
+                ),
+                ("root.json", sequence_json(name, entries)),
+            ];
+            let (_, skips) =
+                Library::load_resolved(docs, &limits(), |_| Some(JointTargets::default()));
+            let skip = skips
+                .iter()
+                .find(|skip| skip.name.as_deref() == Some(name))
+                .expect("mixed sequence is skipped");
+            match &skip.error {
+                LoadError::Resolve(ResolveError::MixedProvenance {
+                    sequence,
+                    channel,
+                    posed,
+                    unposed,
+                }) => {
+                    assert_eq!(sequence, name);
+                    assert_eq!(*channel, Channel::Head);
+                    assert_eq!(posed, "pod/posed");
+                    assert_eq!(unposed, "pod/unposed");
+                }
+                other => panic!("unexpected skip: {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -106,6 +106,7 @@ stage_payload() {
 	: >"${payload}/robotcpu.textproto"
 	: >"${payload}/robotcpu_harness.textproto"
 	: >"${payload}/cogs/session_params.textproto"
+	cp -- "$names_table" "${payload}/cogs/library.names.json"
 	# The three files a run carries home beside its records and the only
 	# three an experiment overlay may write. Distinguishable contents,
 	# because a case below asserts that an overlaid copy replaced the
@@ -308,6 +309,7 @@ if [ "$status" = 0 ]; then
 			mkdir -p -- "${dest}/config/cogs"
 			echo 'antennas_p: 200' \
 				>"${dest}/config/cogs/servo_gains.textproto"
+			echo '{"motions": []}' >"${dest}/config/cogs/library.names.json"
 			;;
 		# A copy at the root *and* one already inside the run
 		# directory, which is what a fetch into a destination that
@@ -394,6 +396,10 @@ case " $* " in
 		# analyzer's verdict either.
 		[ -n "${TOUR_TABLE:-}" ] && printf '%s\n' "$TOUR_TABLE"
 		exit "${TOUR_TABLE_STATUS:-0}"
+		;;
+	*" --script-budget "*)
+		[ -n "${SCRIPT_BUDGET:-}" ] && echo "$SCRIPT_BUDGET"
+		exit "${SCRIPT_BUDGET_STATUS:-0}"
 		;;
 esac
 exit "${BAZEL_STATUS:-0}"
@@ -1635,8 +1641,10 @@ assert_status "a tour that ended itself and passed the analyzer succeeds" 0 \
 	"$(status_of "$result")"
 assert_contains "the budget is asked of the sender, over the committed table" "$toured" \
 	"bazel run -- //crates/reachy-ask:reachy_ask --tour-budget ${names_table}"
-assert_contains "the bus question, the log root's clear and the tour are one invocation" "$toured" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --tour cogs/library.names.json >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask; ask_rc=\$?; exit \$(( rc != 0 ? rc : ask_rc ))"
+assert_contains "the tour uses the shared settlement" "$toured" \
+	"launcher_rc=\$?; i=0; while kill -0 \"\$ask\" 2>/dev/null && [ \"\$i\" -lt 10 ]"
+assert_contains "the tour bounds a failed sender settlement" "$toured" \
+	"while kill -0 \"\$ask\" 2>/dev/null && [ \"\$i\" -lt 10 ]; do sleep 1"
 # The sender knows its own end, so it is given neither of the gesture's clocks:
 # a run window would be a second opinion about when the tour is over, and the
 # commissioning timeout it ships with is the one that says a unit never came up.
@@ -1821,8 +1829,8 @@ assert_status "a probe run that ended itself and passed the analyzer succeeds" 0
 	"$(status_of "$result")"
 assert_contains "the backstop is the sender's over the one motion" "$probed" \
 	"reachy_ask --tour-budget ${names_table} --motion probe/antenna-step-a"
-assert_contains "the sender is told to play that motion and nothing else" "$probed" \
-	"./reachy_ask --tour cogs/library.names.json --motion probe/antenna-step-a >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask; ask_rc=\$?; exit \$(( rc != 0 ? rc : ask_rc ))"
+assert_contains "the sender is told to play that motion and gets the shared settlement" "$probed" \
+	"./reachy_ask --tour cogs/library.names.json --motion probe/antenna-step-a >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; launcher_rc=\$?; i=0; while kill -0 \"\$ask\" 2>/dev/null && [ \"\$i\" -lt 10 ]"
 assert_contains "the records say which kind of run they came off" "$probed" \
 	"${probe_dest}/probe-log-"
 assert_contains "the table the run played names the one motion" "$probed" \
@@ -3124,6 +3132,148 @@ assert_contains "the refusal names the missing configuration" "$(output_of "$res
 assert_lacks "and reaches no device" "$(calls)" "rsync"
 mkdir -p -- "${payload}/cogs" "${payload}/driver"
 stage_payload "$after"
+
+# ---------------------------------------------------------------------------
+# The arbitrary-script device chain
+# ---------------------------------------------------------------------------
+
+script_file="${work}/script name;echo not-a-command.json"
+printf '%s\n' '{"script":"fixture"}' >"$script_file"
+export SCRIPT_BUDGET=79 SCRIPT_BUDGET_STATUS=0 SSH_RUN_REACHED=yes SSH_RUN_STATUS=1
+result=$(deploy unit --script "${work}/script-logs" "$script_file")
+assert_status "a red script sender still fails the run" 1 "$(status_of "$result")"
+assert_contains "the local budget is requested" "$(calls)" \
+	"bazel run -- //crates/reachy-ask:reachy_ask --script-budget ${script_file}"
+assert_contains "the fixed RAM script path is transferred" "$(calls)" \
+	"root@unit:/run/brenn-app/releases/motion/script.json"
+assert_contains "the sender starts before the launcher" "$(calls)" \
+	"./reachy_ask --script script.json"
+assert_contains "the sender budget drives the timeout" "$(calls)" \
+	"timeout --signal=INT --kill-after=10 79 ./simplelaunch"
+assert_contains "the script uses the shared zero-status settlement" "$(calls)" \
+	"launcher_rc=\$?; i=0; while kill -0 \"\$ask\" 2>/dev/null && [ \"\$i\" -lt 10 ]"
+assert_contains "the script interrupts and bounds a failed sender settlement" "$(calls)" \
+	"kill -INT \"\$ask\" 2>/dev/null; i=0; while kill -0 \"\$ask\" 2>/dev/null && [ \"\$i\" -lt 10 ]"
+assert_contains "the script preserves the launcher status" "$(calls)" \
+	"if [ \"\$launcher_rc\" -ne 0 ]; then exit \"\$launcher_rc\"; fi; exit \"\$ask_rc\""
+assert_contains "records are fetched after a red sender" "$(calls)" \
+	"script-log-"
+assert_lacks "script mode does not make an asked table" "$(calls)" "--tour-table"
+assert_lacks "script mode does not run the library report" "$(calls)" "library_tour_report"
+assert_lacks "default script mode does not request settle evidence" "$(calls)" "--settle-evidence"
+
+export SSH_RUN_REACHED=yes SSH_RUN_STATUS=0 BAZEL_STATUS=0
+result=$(deploy unit --script "${work}/script-green" "$script_file")
+assert_status "a green supplied script reaches its report" 0 "$(status_of "$result")"
+assert_contains "the green script selects the supplied-script report" "$(calls)" \
+	"bazel run -- //cogs:script_run_report"
+assert_contains "the script report receives the fetched run path" "$(calls)" \
+	"/config/cogs/library.names.json"
+assert_lacks "a supplied script never uses the tour report" "$(calls)" "library_tour_report"
+names_count=$(find "${work}/script-green" -type f -path '*/config/cogs/library.names.json' | wc -l)
+assert_eq "the fetched script run retains exactly one names sidecar" 1 "$names_count"
+
+result=$(deploy unit --script "${work}/script-strict" "$script_file" --settle-evidence)
+assert_status "strict supplied script reaches its report" 0 "$(status_of "$result")"
+mapfile -t strict_run_dirs < <(find "${work}/script-strict" -type d -name 1788832560362471129)
+assert_eq "strict supplied script fetches exactly one run directory" 1 "${#strict_run_dirs[@]}"
+strict_run_dir=${strict_run_dirs[0]}
+strict_report_call=$(calls | grep '//cogs:script_run_report' | tail -n 1)
+expected_suffix="-- //cogs:script_run_report ${strict_run_dir} ${strict_run_dir}/config/cogs/library.names.json --settle-evidence"
+actual_suffix=${strict_report_call: -${#expected_suffix}}
+assert_eq "strict device report ends with its run directory, sidecar, and flag in order" \
+	"$expected_suffix" "$actual_suffix"
+
+result=$(deploy unit --script "${work}/script-bad-flag" "$script_file" --settle-evidenc)
+assert_status "a misspelled settle flag is refused" 1 "$(status_of "$result")"
+assert_contains "misspelled settle flag prints script syntax" "$(output_of "$result")" \
+	"--script <records-dir> FILE [--settle-evidence]"
+assert_lacks "usage does not attach settle evidence to tour mode" "$(output_of "$result")" \
+	"--tour <dir> [--settle-evidence]"
+result=$(deploy unit --script "${work}/script-misplaced" --settle-evidence "$script_file")
+assert_status "a misplaced settle flag is refused" 1 "$(status_of "$result")"
+assert_contains "misplaced settle flag prints script syntax" "$(output_of "$result")" \
+	"--script <records-dir> FILE [--settle-evidence]"
+
+export SSH_RUN_REACHED=no SSH_RUN_STATUS=255 SSH_PREPARE_STATUS=0
+result=$(deploy unit --script "${work}/script-ssh" "$script_file")
+assert_status "script ssh refusal is red" 1 "$(status_of "$result")"
+assert_contains "script ssh refusal names the connection" "$(output_of "$result")" "ssh to root@unit failed"
+
+export SSH_RUN_STATUS=5
+result=$(deploy unit --script "${work}/script-no-launch-config" "$script_file")
+assert_status "script launch-config refusal is red" 1 "$(status_of "$result")"
+assert_contains "script launch-config refusal names the payload" "$(output_of "$result")" "payload"
+assert_lacks "script launch refusal never runs its report" "$(calls)" "script_run_report"
+
+export SSH_RUN_STATUS=6
+result=$(deploy unit --script "${work}/script-no-provenance" "$script_file")
+assert_status "script provenance refusal is red" 1 "$(status_of "$result")"
+assert_contains "script provenance refusal names the stamp" "$(output_of "$result")" "provenance"
+
+export SSH_RUN_STATUS=4
+result=$(deploy unit --script "${work}/script-bus" "$script_file")
+assert_status "script bus refusal is red" 1 "$(status_of "$result")"
+assert_contains "script bus refusal names the bus" "$(output_of "$result")" "bus"
+
+export SSH_RUN_REACHED=yes SSH_RUN_STATUS=137
+result=$(deploy unit --script "${work}/script-137" "$script_file")
+assert_status "script launcher 137 is red" 1 "$(status_of "$result")"
+assert_contains "script launcher 137 names the launcher" "$(output_of "$result")" "launcher"
+assert_lacks "script launch failure never runs its report" "$(calls)" "script_run_report"
+
+export SSH_RUN_STATUS=124
+result=$(deploy unit --script "${work}/script-last-line" "$script_file")
+assert_status "script sender timeout is red" 1 "$(status_of "$result")"
+assert_contains "script timeout includes sender last line" "$(output_of "$result")" "the tour said why"
+
+export SSH_RUN_REACHED=no SSH_RUN_STATUS=124 SSH_PREPARE_STATUS=23
+result=$(deploy unit --script "${work}/script-remove" "$script_file")
+assert_status "script stale removal failure is red" 1 "$(status_of "$result")"
+assert_contains "script stale removal failure is named" "$(output_of "$result")" "stale script"
+
+export SSH_PREPARE_STATUS=0 RSYNC_STATUS=23
+result=$(deploy unit --script "${work}/script-transfer" "$script_file")
+assert_status "script transfer failure is red" 1 "$(status_of "$result")"
+assert_contains "script transfer failure is named" "$(output_of "$result")" "transfer script"
+assert_lacks "script transfer failure never runs its report" "$(calls)" "script_run_report"
+export RSYNC_STATUS=0
+
+export SSH_RUN_REACHED=yes SSH_RUN_STATUS=0 RSYNC_OLOG=none
+result=$(deploy unit --script "${work}/script-fetch" "$script_file")
+assert_status "script fetch failure is red" 1 "$(status_of "$result")"
+assert_lacks "script fetch failure never runs its report" "$(calls)" "script_run_report"
+export RSYNC_OLOG=full
+
+result=$(deploy unit --script "${work}/script-missing" "${work}/missing;touch pwned.json")
+assert_status "script preflight precedes remote mutation" 1 "$(status_of "$result")"
+assert_lacks "missing script reaches no device" "$(calls)" "ssh"
+assert_no_file "and shell metacharacters are not evaluated" "${work}/pwned.json"
+if [ "$(id -u)" -ne 0 ]; then
+	chmod 000 -- "${script_file}"
+	result=$(deploy unit --script "${work}/script-unreadable" "${script_file}")
+	assert_status "an unreadable script refuses before device mutation" 1 "$(status_of "$result")"
+	assert_lacks "the unreadable script reaches no device" "$(calls)" "ssh"
+	chmod 600 -- "${script_file}"
+else
+	pass "the deploy unreadable script check is guarded for root"
+fi
+export SSH_RUN_REACHED=no SSH_RUN_STATUS=124
+
+makefile="${script_dir}/../Makefile"
+motion_script_recipe=$(sed -n '/^motion-script:/,/^$/p' -- "$makefile")
+assert_contains "Makefile refuses an empty SCRIPT in an ordered submake" \
+	"$motion_script_recipe" "\$(MAKE) require-motion-script"
+assert_contains "Makefile script target invokes device deployment exactly" \
+	"$motion_script_recipe" "tools/deploy-motion.sh \$(REACHY_HOST) --script \$(MOTION_RECORDS) \"\$(SCRIPT)\""
+guard_line=$(printf '%s\n' "$motion_script_recipe" | grep -n 'require-motion-script' | cut -d: -f1)
+deploy_line=$(printf '%s\n' "$motion_script_recipe" | grep -n 'motion-deploy' | cut -d: -f1)
+if [ "$guard_line" -lt "$deploy_line" ]; then
+	pass "the empty SCRIPT guard precedes device deployment"
+else
+	fail "the empty SCRIPT guard precedes device deployment" \
+		"guard line ${guard_line}, deployment line ${deploy_line}"
+fi
 
 # ---------------------------------------------------------------------------
 # The two names another repository reads

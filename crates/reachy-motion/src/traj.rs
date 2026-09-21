@@ -57,6 +57,7 @@ use clockwork_rs::Duration as SlotDuration;
 /// numbering starts there rather than at one: a move with no warp is not a
 /// thing, and minimum-jerk is what the head actually moves on, because the
 /// linkage's own compliance rings on a velocity step.
+// TODO(configuration-space-moves)
 pub use brenn_reachy__motion__tick_state_clk_rs::WarpKind;
 
 /// Progress at normalised time `u`, which the caller has already placed in

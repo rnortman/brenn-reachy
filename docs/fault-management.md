@@ -18,9 +18,12 @@ because it never has far to fall and cannot fall fast. The risk of damage is
 mostly to the robot itself, not to any person or thing near it.
 
 The largest risk this device poses to its surroundings is the antennas
-sweeping through their outboard (sideways) arc and knocking something over —
-which is why the antenna arc policy exists in the motion code, and it is a
-*commanding* concern, not a fault-response concern.
+sweeping through their outboard (sideways) arc and knocking something over.
+Today the answer is content-authored antenna directions, with posed clips
+coming in on the short arc from where they are commanded, plus the short arc
+between planned targets; interference-aware planning waits on the vendor's
+geometry.
+This is a *commanding* concern, not a fault-response concern.
 
 Consequence for everything below: fault handling on this platform optimizes
 for simplicity and for getting to the safe condition fast. It does not import

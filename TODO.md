@@ -1,5 +1,18 @@
 # TODOs
 
+## `configuration-space-moves`
+
+Make future trajectories solve IK at both endpoints, interpolate in crank or
+configuration space, and use FK at every sample for envelope properties that
+crank windows do not express. Make an explicit product/design decision about
+the resulting head path. This needs its own design cycle; the fixed derived
+lift remains the authored path until then.
+
+Deferral context: the current trajectory interpolates task-space head poses and
+the linkage can pass through a configuration-space refusal between two valid
+endpoints. The transition gate samples the task-space path, so changing this
+requires a new planner and a reviewed decision about the physical path.
+
 Entries are slugs joined to `TODO(slug)` comments in the tree. See `CLAUDE.md`
 for the convention — including that this file ships publicly.
 
@@ -9,6 +22,29 @@ This is a placeholder entry. Leave it here so the file is never empty. It is not
 a real TODO. You would reference it in code with a `TODO(example-placeholder)`
 comment. That is the whole design: an entry here with a slug, joined to code
 comments by that slug. Add real TODOs below this one, in this format.
+
+## frame-aware-motion
+
+Name the head, body, and base/world frames and their transforms so camera or
+microphone targets can be commanded in the frame where they were sensed and a
+clip can express an antenna as world-upright instead of baking a number for one
+head tilt.
+
+Deferral context: the posed greeting's numerically authored world-upright
+antenna centre is the concrete case for a future motion-system frame model. The
+existing world/body yaw seam remains behaviorally unchanged until that design
+cycle decides the frame vocabulary and transforms.
+
+## play-mirrored
+
+Add a mirrored play invocation whose spatial map is head translation y -> -y,
+quaternion (w, x, y, z) -> (w, -x, y, -z), body yaw sign reversal, and
+antenna side-swap plus sign reversal, with both original and mirrored forms
+screened at load.
+
+Deferral context: this changes the shared wire contract and brenn-pod's cue
+vocabulary, so both repositories need one design cycle. Independently named
+wave assets remain committed motions rather than runtime-generated mirrors.
 
 ## `collision-envelope`
 
@@ -27,6 +63,27 @@ the check that would replace the cap needs the collision geometry the vendor
 publishes at three fidelities plus a segment-distance test that the envelope
 does not currently carry. Marked at `EnvelopeConfig` in
 `crates/reachy-kin/src/envelope.rs`.
+
+## `head-body-interference`
+
+Bound the head against the body. This needs the vendor's head/body geometry and
+a distance test the envelope does not currently carry. Until it exists, settle
+evidence from a run with contact cannot attribute the residual to a servo.
+
+Deferral context: marked at `EnvelopeConfig` in
+`crates/reachy-kin/src/envelope.rs`, beside the linkage collision bound.
+
+## `antenna-interference-geometry`
+
+Define a future antenna planning policy from the vendor's 3-D antenna and head
+geometry. It must model antenna/head and antenna/antenna interference and is the
+antenna counterpart to `collision-envelope`'s linkage geometry. Until then,
+planned moves take the shortest representable arc and content owns allowed
+directions.
+
+Deferral context: the machine's largest surroundings risk is an outboard antenna
+sweep, but the geometry needed to distinguish safe and unsafe arcs is not yet
+part of the envelope or planner.
 
 ## `health-read-budget`
 

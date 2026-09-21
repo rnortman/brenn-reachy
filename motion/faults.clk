@@ -177,6 +177,13 @@ schema TickFault
         // For the two obstructions the streak is the tracking run: the count it
         // had reached on the tick it ran out.
         #4 count: UInt32;
+
+        // Exact envelope evidence: bits 0..5 are unreachable legs 1..6,
+        // bits 6..11 are travel-window legs 1..6, bit 12 is toggle margin,
+        // bit 13 is body yaw, bit 14 is head-relative yaw, and bit 15 is the
+        // head cone. Zero means the raise was not an envelope result, and is
+        // also what an older log decodes to.
+        #5 envelope_checks: UInt32;
     }
 }
 

@@ -602,13 +602,13 @@ const LAG: i64 = 2;
 /// that timed the two moves fails if the pair is swapped.
 const UP_NS: i64 = 800_000_000;
 
-/// The pose these cases raise to, as the committed library numbers it.
+/// The pose these cases raise to, resolved by its declared library name.
 ///
-/// A number and not a name: the schedule carries an index, and what these cases
-/// are about is that the mover resolves it through the library it was
-/// configured with. `the_raise_id_is_a_pose_the_committed_library_holds` pins
-/// that this one is a pose of that library and is not the fold.
-const UP_POSE_ID: u16 = 0;
+/// The schedule carries an index, so the test resolves the name through the
+/// same sidecar the mover uses rather than assuming a document position.
+fn up_pose_id() -> u16 {
+    committed_poses::entry("neutral").pose_id
+}
 
 /// The index the fold sits at, as that library numbers it.
 fn stow_pose_id() -> u16 {
@@ -616,10 +616,10 @@ fn stow_pose_id() -> u16 {
 }
 
 /// Where the antennas rest at the raise, right then left, radians, as the
-/// committed library states it: the pose [`UP_POSE_ID`] names.
+/// committed library states it: the pose named `neutral`.
 fn neutral_antennas() -> [f64; 2] {
     committed_poses::library()
-        .targets(UP_POSE_ID)
+        .targets(up_pose_id())
         .expect("the raise is a pose the committed library holds")
         .0
         .antennas
@@ -813,7 +813,7 @@ impl Mover {
                 step.set_kind(*kind);
                 step.set_pose_id(*pose_id);
                 step.set_pace(clockwork_rs::Duration::from_nanos(
-                    if *pose_id == UP_POSE_ID {
+                    if *pose_id == up_pose_id() {
                         self.pace.0
                     } else {
                         self.pace.1
@@ -836,6 +836,82 @@ impl Mover {
         self.schedule_playing_engaged(true, epoch, windows);
     }
 
+    /// Publish an overlay schedule over a named committed base pose.
+    fn schedule_playing_pose(
+        &mut self,
+        epoch: u32,
+        pose_id: u16,
+        windows: &[(u16, i64, i64, f64, f64)],
+    ) {
+        let mut schedule = SessionScheduleWire::new();
+        schedule.set_engaged(true);
+        schedule.set_epoch(epoch);
+        {
+            let mut steps = schedule.steps_mut();
+            steps.clear();
+            let step: &mut ScheduledStepWire = steps.try_grow().expect("one step fits");
+            step.set_start(SyncTime::from_nanos(T0));
+            step.set_end(SyncTime::from_nanos(T0 + 1000 * PERIOD));
+            step.set_kind(StepKindWire::BASE_POSTURE);
+            step.set_pose_id(pose_id);
+            step.set_pace(clockwork_rs::Duration::from_nanos(self.pace.0));
+        }
+        {
+            let mut rows = schedule.overlays_mut();
+            rows.clear();
+            for (motion_id, opens, closes, gain, speed) in windows {
+                let row: &mut OverlayWindowWire = rows.try_grow().expect("four windows fit");
+                row.set_motion_id(*motion_id);
+                row.set_start(SyncTime::from_nanos(T0 + opens * PERIOD));
+                row.set_end(SyncTime::from_nanos(T0 + closes * PERIOD));
+                row.set_gain(*gain);
+                row.set_speed(*speed);
+            }
+        }
+        self.cog
+            .publish_sched(&schedule, SyncTime::from_nanos(self.now));
+    }
+
+    /// Publish overlay windows over a sequence of named base postures.
+    fn schedule_playing_poses(
+        &mut self,
+        epoch: u32,
+        spans: &[(&str, i64)],
+        windows: &[(u16, i64, i64, f64, f64)],
+    ) {
+        let mut schedule = SessionScheduleWire::new();
+        schedule.set_engaged(true);
+        schedule.set_epoch(epoch);
+        {
+            let mut steps = schedule.steps_mut();
+            steps.clear();
+            let mut start = T0;
+            for (name, cycles) in spans {
+                let step: &mut ScheduledStepWire = steps.try_grow().expect("three steps fit");
+                step.set_start(SyncTime::from_nanos(start));
+                start += cycles * PERIOD;
+                step.set_end(SyncTime::from_nanos(start));
+                step.set_kind(StepKindWire::BASE_POSTURE);
+                step.set_pose_id(committed_poses::entry(name).pose_id);
+                step.set_pace(clockwork_rs::Duration::from_nanos(self.pace.0));
+            }
+        }
+        {
+            let mut rows = schedule.overlays_mut();
+            rows.clear();
+            for (motion_id, opens, closes, gain, speed) in windows {
+                let row: &mut OverlayWindowWire = rows.try_grow().expect("four windows fit");
+                row.set_motion_id(*motion_id);
+                row.set_start(SyncTime::from_nanos(T0 + opens * PERIOD));
+                row.set_end(SyncTime::from_nanos(T0 + closes * PERIOD));
+                row.set_gain(*gain);
+                row.set_speed(*speed);
+            }
+        }
+        self.cog
+            .publish_sched(&schedule, SyncTime::from_nanos(self.now));
+    }
+
     /// The same, engaged or not: a schedule nobody is engaged on is what the
     /// interval between a script being accepted and an engagement concluding
     /// looks like to this cog.
@@ -855,7 +931,7 @@ impl Mover {
             step.set_start(SyncTime::from_nanos(T0));
             step.set_end(SyncTime::from_nanos(T0 + 1000 * PERIOD));
             step.set_kind(StepKindWire::BASE_POSTURE);
-            step.set_pose_id(UP_POSE_ID);
+            step.set_pose_id(up_pose_id());
             step.set_pace(clockwork_rs::Duration::from_nanos(self.pace.0));
         }
         {
@@ -996,11 +1072,8 @@ fn read_report(fault: &TickFaultWire) -> Report {
 /// Which way an antenna points, wrapped into a half turn either side of
 /// upright.
 ///
-/// An antenna is a free rotor and a sweep goes inboard over the head rather
-/// than out through its own sideways point, so a fold at -3.32 rad reaches
-/// upright by continuing on to a whole turn rather than by turning back. The
-/// reading is the turns as well as the direction; what a case about posture
-/// means is the direction.
+/// An antenna is a free rotor, so the reading is the turns as well as the
+/// direction; what a case about posture means is the direction.
 fn direction(angle: f64) -> f64 {
     let turn = angle.rem_euclid(core::f64::consts::TAU);
     if turn > core::f64::consts::PI {
@@ -1020,7 +1093,7 @@ fn standing_up() -> Mover {
     let mut mover = Mover::new();
     // One long step, so the whole run is inside it and a case that wants a
     // retarget publishes a fresh schedule rather than falling off the end.
-    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
     mover
 }
 
@@ -1136,7 +1209,7 @@ fn a_holding_machine_keeps_the_goal_stream_alive_with_the_setpoint_it_is_on() {
 #[test]
 fn a_session_nobody_engaged_is_never_armed_and_never_commands() {
     let mut mover = Mover::new();
-    mover.schedule(false, 1, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(false, 1, &[(1000, Some(up_pose_id()))]);
 
     let cycles = mover.run(5);
     assert!(cycles.iter().all(|cycle| cycle.goal.is_none()));
@@ -1161,7 +1234,7 @@ fn disengaging_ends_the_session_and_stops_the_stream() {
     mover.run(20);
     assert!(mover.cog.state_ctrl().armed());
 
-    mover.schedule(false, 2, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(false, 2, &[(1000, Some(up_pose_id()))]);
     let cycles = mover.run(3);
     assert!(
         cycles.iter().all(|cycle| cycle.goal.is_none()),
@@ -1613,9 +1686,9 @@ fn a_fresh_engagement_is_the_way_out_of_a_latched_fault() {
     assert!(mover.step().goal.is_none(), "parked");
 
     mover.blind = false;
-    mover.schedule(false, 2, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(false, 2, &[(1000, Some(up_pose_id()))]);
     mover.step();
-    mover.schedule(true, 3, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 3, &[(1000, Some(up_pose_id()))]);
     let fresh = mover.step();
     assert!(
         fresh.goal.is_some(),
@@ -1812,7 +1885,7 @@ fn a_repeated_schedule_dispatches_nothing_new() {
     mover.run(60);
     let arrived = mover.step().goal.expect("a goal").targets;
 
-    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
     let same = mover.run(3);
     for cycle in &same {
         assert_eq!(
@@ -1848,7 +1921,7 @@ fn two_posture_steps_under_one_epoch_answer_it_once() {
     mover.schedule(
         true,
         1,
-        &[(BOUNDARY, Some(UP_POSE_ID)), (1000, Some(stow_pose_id()))],
+        &[(BOUNDARY, Some(up_pose_id())), (1000, Some(stow_pose_id()))],
     );
 
     let up = mover.run(usize::try_from(BOUNDARY - 1).expect("cycles inside the first step"));
@@ -1894,7 +1967,7 @@ fn two_bumps_in_one_gap_are_answered_once() {
     // published inside the same span.
     const KEEP: usize = 6;
     let keep_until = mover.cycles_from_start() + i64::try_from(KEEP).expect("six cycles") + 1;
-    let spans = [(keep_until, None), (1000, Some(UP_POSE_ID))];
+    let spans = [(keep_until, None), (1000, Some(up_pose_id()))];
     mover.schedule(true, 2, &spans);
     mover.run(3);
     assert_eq!(
@@ -1963,7 +2036,7 @@ fn an_epoch_bump_alone_dispatches_a_fresh_move() {
 
     // The same step and the same posture at one epoch higher, covering the
     // instants the samples that follow name.
-    mover.schedule(true, 2, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 2, &[(1000, Some(up_pose_id()))]);
     let again = mover.run(3);
     assert!(reports(&again).is_empty(), "a retarget refuses nothing");
 
@@ -2042,7 +2115,7 @@ fn an_epoch_bump_in_a_gap_survives_until_a_step_answers() {
     const KEEP: usize = 4;
     let keep_cycles = i64::try_from(KEEP).expect("four cycles");
     let keep_until = mover.cycles_from_start() + keep_cycles + 1;
-    mover.schedule(true, 2, &[(keep_until, None), (1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 2, &[(keep_until, None), (1000, Some(up_pose_id()))]);
     let keeping = mover.run(KEEP);
     for cycle in &keeping {
         assert_eq!(
@@ -2092,7 +2165,7 @@ fn an_epoch_bump_in_a_gap_survives_until_a_step_answers() {
 #[test]
 fn a_step_that_keeps_the_base_and_a_gap_both_hold() {
     let mut mover = Mover::new();
-    mover.schedule(true, 1, &[(5, None), (1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 1, &[(5, None), (1000, Some(up_pose_id()))]);
 
     let keeping = mover.run(4);
     for cycle in &keeping {
@@ -2202,7 +2275,7 @@ fn the_tick_state_survives_the_slot_it_is_kept_in() {
     assert!(state.armed());
     assert_eq!(state.schedule_epoch_seen(), 1);
     assert_eq!(state.desired_kind(), StepKindWire::BASE_POSTURE);
-    assert_eq!(state.desired_pose_id(), UP_POSE_ID);
+    assert_eq!(state.desired_pose_id(), up_pose_id());
     assert_eq!(
         state.desired_pace(),
         SlotDuration::from_nanos(UP_NS),
@@ -2291,7 +2364,7 @@ fn a_second_raise_in_one_execution_is_counted_rather_than_quietly_lost() {
     mover.schedule(
         true,
         1,
-        &[(2, Some(UP_POSE_ID)), (1000, Some(stow_pose_id()))],
+        &[(2, Some(up_pose_id())), (1000, Some(stow_pose_id()))],
     );
     mover.present[row(JointRef::AntennaRight).expect("a bus row")] = stranded;
 
@@ -2370,7 +2443,7 @@ fn a_move_no_servo_could_step_through_is_floored_and_counted() {
     // The whole stand-up in one cycle, which every crank would have to cross in
     // one bus period.
     let mut mover = Mover::paced(&params(PERIOD), PERIOD, STOW_NS);
-    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
 
     let cycles = mover.run(80);
     assert!(
@@ -2417,7 +2490,7 @@ fn a_move_no_servo_could_step_through_is_floored_and_counted() {
 fn the_moves_clock_is_the_pace_the_row_states() {
     let slow = UP_NS * 2;
     let mut mover = Mover::paced(&params(PERIOD), slow, STOW_NS);
-    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
     let quick = usize::try_from(UP_NS / PERIOD).expect("a move of whole cycles");
     mover.run(quick + 5);
     assert!(
@@ -2441,7 +2514,7 @@ fn the_moves_clock_is_the_pace_the_row_states() {
 #[test]
 fn a_row_pacing_a_move_at_no_time_is_refused_and_moves_nothing() {
     let mut mover = Mover::paced(&params(PERIOD), 0, STOW_NS);
-    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
 
     let first = mover.step();
     let report = first.report.expect("a move of no time is reported");
@@ -2465,7 +2538,7 @@ fn a_row_pacing_a_move_at_no_time_is_refused_and_moves_nothing() {
 #[test]
 fn a_row_pacing_a_move_backwards_is_refused_the_same_way() {
     let mut mover = Mover::paced(&params(PERIOD), -UP_NS, STOW_NS);
-    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
 
     let first = mover.step();
     assert_eq!(
@@ -2497,7 +2570,7 @@ fn a_row_naming_the_dispatched_posture_at_another_pace_dispatches() {
 
     // The same epoch and the same posture; only the pace differs.
     mover.pace = (UP_NS / 2, STOW_NS);
-    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
     mover.run(1);
     assert_eq!(
         mover.cog.state_ctrl().desired_pace(),
@@ -2521,10 +2594,10 @@ fn a_row_naming_the_dispatched_posture_at_another_pace_dispatches() {
 fn the_raise_id_is_a_pose_the_committed_library_holds() {
     let library = committed_poses::library();
     assert!(
-        library.targets(UP_POSE_ID).is_some(),
+        library.targets(up_pose_id()).is_some(),
         "the committed library holds the pose these cases raise to",
     );
-    assert_ne!(UP_POSE_ID, stow_pose_id(), "and it is not the fold");
+    assert_ne!(up_pose_id(), stow_pose_id(), "and it is not the fold");
 }
 
 /// A pose id the deployed library does not hold is refused and nothing moves.
@@ -2575,8 +2648,8 @@ fn a_step_kind_this_build_cannot_read_holds() {
         true,
         1,
         &[
-            (5, StepKindWire(200), UP_POSE_ID),
-            (1000, StepKindWire::BASE_POSTURE, UP_POSE_ID),
+            (5, StepKindWire(200), up_pose_id()),
+            (1000, StepKindWire::BASE_POSTURE, up_pose_id()),
         ],
     );
 
@@ -2615,7 +2688,7 @@ fn a_step_kind_this_build_cannot_read_holds() {
 #[should_panic(expected = "execute() failed")]
 fn a_control_period_of_no_length_is_refused() {
     let mut mover = Mover::on(&params(0));
-    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
     mover.step();
 }
 
@@ -2623,7 +2696,7 @@ fn a_control_period_of_no_length_is_refused() {
 #[should_panic(expected = "execute() failed")]
 fn a_control_period_running_backwards_is_refused() {
     let mut mover = Mover::on(&params(-PERIOD));
-    mover.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+    mover.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
     mover.step();
 }
 
@@ -2640,6 +2713,7 @@ fn a_control_period_running_backwards_is_refused() {
 /// derivation.
 fn antenna_clip(step: f64, frames: usize) -> Clip {
     let doc = ClipDoc {
+        base: None,
         version: 1,
         kind: "clip".to_owned(),
         name: "wiggle".to_owned(),
@@ -2672,6 +2746,7 @@ fn one_motion(step: f64, frames: usize) -> Box<ClipLibraryConfigWire> {
 /// but not over every base a session composes it onto.
 fn one_head_motion(dz: f64, frames: usize) -> Box<ClipLibraryConfigWire> {
     let doc = ClipDoc {
+        base: None,
         version: 1,
         kind: "clip".to_owned(),
         name: "lift".to_owned(),
@@ -2724,6 +2799,160 @@ fn library_naming(clip_id: u16, step: f64, frames: usize) -> Box<ClipLibraryConf
         segment.gap_after_ms = 0;
     }
     out
+}
+
+/// One committed clip document, resolved against the committed pose library,
+/// as the real library emitter writes it: one clip and its one motion.
+fn committed_motion(name: &str) -> (Clip, Box<ClipLibraryConfigWire>) {
+    assert!(matches!(name, "hello_wave" | "dance"));
+    let path = format!("cogs/clips/{name}.json");
+    let json = std::fs::read_to_string(&path).expect("the committed clip is a runfile");
+    let clip = Clip::from_json_resolved(&json, &ClipLimits::default(), |base| {
+        Some(committed_poses::targets(base))
+    })
+    .expect("the committed clip loads through its real pose anchor");
+    let mut library = ClipLibraryConfigWire::new_boxed();
+    {
+        let message = library.clear_valid();
+        write_clip(&clip, message.clips.try_grow().expect("one clip fits"))
+            .expect("the committed clip fits");
+        let motion = message.motions.try_grow().expect("one motion fits");
+        motion.lead_gap_ms = 0;
+        let segment = motion.segments.try_grow().expect("one segment fits");
+        segment.clip_id = 0;
+        segment.speed = 1.0;
+        segment.gap_after_ms = 0;
+    }
+    (clip, library)
+}
+
+/// Assert both antenna representatives of one committed posed motion through
+/// the cog's real decision layer: per side, pin the authored span and
+/// pre-window base command at its expected turn, then require in-window goals
+/// to stay within the shifted authored range and reach authored targets.
+fn assert_committed_antenna_stream(
+    name: &str,
+    expected_spans: [Option<f64>; 2],
+    expected_turns: [i32; 2],
+    max_frame_excursion: Option<f64>,
+) {
+    let (clip, library) = committed_motion(name);
+    let anchor = clip
+        .anchor()
+        .expect("the committed clip is posed")
+        .targets();
+    let authored: [Vec<f64>; 2] = core::array::from_fn(|side| {
+        clip.frames()
+            .iter()
+            .map(|frame| anchor.antennas[side] + frame.antennas.expect("antenna frame")[side])
+            .collect()
+    });
+    for side in 0..2 {
+        let span = authored[side]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max)
+            - authored[side].iter().copied().fold(f64::INFINITY, f64::min);
+        if let Some(expected_span) = expected_spans[side] {
+            assert!(
+                (span - expected_span).abs() < 1e-3,
+                "{name} side {side} span {span}, expected {expected_span}"
+            );
+        }
+        if let Some(max_frame_excursion) = max_frame_excursion {
+            let frame_excursion = clip
+                .frames()
+                .iter()
+                .map(|frame| frame.antennas.expect("antenna frame")[side].abs())
+                .fold(0.0, f64::max);
+            assert!(frame_excursion <= max_frame_excursion + 1e-9);
+        }
+    }
+
+    let mut mover = Mover::playing(&params(PERIOD), &library);
+    if name == "hello_wave" {
+        mover.schedule_playing_poses(
+            1,
+            &[("peek_tilt", 80), ("hello", 40), ("hello", 880)],
+            &[(0, 120, 760, 1.0, 1.0)],
+        );
+    } else {
+        mover.schedule_playing_pose(
+            1,
+            committed_poses::entry("neutral").pose_id,
+            &[(0, 120, 760, 1.0, 1.0)],
+        );
+    }
+    let cycles = mover.run(800);
+    assert!(
+        reports(&cycles).is_empty(),
+        "{name} reports a refusal or fault"
+    );
+    assert_eq!(mover.cog.state_ctrl().overlays_refused(), 0);
+    assert_eq!(mover.cog.state_ctrl().players_refused(), 0);
+
+    for side in 0..2 {
+        let joint = row(if side == 0 {
+            JointRef::AntennaRight
+        } else {
+            JointRef::AntennaLeft
+        })
+        .expect("a bus row");
+        let pre_window = cycles[118]
+            .goal
+            .as_ref()
+            .expect("the base commands before the window")
+            .targets[joint];
+        let expected_turn = f64::from(expected_turns[side]);
+        let pre_reference = if name == "hello_wave" {
+            [-0.8303838173726208, -0.23610866451374868][side]
+        } else {
+            [-0.1745, 0.1745][side]
+        };
+        assert!(
+            (pre_window - (pre_reference + core::f64::consts::TAU * expected_turn)).abs() < 1e-4,
+            "{name} side {side} pre-window {pre_window}, reference {pre_reference}, turn {}",
+            expected_turns[side]
+        );
+        let low = authored[side].iter().copied().fold(f64::INFINITY, f64::min)
+            + core::f64::consts::TAU * expected_turn;
+        let high = authored[side]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max)
+            + core::f64::consts::TAU * expected_turn;
+        let mut full_weight_samples = 0;
+        let mut closest_error = f64::INFINITY;
+        for cycle in &cycles[130..700] {
+            let goal = cycle.goal.as_ref().expect("the overlay keeps commanding");
+            assert!(goal.targets[joint] >= low - 1e-4 && goal.targets[joint] <= high + 1e-4);
+            let error = authored[side]
+                .iter()
+                .map(|target| {
+                    (goal.targets[joint] - (target + core::f64::consts::TAU * expected_turn)).abs()
+                })
+                .fold(f64::INFINITY, f64::min);
+            closest_error = closest_error.min(error);
+            if error < 1e-4 {
+                full_weight_samples += 1;
+            }
+        }
+        assert!(
+            full_weight_samples > 10,
+            "{name} side {side} never reached full antenna weight; closest error {closest_error}"
+        );
+    }
+}
+
+#[test]
+fn committed_hello_wave_and_dance_keep_their_antenna_representatives() {
+    assert_committed_antenna_stream(
+        "hello_wave",
+        [Some(0.0), Some(1.4666666666666675)],
+        [0, 1],
+        None,
+    );
+    assert_committed_antenna_stream("dance", [None, None], [-1, 1], Some(0.26));
 }
 
 /// How far each servo travelled between consecutive goals, cycle by cycle.
@@ -2840,7 +3069,7 @@ fn an_overlay_window_composes_over_the_base_and_hands_it_back() {
     // The same schedule with no window, driven in step, which is what "the
     // composition is visible" is visible against.
     let mut bare = Mover::new();
-    bare.schedule(true, 1, &[(1000, Some(UP_POSE_ID))]);
+    bare.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
 
     let mut composed = Vec::new();
     let mut plain = Vec::new();
@@ -2920,7 +3149,9 @@ fn an_overlay_window_composes_over_the_base_and_hands_it_back() {
     );
     assert!(reports(&composed).is_empty(), "nothing was refused");
     assert!(
-        (mover.at(JointRef::AntennaRight) - bare.at(JointRef::AntennaRight)).abs() < 1e-3,
+        (direction(mover.at(JointRef::AntennaRight)) - direction(bare.at(JointRef::AntennaRight)))
+            .abs()
+            < 1e-3,
         "the base ended at {} against the plain run's {}",
         mover.at(JointRef::AntennaRight),
         bare.at(JointRef::AntennaRight),
@@ -3783,7 +4014,7 @@ fn script_msg_paced(
             row.set_duration_ms(step.duration_ms);
             row.set_kind(step.kind);
             row.set_pose_id(step.pose_id);
-            row.set_move_ms(move_ms.unwrap_or(if step.pose_id == UP_POSE_ID {
+            row.set_move_ms(move_ms.unwrap_or(if step.pose_id == up_pose_id() {
                 u32::try_from(UP_NS / 1_000_000).expect("a pace in whole milliseconds")
             } else {
                 u32::try_from(STOW_NS / 1_000_000).expect("a pace in whole milliseconds")
@@ -3832,7 +4063,7 @@ fn one_step_script(script_id: u32, arrival_ns: i64) -> ScriptWire {
             after_ms: 500,
             duration_ms: 2_000,
             kind: StepKindWire::BASE_POSTURE,
-            pose_id: UP_POSE_ID,
+            pose_id: up_pose_id(),
         }],
         &[],
     )
@@ -4055,7 +4286,7 @@ fn an_accepted_script_becomes_the_schedule_the_session_holds() {
     assert_eq!(step.start().as_nanos(), arrival + 500_000_000);
     assert_eq!(step.end().as_nanos(), arrival + 2_500_000_000);
     assert_eq!(step.kind(), StepKindWire::BASE_POSTURE);
-    assert_eq!(step.pose_id(), UP_POSE_ID);
+    assert_eq!(step.pose_id(), up_pose_id());
 }
 
 /// Two scripts in one window are answered one at a time, and the first one
@@ -4076,7 +4307,7 @@ fn the_first_script_accepted_in_a_window_is_the_schedule() {
                     after_ms: 0,
                     duration_ms: 1_000,
                     kind: StepKindWire::BASE_POSTURE,
-                    pose_id: UP_POSE_ID,
+                    pose_id: up_pose_id(),
                 },
                 Step {
                     after_ms: 1_000,
@@ -4133,7 +4364,7 @@ fn an_accepted_script_carries_its_overlay_windows() {
                 after_ms: 0,
                 duration_ms: 1_000,
                 kind: StepKindWire::BASE_POSTURE,
-                pose_id: UP_POSE_ID,
+                pose_id: up_pose_id(),
             }],
             &[Overlay {
                 motion_id: 3,
@@ -4271,7 +4502,12 @@ fn a_base_steps_pace_crosses_the_screen_and_a_move_of_no_time_is_refused() {
     };
 
     cog.publish_script(
-        &script_msg(1, T0, &[step(StepKindWire::BASE_POSTURE, UP_POSE_ID)], &[]),
+        &script_msg(
+            1,
+            T0,
+            &[step(StepKindWire::BASE_POSTURE, up_pose_id())],
+            &[],
+        ),
         SyncTime::from_nanos(T0),
     );
     let _ = wake(&mut cog, T0 + 1);
@@ -4289,7 +4525,7 @@ fn a_base_steps_pace_crosses_the_screen_and_a_move_of_no_time_is_refused() {
         &script_msg_paced(
             2,
             T0,
-            &[step(StepKindWire::BASE_POSTURE, UP_POSE_ID)],
+            &[step(StepKindWire::BASE_POSTURE, up_pose_id())],
             &[],
             Some(0),
         ),
@@ -4569,7 +4805,7 @@ fn an_instant_the_clock_does_not_have_is_refused() {
                 after_ms,
                 duration_ms,
                 kind: StepKindWire::BASE_POSTURE,
-                pose_id: UP_POSE_ID,
+                pose_id: up_pose_id(),
             }],
             &[],
         )
@@ -7456,7 +7692,7 @@ fn a_window_outliving_the_last_step_keeps_the_machine_under_command() {
             after_ms: 500,
             duration_ms: 500,
             kind: StepKindWire::BASE_POSTURE,
-            pose_id: UP_POSE_ID,
+            pose_id: up_pose_id(),
         }],
         &[Overlay {
             motion_id: 0,
@@ -7763,7 +7999,7 @@ fn hold_script(script_id: u32, arrival_ns: i64, duration_ms: u32) -> ScriptWire 
             after_ms: 0,
             duration_ms,
             kind: StepKindWire::BASE_POSTURE,
-            pose_id: UP_POSE_ID,
+            pose_id: up_pose_id(),
         }],
         &[],
     )
@@ -7861,7 +8097,7 @@ fn a_replacement_carries_its_own_windows_and_none_of_the_old_ones() {
                 after_ms: 0,
                 duration_ms: 3_000,
                 kind: StepKindWire::BASE_POSTURE,
-                pose_id: UP_POSE_ID,
+                pose_id: up_pose_id(),
             }],
             &[Overlay {
                 motion_id: 4,
@@ -8002,7 +8238,7 @@ fn an_overlay_window_past_the_span_cap_is_refused() {
                 after_ms: 0,
                 duration_ms: 1_000,
                 kind: StepKindWire::BASE_POSTURE,
-                pose_id: UP_POSE_ID,
+                pose_id: up_pose_id(),
             }],
             &[Overlay {
                 motion_id: 1,

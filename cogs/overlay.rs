@@ -570,19 +570,21 @@ impl<'a> Overlays<'a> {
     }
 
     /// Advance every playing row by one period and collect what it contributes.
+    /// `commanded_antennas` is the last commanded setpoint, used once when a
+    /// posed antenna channel enters and retained until that channel fades out.
     ///
     /// The window's gain scales the player's own weights, which is what a gain
     /// is: the share of the motion's delta that applies where the motion is at
     /// full blend. A player whose motion and fade-out are both over contributes
     /// nothing and is left in place — its row holds the finished player it is,
     /// so nothing restarts it.
-    pub fn sample(&mut self, period: Duration) -> Samples {
+    pub fn sample(&mut self, period: Duration, commanded_antennas: [f64; 2]) -> Samples {
         let mut samples = Samples::none();
         for row in &mut self.rows {
             let Some(PlayingRow { gain, player, .. }) = row else {
                 continue;
             };
-            let Some(mut sample) = player.advance(period) else {
+            let Some(mut sample) = player.advance(period, commanded_antennas) else {
                 continue;
             };
             for channel in Channel::ALL {
@@ -624,6 +626,7 @@ mod tests {
     /// confused with its neighbour shows up.
     fn doc(name: &str, frames: usize) -> ClipDoc {
         ClipDoc {
+            base: None,
             version: 1,
             kind: "clip".to_owned(),
             name: name.to_owned(),
@@ -889,7 +892,7 @@ mod tests {
             state.motion_id = 0;
             let mut player = ClipPlayer::joining_at(motion, 1.5, Duration::from_millis(60), state);
             for _ in 0..3 {
-                player.advance(PERIOD);
+                player.advance(PERIOD, [0.0, 0.0]);
             }
         }
         let state = slot.validate().expect("a played row validates");
@@ -927,9 +930,9 @@ mod tests {
                     let (mut crossed, refusals) =
                         Overlays::take_up(&mut crossed_rows, &windows, now);
                     assert_eq!(refusals, Refusals::default(), "tick {tick}");
-                    crossed.sample(PERIOD)
+                    crossed.sample(PERIOD, [0.0, 0.0])
                 };
-                let whole_samples = whole.sample(PERIOD);
+                let whole_samples = whole.sample(PERIOD, [0.0, 0.0]);
                 assert_eq!(
                     crossed_samples.as_slice(),
                     whole_samples.as_slice(),
@@ -958,7 +961,10 @@ mod tests {
         let (mut at_full, _) = Overlays::take_up(&mut full_rows, &full, 0);
         let (mut at_half, _) = Overlays::take_up(&mut half_rows, &half, 0);
         for tick in 0..8 {
-            let (full_sample, half_sample) = (at_full.sample(PERIOD), at_half.sample(PERIOD));
+            let (full_sample, half_sample) = (
+                at_full.sample(PERIOD, [0.0, 0.0]),
+                at_half.sample(PERIOD, [0.0, 0.0]),
+            );
             let (full_sample, half_sample) = (full_sample.as_slice()[0], half_sample.as_slice()[0]);
             assert_eq!(full_sample.frame, half_sample.frame, "tick {tick}");
             for channel in Channel::ALL {
@@ -984,14 +990,14 @@ mod tests {
         {
             let (mut open, _) = Overlays::take_up(&mut rows, &windows, 0);
             assert!(open.any());
-            assert!(!open.sample(PERIOD).is_empty());
+            assert!(!open.sample(PERIOD, [0.0, 0.0]).is_empty());
         }
         assert!(rows[0].active(), "an open window keeps its player");
 
         {
             let (mut closed, refusals) = Overlays::take_up(&mut rows, &windows, 100_000_000);
             assert!(!closed.any(), "a closed window plays nothing");
-            assert!(closed.sample(PERIOD).is_empty());
+            assert!(closed.sample(PERIOD, [0.0, 0.0]).is_empty());
             assert_eq!(refusals, Refusals::default());
         }
         assert!(!rows[0].active(), "a closed window leaves no player");
@@ -1009,7 +1015,7 @@ mod tests {
         {
             let (mut playing, _) = Overlays::take_up(&mut rows, &first, 0);
             for _ in 0..4 {
-                playing.sample(PERIOD);
+                playing.sample(PERIOD, [0.0, 0.0]);
             }
         }
 
@@ -1020,7 +1026,7 @@ mod tests {
         {
             let (mut fresh, refusals) = Overlays::take_up(&mut rows, &second, 200_000_000);
             assert_eq!(refusals, Refusals::default());
-            fresh.sample(PERIOD);
+            fresh.sample(PERIOD, [0.0, 0.0]);
         }
         assert_eq!(rows[0].motion_id(), 1);
         assert_eq!(
@@ -1042,7 +1048,7 @@ mod tests {
         {
             let (mut playing, _) = Overlays::take_up(&mut rows, &windows, 0);
             for _ in 0..4 {
-                playing.sample(PERIOD);
+                playing.sample(PERIOD, [0.0, 0.0]);
             }
         }
         // A frozen head delta the pick-up refuses: the flag says a rotation is
@@ -1068,6 +1074,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_row_with_a_stray_antenna_turn_is_refused_and_rejoined() {
+        let library = library();
+        let validated = ValidatedLibrary::of(read(&library)).expect("the fixture library plays");
+        let windows = Windows::of(&schedule(&[(0, 0, 400_000_000, 1.0, 1.0)]), &validated);
+        let mut rows = core::array::from_fn::<_, MAX_OVERLAYS, _>(|_| ClipPlayerSnapWire::new());
+        {
+            let (mut playing, refusals) = Overlays::take_up(&mut rows, &windows, 0);
+            assert_eq!(refusals, Refusals::default());
+            playing.sample(PERIOD, [0.0, 0.0]);
+        }
+        rows[0]
+            .validate_mut()
+            .expect("the playing row validates")
+            .antenna_turns_right = 1;
+
+        let (mut rejoined, refusals) = Overlays::take_up(&mut rows, &windows, 20_000_000);
+        assert_eq!(refusals, Refusals { players: 1 });
+        assert!(!rejoined.sample(PERIOD, [0.0, 0.0]).is_empty());
+        assert_eq!(
+            rows[0]
+                .validate()
+                .expect("the fresh row validates")
+                .antenna_turns_right,
+            0
+        );
+    }
+
     /// A player whose clip and fade-out are both over contributes nothing and is
     /// left in place: its row says it is finished, so nothing restarts it.
     #[test]
@@ -1081,7 +1115,7 @@ mod tests {
         {
             let mut layer = Overlays::take_up(&mut rows, &windows, 0).0;
             for tick in 0..40 {
-                if !layer.sample(PERIOD).is_empty() {
+                if !layer.sample(PERIOD, [0.0, 0.0]).is_empty() {
                     last_contribution = tick;
                 }
             }

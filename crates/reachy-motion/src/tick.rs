@@ -481,10 +481,10 @@ impl Default for MotionConfig {
                 body_yaw: 0.15,
                 // The fastest sweep on record — an antenna crossing 3.22 rad in
                 // 0.3 s, 855°/s — plans a peak of 0.403 rad per period at
-                // 50 Hz. Better than half as much again. A sweep takes the arc
-                // that misses its outboard direction, so the widest one
-                // commandable is just under a full turn: 6.28 rad, which needs
-                // 0.36 s to stay inside this.
+                // 50 Hz. Better than half as much again. The normal widest
+                // planned sweep is half a turn; the representability fallback
+                // can approach a full turn, which needs 0.36 s to stay inside
+                // this.
                 antennas: 0.65,
             },
             tracking: TrackingFaultConfig::default(),
@@ -903,6 +903,13 @@ pub const ANTENNA_GOAL_MAX_RAD: f64 =
 pub const ANTENNA_GOAL_MIN_RAD: f64 =
     -core::f64::consts::TAU * (ANTENNA_GOAL_COUNTS / COUNTS_PER_TURN) - core::f64::consts::PI;
 
+/// The largest whole-turn lift a posed antenna channel can retain.
+///
+/// The interval is just under 512 turns wide, so two representable points can
+/// never be separated by 512 whole turns.
+pub const ANTENNA_TURNS_MAX: i32 =
+    ((ANTENNA_GOAL_MAX_RAD - ANTENNA_GOAL_MIN_RAD) / core::f64::consts::TAU).floor() as i32;
+
 /// The highest count body yaw's goal register holds.
 ///
 /// The yaw servo is provisioned in single-turn mode — commissioning stops
@@ -925,22 +932,6 @@ pub const YAW_GOAL_COUNT_MAX: f64 = COUNTS_PER_TURN - 1.0;
 pub fn yaw_goal_counts(radians: f64) -> f64 {
     ((radians + core::f64::consts::PI) * COUNTS_PER_TURN / core::f64::consts::TAU).round()
 }
-
-/// The physically sideways direction each antenna is kept from sweeping
-/// through, radians: right, then left.
-///
-/// Horizontal — a quarter turn either side of straight up — and signed by the
-/// side the antenna is mounted on, so each constant names its own antenna's
-/// outboard direction. That arc is the maximal-interference one: it sweeps the
-/// widest envelope around the machine exactly where objects sit beside it,
-/// while the inboard arc crosses the antennas harmlessly over the head at their
-/// different heights and disturbs almost nothing outside the head's footprint.
-///
-/// Deliberately not derived from the stow angles. Halfway between straight up
-/// and the fold is ±1.66 rad, about 5.1° off horizontal; these are the physical
-/// direction and stay put if the stow angles ever move.
-pub const ANTENNA_OUTBOARD: [f64; 2] =
-    [-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2];
 
 /// What a caller asks the tick to do.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2521,12 +2512,8 @@ fn shape_move(
 /// without commanding anything.
 ///
 /// What a caller driving its own tick-by-tick composition needs and cannot
-/// assemble itself: the antenna resolution that routes each side away from its
-/// outboard direction is private to this module, and a trajectory built from
-/// [`floor_move_clock`]'s deliberately *unresolved* target would sweep the
-/// short arc straight through the point that resolution exists to miss. So the
-/// whole construction lives here — resolve, floor the clock, shape the path to
-/// the resolved target — and a caller that samples the result and hands each
+/// assemble itself: antenna resolution, clock flooring, and trajectory shaping
+/// all happen together so a caller that samples the result and hands each
 /// sample back as [`MotionCommand::Track`] moves exactly as the same command
 /// through [`take_command`] would have.
 ///
@@ -2930,11 +2917,10 @@ pub fn floor_move_clock(
         return (*command, None);
     }
     (
-        // The target as it was handed in, unresolved: the resolution above is
-        // this pass's own arithmetic, and re-resolving an already-resolved
-        // antenna direction is not the identity.
+        // Return the resolved target so a caller driving the floored command
+        // receives the same continuous representatives the dry pass measured.
         MotionCommand::MoveTo {
-            target: *target,
+            target: resolved,
             durations: effective,
             warp: *warp,
         },
@@ -3359,7 +3345,7 @@ pub fn joints_of(cfg: &MotionConfig, targets: &JointTargets) -> Option<JointVect
 /// An antenna target is a direction — a physical angle mod 2π — and the
 /// machine's frame for it is continuous and unbounded. Each direction resolves
 /// to a representative within a turn of where the last command left that
-/// antenna, chosen to miss the outboard sideways point. This is the only wrap
+/// antenna. This is the only wrap
 /// arithmetic on the command path, and the one place it lives: the
 /// interpolation, the step guard, the tracking comparison and the dry pass that
 /// right-sizes a move's clock all take plain linear differences in the frame it
@@ -3374,7 +3360,7 @@ fn resolve_antennas(
         .enumerate()
     {
         let last = start.antennas[side];
-        match resolve_antenna(last, resolved.antennas[side], ANTENNA_OUTBOARD[side]) {
+        match resolve_antenna(last, resolved.antennas[side]) {
             Some(angle) => resolved.antennas[side] = angle,
             None => {
                 // Both arcs land where no servo count reaches. The preferred one
@@ -3389,53 +3375,23 @@ fn resolve_antennas(
 
 /// The representative of direction `target` nearest `last`: the arc no longer
 /// than half a turn.
-fn short_arc(last: f64, target: f64) -> f64 {
+pub fn short_arc(last: f64, target: f64) -> f64 {
     last + wrap_to_pi(target - last)
 }
 
-/// Which representative of antenna direction `target` to sweep to from `last`,
-/// or `None` when no servo count reaches either candidate.
-///
-/// The short arc unless it would carry the antenna through `outboard` — the
-/// direction it must not sweep past — in which case the long way round, which
-/// costs at most a turn and keeps the antenna over the head instead of out to
-/// the side. Endpoints count as not crossing, so an antenna already standing at
-/// sideways takes the shortest path away from it, and one commanded exactly
-/// there arrives the short way.
-fn resolve_antenna(last: f64, target: f64, outboard: f64) -> Option<f64> {
-    // The sweep is the wrapped difference itself, not `short - last`: adding it
-    // to `last` and taking it back off loses a bit at some angles, and the
-    // endpoint case below compares it against a distance measured from `last`
-    // for equality.
-    let sweep = wrap_to_pi(target - last);
-    let short = last + sweep;
-    // Ground from `last` to `outboard` in the direction of travel, up to a
-    // turn. Strictly inside the sweep is a crossing; nothing else is — an
-    // antenna standing on the point measures no ground or a whole turn of it,
-    // and one arriving there measures the sweep itself.
-    //
-    // Measured through the same wrap the sweep is, and turned round the same
-    // way, so that an antenna commanded exactly to the point reaches the
-    // comparison with the two figures bit-equal rather than a rounding apart.
-    let forward = (outboard - last).rem_euclid(core::f64::consts::TAU);
-    let to_outboard = if sweep >= 0.0 {
-        forward
-    } else {
-        core::f64::consts::TAU - forward
-    };
-    let crosses = to_outboard > 0.0 && to_outboard < sweep.abs();
-
-    let long = if sweep >= 0.0 {
+/// Resolve the representative nearest `last`, preferring the short arc and
+/// then the opposite representative, or `None` when neither is representable.
+// TODO(antenna-interference-geometry): use the vendor's 3-D antenna and head
+// geometry to model antenna/head and antenna/antenna interference before
+// choosing a planned arc; content owns allowed directions until then.
+pub fn resolve_antenna(last: f64, target: f64) -> Option<f64> {
+    let short = short_arc(last, target);
+    let other = if short >= last {
         short - core::f64::consts::TAU
     } else {
         short + core::f64::consts::TAU
     };
-    let (preferred, fallback) = if crosses {
-        (long, short)
-    } else {
-        (short, long)
-    };
-    [preferred, fallback].into_iter().find(|angle| {
+    [short, other].into_iter().find(|angle| {
         !(outside_limit(*angle, ANTENNA_GOAL_MAX_RAD) || below_limit(*angle, ANTENNA_GOAL_MIN_RAD))
     })
 }
@@ -3449,6 +3405,38 @@ mod tests {
     };
     use crate::seq::{RegId, SeqStepKind, StepContext};
     use reachy_kin::rest_head_pose;
+
+    #[test]
+    fn antenna_turn_bound_matches_the_register_interval() {
+        assert_eq!(ANTENNA_TURNS_MAX, 511);
+        assert!(
+            ANTENNA_GOAL_MIN_RAD + core::f64::consts::TAU * f64::from(ANTENNA_TURNS_MAX + 1)
+                > ANTENNA_GOAL_MAX_RAD
+        );
+    }
+
+    #[test]
+    fn shared_antenna_helpers_agree_on_the_half_turn_tie() {
+        let last = 0.37;
+        let target = last + core::f64::consts::PI;
+        assert_eq!(resolve_antenna(last, target), Some(short_arc(last, target)));
+    }
+
+    #[test]
+    fn antenna_resolution_uses_the_other_representative_at_a_goal_edge() {
+        let last = ANTENNA_GOAL_MAX_RAD - 0.1;
+        let target = last + core::f64::consts::PI - 1e-3;
+        let resolved = resolve_antenna(last, target).expect("the opposite representative fits");
+        let nearest = short_arc(last, target);
+        let other = if nearest >= last {
+            nearest - core::f64::consts::TAU
+        } else {
+            nearest + core::f64::consts::TAU
+        };
+        assert_ne!(resolved, nearest);
+        assert_eq!(resolved, other);
+        assert!((ANTENNA_GOAL_MIN_RAD..=ANTENNA_GOAL_MAX_RAD).contains(&resolved));
+    }
 
     /// Where these cases fold the antennas, right then left, radians: past
     /// straight down and leaning inboard, which is the shape of a fold.
@@ -4000,9 +3988,8 @@ mod tests {
                 Some(0),
             ),
             (
-                // Mirrored, so the arc is the direct one: the left antenna's
-                // outboard point sits where the right's does reflected, and a
-                // positive sweep this wide would be sent the long way round it.
+                // Mirrored, so the left antenna carries the same direct span
+                // as the right one.
                 "left antenna",
                 JointTargets {
                     antennas: [0.0, -antenna_span],
@@ -4724,11 +4711,8 @@ mod tests {
     /// machine actually runs, each named with the clock it runs on.
     ///
     /// The stow pose carries the antennas the machine actually folds them to,
-    /// so its antenna leg is a landing and a length: the sweep from neutral is
-    /// most of a turn inboard over the head, and the fixture asserts the walk
-    /// lands on it and takes that long. Which branch of the arc policy produces
-    /// the inboard sweep is `an_antenna_sweep_misses_its_outboard_point`'s
-    /// question, not this one's.
+    /// so its antenna leg is a landing and a length: the fixture asserts the
+    /// walk lands on it and takes the shortest representable arc.
     fn landing_fixtures() -> [(&'static str, JointTargets, JointTargets, f64); 4] {
         let rest = JointTargets {
             head_pose_body: rest_head_pose(),
@@ -5228,48 +5212,33 @@ mod tests {
         }
     }
 
-    /// An antenna whose short arc would sweep through the outboard point goes
-    /// the long way round, and the clock is sized for the arc the machine
-    /// actually travels — not for the short one nobody commanded.
-    ///
-    /// Both halves of the one place this pass does wrap arithmetic. The dry
-    /// sample runs over the resolved representative, so the span it measures is
-    /// the long one; and what comes back carries the target exactly as it was
-    /// handed in, because resolving an already-resolved direction a second time
-    /// at the tick would flip it back to the short arc and run a path whose
-    /// clock was never measured.
+    /// The dry sample and returned command use the same resolved representative,
+    /// so a caller can drive the floored path without changing its arc.
     #[test]
-    fn an_antenna_that_wraps_is_floored_for_the_arc_it_sweeps() {
+    fn an_antenna_crossing_outboard_is_floored_for_its_short_arc() {
         let cfg = MotionConfig::default();
         let (state, _) = armed_at(&cfg, &JointTargets::default());
 
-        // The right antenna, from straight up: the short way to -2 rad crosses
-        // its outboard direction at -π/2, so the sweep is the other way round.
+        // The right antenna, from straight up, takes the negative short arc.
         let short_arc = -2.0;
-        let long_arc = short_arc + core::f64::consts::TAU;
         let command = MotionCommand::MoveTo {
             target: JointTargets {
                 antennas: [short_arc, 0.0],
                 ..JointTargets::default()
             },
-            durations: MoveDurations::uniform(secs(0.15)),
+            durations: MoveDurations::uniform(secs(0.05)),
             warp: WarpKind::MinJerk,
         };
 
         let (floored, stretch) =
             floor_move_clock(&cfg, &last_targets(&state), &command, FLOOR_TICK_HZ);
-        let stretch = stretch.expect("a seventh of a second cannot carry a turn of antenna");
+        let stretch = stretch.expect("a seventh of a second cannot carry a 2 rad antenna sweep");
 
-        let long_floor = duration_floor_s(long_arc, cfg.max_step.antennas, FLOOR_TICK_HZ);
         let short_floor = duration_floor_s(short_arc.abs(), cfg.max_step.antennas, FLOOR_TICK_HZ);
         let moved = stretch.effective.antennas[0].as_secs_f64();
         assert!(
-            lands_on(moved, long_floor, FLOOR_TICK_HZ),
-            "stretched to {moved:.4} s, not the {long_floor:.4} s the long way round needs"
-        );
-        assert!(
-            moved > short_floor * 1.5,
-            "stretched to {moved:.4} s, which the {short_floor:.4} s short arc would have covered"
+            lands_on(moved, short_floor, FLOOR_TICK_HZ),
+            "stretched to {moved:.4} s, not the {short_floor:.4} s short arc needs"
         );
 
         let MotionCommand::MoveTo { target, .. } = floored else {
@@ -5278,7 +5247,7 @@ mod tests {
         assert_eq!(
             target.antennas,
             [short_arc, 0.0],
-            "the target came back resolved, and the tick resolves it again"
+            "the target came back as the resolved short representative"
         );
     }
 
@@ -5294,7 +5263,7 @@ mod tests {
 
     /// The stow representative the recordings hold the pair at, a hair over half
     /// a turn from straight up on each side.
-    const SWEPT_FROM: [f64; 2] = [3.2336, -3.2336];
+    const SWEPT_FROM: [f64; 2] = [-3.32, 3.32];
 
     /// The gesture the pair is judged on: both antennas inboard to straight up,
     /// on `antennas` and a head clock of `head`.
@@ -9066,8 +9035,8 @@ mod tests {
         assert_eq!(report.violations.window, [false; 6], "{verdict:?}");
         assert_eq!(report.violations.unreachable, [false; 6]);
         assert!(
-            report.violations.margin,
-            "and it is still tighter than the floor"
+            !report.violations.margin,
+            "the armed clearance clears the floor"
         );
         assert_eq!(
             format!("{:.9}", state.present_min_margin),
@@ -9082,18 +9051,18 @@ mod tests {
     /// measured that rest is refused.
     #[test]
     fn the_present_clearance_is_the_baseline() {
-        let cfg = MotionConfig::default();
+        let cfg = MotionConfig {
+            env: EnvelopeConfig {
+                min_toggle_margin: 0.0015,
+                ..EnvelopeConfig::default()
+            },
+            ..MotionConfig::default()
+        };
         let rest = rest_targets(0.0);
         let (mut state, pinned) = armed_at(&cfg, &rest);
-        assert!(
-            state.present_min_margin < cfg.env.min_toggle_margin,
-            "the armed rest is tighter than the floor: {}",
-            state.present_min_margin
-        );
+        assert!((state.present_min_margin - 0.000841568).abs() < 1e-9);
 
-        // One millimetre up: still far below the floor, admitted because it
-        // improves on the measured clearance.
-        let lift = rest_targets(0.001);
+        let lift = rest_targets(0.0011);
         let command = MotionCommand::MoveTo {
             target: lift,
             durations: MoveDurations::uniform(secs(2.0)),
@@ -10020,6 +9989,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn floor_move_clock_returns_the_valid_fallback_representative() {
+        let cfg = MotionConfig::default();
+        let start = antennas_at([ANTENNA_GOAL_MAX_RAD - 0.1, 0.0]);
+        let target = antennas_at([start.antennas[0] + 0.2, 0.0]);
+        let command = MotionCommand::MoveTo {
+            target,
+            durations: MoveDurations::uniform(secs(0.02)),
+            warp: WarpKind::MinJerk,
+        };
+        let (floored, _) = floor_move_clock(&cfg, &start, &command, FLOOR_TICK_HZ);
+        let MotionCommand::MoveTo {
+            target: resolved,
+            durations,
+            warp,
+        } = floored
+        else {
+            panic!("a move remains a move")
+        };
+        assert!(
+            (resolved.antennas[0] - (target.antennas[0] - core::f64::consts::TAU)).abs() < 1e-12
+        );
+        assert!((ANTENNA_GOAL_MIN_RAD..=ANTENNA_GOAL_MAX_RAD).contains(&resolved.antennas[0]));
+
+        let normal_command = MotionCommand::MoveTo {
+            target: resolved,
+            durations,
+            warp,
+        };
+        let (mut normal_state, pinned) = armed_at(&cfg, &start);
+        let mut normal_goals = Vec::new();
+        for n in 0..=200 {
+            let command = (n == 0).then_some(&normal_command);
+            let out = tick_with(
+                &cfg,
+                &mut normal_state,
+                secs(f64::from(n) * 0.02),
+                &pinned,
+                command,
+            );
+            if let Some(goal) = out.goal {
+                normal_goals.push(goal);
+            }
+            if out.report.completed {
+                break;
+            }
+        }
+        let (trajectory, _) = plan_move(
+            &cfg,
+            &start,
+            &target,
+            MoveDurations::uniform(secs(0.02)),
+            WarpKind::MinJerk,
+            FLOOR_TICK_HZ,
+            None,
+        )
+        .expect("the planned path is accepted");
+        let (mut track_state, track_pinned) = armed_at(&cfg, &start);
+        let mut track_goals = Vec::new();
+        for n in 1..=200 {
+            let mut sample = JointTargets::default();
+            trajectory.sample(secs(f64::from(n) * 0.02), &mut sample);
+            let command = MotionCommand::Track(sample);
+            let out = tick_with(
+                &cfg,
+                &mut track_state,
+                secs(f64::from(n) * 0.02),
+                &track_pinned,
+                Some(&command),
+            );
+            if let Some(goal) = out.goal {
+                track_goals.push(goal);
+            }
+            if trajectory.done(secs(f64::from(n) * 0.02)) {
+                break;
+            }
+        }
+        assert_eq!(
+            normal_goals, track_goals,
+            "MoveTo and Track diverged by period"
+        );
+        let landed = last_targets(&normal_state).antennas[0];
+        assert!(wrap_to_pi(landed - target.antennas[0]).abs() < 1e-9);
+        assert!((ANTENNA_GOAL_MIN_RAD..=ANTENNA_GOAL_MAX_RAD).contains(&landed));
+    }
+
     /// Every antenna goal a move emits, in order, for one side.
     fn antenna_series(
         cfg: &MotionConfig,
@@ -10047,25 +10102,17 @@ mod tests {
         series
     }
 
-    /// The arc policy: a sweep takes the way round that misses the antenna's own
-    /// outboard sideways point, because that is the direction that sweeps the
-    /// widest envelope past whatever is standing beside the machine.
-    ///
-    /// Two legs per side, and they prove different halves. The stow fold leans
-    /// inboard of straight down, so its *short* arc to upright already misses
-    /// the outboard point and the policy never fires: that leg is the sweep the
-    /// machine actually makes, asserted to miss the point, land, and be a whole
-    /// turn less the difference. The synthetic fold short of half a turn is the
-    /// leg whose short arc does cross, so it is the one the long-way branch
-    /// carries; the same three assertions hold over it.
+    /// Every side and direction takes the shortest representable arc.
     #[test]
-    fn an_antenna_sweep_misses_its_outboard_point() {
+    fn an_antenna_sweep_takes_the_short_arc() {
         let cfg = MotionConfig::default();
-        for (side, outboard) in ANTENNA_OUTBOARD.into_iter().enumerate() {
-            let stow = FOLD[side];
-            // Inboard of the outboard point, so its short arc crosses it.
-            let crossing = if side == 0 { -2.5 } else { 2.5 };
-            for (from, to) in [(stow, 0.0), (0.0, stow), (crossing, 0.0), (0.0, crossing)] {
+        for side in 0..2 {
+            for (from, to) in [
+                (FOLD[side], 0.0),
+                (0.0, FOLD[side]),
+                (if side == 0 { -2.0 } else { 2.0 }, 0.0),
+                (0.0, if side == 0 { -2.0 } else { 2.0 }),
+            ] {
                 let mut antennas = [0.0; 2];
                 antennas[side] = from;
                 let start = antennas_at(antennas);
@@ -10075,103 +10122,15 @@ mod tests {
                 let series =
                     antenna_series(&cfg, &mut state, &pinned, &antennas_at(antennas), side);
                 assert!(!series.is_empty(), "antenna {side} was commanded");
-                for goal in &series {
-                    assert!(
-                        wrap_to_pi(goal - outboard).abs() > 0.5,
-                        "antenna {side} passed its outboard point at {goal} going {from} -> {to}"
-                    );
-                }
                 let landed = *series.last().expect("a last goal");
                 assert!(wrap_to_pi(landed - to).abs() < 1e-9, "landed at {landed}");
                 let swept = (landed - from).abs();
-                let fold = if from == 0.0 { to } else { from };
                 assert!(
-                    (swept - (core::f64::consts::TAU - fold.abs())).abs() < 1e-9,
+                    (swept - wrap_to_pi(to - from).abs()).abs() < 1e-9,
                     "antenna {side} swept {swept} rad going {from} -> {to}"
                 );
             }
         }
-    }
-
-    /// An antenna already standing at its outboard point takes the shortest
-    /// path away from it: the endpoint counts as not crossing, so nothing sends
-    /// a sideways antenna the long way round to come down.
-    #[test]
-    fn an_antenna_at_sideways_takes_the_short_way() {
-        let cfg = MotionConfig::default();
-        for (side, outboard) in ANTENNA_OUTBOARD.into_iter().enumerate() {
-            let stow = FOLD[side];
-            let mut antennas = [0.0; 2];
-            antennas[side] = outboard;
-            let start = antennas_at(antennas);
-            let (mut state, pinned) = armed_at(&cfg, &start);
-
-            // Down to stow, which is the near side from sideways.
-            antennas[side] = stow;
-            let (_, out) = run_move(
-                &cfg,
-                &mut state,
-                &pinned,
-                &antennas_at(antennas),
-                secs(2.0),
-                0.02,
-            );
-            assert!(out.report.completed, "{:?}", out.report.fault);
-            let landed = last_targets(&state).antennas[side];
-            let swept = (landed - outboard).abs();
-            assert!(
-                (swept - (stow.abs() - core::f64::consts::FRAC_PI_2)).abs() < 1e-9,
-                "antenna {side} swept {swept} rad from sideways"
-            );
-        }
-    }
-
-    /// And an antenna commanded *to* its outboard point arrives the short way,
-    /// for the same reason: arriving at the point is not passing through it.
-    #[test]
-    fn an_antenna_commanded_to_sideways_arrives_the_short_way() {
-        let cfg = MotionConfig::default();
-        for (side, outboard) in ANTENNA_OUTBOARD.into_iter().enumerate() {
-            let stow = FOLD[side];
-            let mut antennas = [0.0; 2];
-            antennas[side] = stow;
-            let start = antennas_at(antennas);
-            let (mut state, pinned) = armed_at(&cfg, &start);
-
-            antennas[side] = outboard;
-            let (_, out) = run_move(
-                &cfg,
-                &mut state,
-                &pinned,
-                &antennas_at(antennas),
-                secs(2.0),
-                0.02,
-            );
-            assert!(out.report.completed, "{:?}", out.report.fault);
-            let landed = last_targets(&state).antennas[side];
-            let swept = (landed - stow).abs();
-            assert!(
-                (swept - (stow.abs() - core::f64::consts::FRAC_PI_2)).abs() < 1e-9,
-                "antenna {side} swept {swept} rad to sideways"
-            );
-        }
-    }
-
-    /// The outboard constants are the physical sideways direction — a quarter
-    /// turn either side of straight up — and not the halfway point between
-    /// straight up and the fold, which is 5.1° off it. A machine whose stow
-    /// fold moved would keep the same two constants.
-    #[test]
-    fn the_outboard_directions_are_horizontal() {
-        assert_eq!(
-            ANTENNA_OUTBOARD,
-            [-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2]
-        );
-        let stow_midpoint = FOLD[1] / 2.0;
-        assert!(
-            (stow_midpoint - core::f64::consts::FRAC_PI_2).abs() > 0.04,
-            "halfway to the fold is {stow_midpoint}, which is not horizontal"
-        );
     }
 
     /// A direction a whole turn from the frame is the direction the machine is
@@ -10705,22 +10664,19 @@ mod tests {
     /// the clock, and shapes the path exactly as the tick would have, so the
     /// goals that go on the wire are goal-for-goal identical.
     ///
-    /// The antenna target is deliberately one whose short arc crosses its
-    /// outboard direction, which is the whole reason a caller cannot assemble
-    /// this trajectory itself: the resolution that routes it the long way round
-    /// is private to the tick.
+    /// The antenna target resolves to the negative short representative.
     #[test]
     fn a_planned_move_driven_as_setpoints_is_the_move_it_planned() {
         let cfg = MotionConfig::default();
         let start = JointTargets::default();
         let target = JointTargets {
             body_yaw: 0.2,
-            antennas: [-1.7, 0.3],
+            antennas: [-2.0, 0.3],
             ..lifted(0.005)
         };
         // Short enough that the pass has to lengthen it, so the equivalence
         // covers the flooring too.
-        let asked = MoveDurations::uniform(secs(0.2));
+        let asked = MoveDurations::uniform(secs(0.05));
 
         let (mut commanded, pinned) = armed_at(&cfg, &start);
         let (floored, stretch) = floor_move_clock(
@@ -10773,12 +10729,7 @@ mod tests {
             planned_stretch, stretch,
             "the same clock, reported the same"
         );
-        assert!(
-            trajectory.target().antennas[0] > 0.0,
-            "the right antenna goes the long way round, not through its outboard \
-             direction: {}",
-            trajectory.target().antennas[0]
-        );
+        assert!(trajectory.target().antennas[0] < 0.0);
 
         let mut streamed = Vec::new();
         let mut present = pinned;

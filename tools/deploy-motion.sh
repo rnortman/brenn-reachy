@@ -5,6 +5,7 @@
 #   tools/deploy-motion.sh <host> --push [--stale-ok]
 #   tools/deploy-motion.sh <host> --run <dir>
 #   tools/deploy-motion.sh <host> --tour <dir>
+#   tools/deploy-motion.sh <host> --script <records-dir> FILE [--settle-evidence]
 #   tools/deploy-motion.sh <host> --probe <dir> <motion>
 #   tools/deploy-motion.sh <host> --fetch <dir>
 #   tools/deploy-motion.sh <host> --speech <dir>
@@ -715,7 +716,7 @@ workspace_paths=(
 )
 
 usage() {
-	die "usage: ${prog} <host> --push [--stale-ok]|--run <dir>|--tour <dir>|--probe <dir> <motion>|--fetch <dir>|--speech <dir>|--speech-preflight|--speech-fetch <dir>|--record <dir>|--record-preflight|--record-fetch <dir>"
+	die "usage: ${prog} <host> --push [--stale-ok]|--run <dir>|--tour <dir>|--script <records-dir> FILE [--settle-evidence]|--probe <dir> <motion>|--fetch <dir>|--speech <dir>|--speech-preflight|--speech-fetch <dir>|--record <dir>|--record-preflight|--record-fetch <dir>"
 }
 
 # Refuse a value that is not a plain path or name, saying what it was.
@@ -1402,6 +1403,16 @@ tour_budget() {
 	echo "$seconds"
 }
 
+script_budget() {
+	local file=$1 seconds
+	seconds=$($bazel run "${build_flags[@]}" -- "$ask_target" --script-budget "$file") ||
+		die "the supplied script's budget could not be computed."
+	case $seconds in
+	'' | *[!0-9]* | 0) die "the supplied script budget was not a positive integer: ${seconds}" ;;
+	esac
+	echo "$seconds"
+}
+
 # Refuse a tree with no committed name table.
 #
 #   require_tour_names
@@ -1469,6 +1480,25 @@ ask_last_line() {
 	fi
 }
 
+# Report launcher and preparation refusals before records are fetched.
+check_launch_refusal() {
+	local subject=$1 article=$2 guidance=$3
+	if ! launcher_reached "${aside}/run-console.log"; then
+		bus_refusal "$rc" "$article" \
+			"255 is ssh's own code and also the run's if the launcher exited with it" \
+			"Its own error is above. Check ${launch_logs} on ${host} before re-running," \
+			"and ${prog} ${host} --fetch <records-dir> first if this run's records matter:" \
+			"the next run empties the log root."
+		chain_refusal "$rc" "$launch_config" --fetch "$guidance"
+	fi
+}
+
+# Settle the sender after the launcher returns, preserving the launcher's
+# status while allowing a successful quit exchange to finish.
+settle_sender() {
+	printf '%s' "; launcher_rc=\$?; i=0; while kill -0 \"\$ask\" 2>/dev/null && [ \"\$i\" -lt 10 ]; do sleep 1; i=\$((i + 1)); done; if kill -0 \"\$ask\" 2>/dev/null; then kill -INT \"\$ask\" 2>/dev/null; i=0; while kill -0 \"\$ask\" 2>/dev/null && [ \"\$i\" -lt 10 ]; do sleep 1; i=\$((i + 1)); done; if kill -0 \"\$ask\" 2>/dev/null; then kill -KILL \"\$ask\" 2>/dev/null; fi; fi; wait \"\$ask\" 2>/dev/null; ask_rc=\$?; if [ \"\$launcher_rc\" -ne 0 ]; then exit \"\$launcher_rc\"; fi; exit \"\$ask_rc\""
+}
+
 # Play the library, or one motion of it, and judge what came back.
 #
 #   play_from_library <records directory> [motion]
@@ -1525,10 +1555,7 @@ play_from_library() {
 	# is where --run and this differ: the launcher returns 0 both when the
 	# sender quit it and when it fell over on its own, and only the sender
 	# knows which of those happened.
-	remote="${remote}; rc=\$?"
-	remote="${remote}; kill -INT \$ask 2>/dev/null"
-	remote="${remote}; wait \$ask; ask_rc=\$?"
-	remote="${remote}; exit \$(( rc != 0 ? rc : ask_rc ))"
+	remote="${remote}$(settle_sender)"
 
 	if [ -n "$motion" ]; then
 		echo "${prog}: playing ${motion} on ${host}; the machine moves for" >&2
@@ -1545,15 +1572,8 @@ play_from_library() {
 	# The chain's own refusals, as --run's: a console with no sentinel in it
 	# is a chain that refused or an ssh that never connected, and nothing was
 	# recorded to fetch.
-	if ! launcher_reached "${aside}/run-console.log"; then
-		bus_refusal "$rc" "$article" \
-			"255 is ssh's own code and also the run's if the launcher exited with it" \
-			"Its own error is above. Check ${launch_logs} on ${host} before re-running," \
-			"and ${prog} ${host} --fetch <records-dir> first if this run's records matter:" \
-			"the next run empties the log root."
-		chain_refusal "$rc" "$launch_config" --fetch \
-			"The payload there predates the harness twin — push again:"
-	fi
+	check_launch_refusal "$subject" "$article" \
+		"The payload there predates the harness twin — push again:"
 
 	# The fetch comes before the judgement here, which is the other way
 	# round from --run. A run that ended badly ended after playing some of
@@ -1595,6 +1615,46 @@ play_from_library() {
 	# sender's own selection, written into the run directory here.
 	asked=$(asked_table "$run_dir" "$motion")
 	tour_verdict "$run_dir" "$asked"
+}
+
+play_script() {
+	local dest=$1 file=$2 strict=${3:-no} budget log_root remote out console run_dir
+	dest=$(absolute_path "$dest")
+	file=$(absolute_path "$file")
+	[ -f "$file" ] && [ -r "$file" ] || die "script ${file} is not a readable regular file."
+	require_bazel "the script's budget and run"
+	budget=$(script_budget "$file")
+	log_root=$(config_string log_root_dir)
+	require_wipeable_log_root "$log_root"
+	ssh -o BatchMode=yes "root@${host}" "rm -f -- ${release}/script.json" ||
+		die "could not remove the stale script on ${host}; nothing was launched."
+	rsync -a --delete -e "ssh -o BatchMode=yes" -- "$file" "root@${host}:${release}/script.json" ||
+		die "could not transfer script ${file} to ${host}; nothing was launched."
+	remote=$(launch_chain "$log_root" cogs/library.names.json)
+	remote="${remote}; ./${ask_binary} --script script.json >${launch_logs}/${ask_console_name} 2>&1 &"
+	remote="${remote} ask=\$!"
+	remote="${remote}; timeout --signal=INT --kill-after=10 ${budget} ./simplelaunch ${launch_config} --logdir ${launch_logs}"
+	remote="${remote}$(settle_sender)"
+	echo "${prog}: running supplied script on ${host}; ${budget}s is the backstop." >&2
+	launch_and_capture "$remote" \
+		"will not reach the unit: the supplied script has a ${budget}s backstop."
+	check_launch_refusal "the supplied script" "a supplied script" \
+		"The payload there predates the harness twin — push again:"
+	out=$(fetch_records "$dest" "$log_root" script-log motion)
+	console=$(file_captures "$aside" "$out")
+	echo "${prog}: console ${console}"
+	case "$rc" in
+	0) ;;
+	124) die "the supplied script reached its ${budget}s backstop; the sender's last line: $(ask_last_line "$console"); records were fetched to ${out}." ;;
+	137) die "the launcher did not stop on SIGINT and was killed (exit ${rc}); records were fetched to ${out}." ;;
+	*) die "the supplied script failed (exit ${rc}); the sender's last line: $(ask_last_line "$console"); records were fetched to ${out}." ;;
+	esac
+	run_dir=$(fetched_run_dir "$out")
+	if [ "$strict" = yes ]; then
+		script_verdict "$run_dir" "${run_dir}/config/cogs/library.names.json" --settle-evidence
+	else
+		script_verdict "$run_dir" "${run_dir}/config/cogs/library.names.json"
+	fi
 }
 
 # The chain fragment that puts this run's configuration beside its records.
@@ -1718,6 +1778,7 @@ fetched_run_dir() {
 # of it, which is the caller's to append.
 launch_chain() {
 	local log_root=$1 remote
+	shift
 	# The bus question and the run are one ssh invocation, which is
 	# what makes the question binding: asked separately, a service
 	# can start in between and the run meets a held bus anyway. That
@@ -1785,7 +1846,7 @@ launch_chain() {
 	# fetch having to know anything. A rename within the store's own
 	# tmpfs, so full-tmpfs and permission failures cannot reach it.
 	remote="${remote}; mv -- ${staged_provenance} ${log_root}/${provenance_name} || exit ${rc_post_wipe}"
-	remote="${remote}$(config_into_log_root "$log_root")"
+	remote="${remote}$(config_into_log_root "$log_root" "$@")"
 	# The payload's first publishes are started here, and the front
 	# of each stream is whatever the logger was late for: it opens
 	# its subscriptions on a poll after it opens the log and attaches
@@ -2489,6 +2550,15 @@ case "$mode" in
 		[ -n "$dest" ] || usage
 		[ $# -eq 1 ] || usage
 		play_from_library "$dest"
+		;;
+
+	--script)
+		dest=${1:-}
+		file=${2:-}
+		strict=no
+		if [ "$#" -eq 3 ] && [ "$3" = --settle-evidence ]; then strict=yes; else [ "$#" -eq 2 ] || usage; fi
+		[ -n "$dest" ] && [ -n "$file" ] || usage
+		play_script "$dest" "$file" "$strict"
 		;;
 
 	--probe)

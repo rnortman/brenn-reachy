@@ -101,8 +101,8 @@ pub const MAX_EXCURSION_RAD: f64 = 2.0 * COUNT_RAD;
 /// the motion: the servo's own profile generator paces every move, so a joint
 /// is still travelling after its setpoint stops changing. The widest hold this
 /// stack judges follows the antennas' arc from the fold to the rest lean,
-/// 3.0977 rad at the antennas' commissioned `522 / 640` under the class's
-/// measured following lag: 24 periods — just under half a second — for the
+/// 3.1377 rad at the antennas' commissioned `522 / 640` under the class's
+/// measured following lag: 25 periods — half a second — for the
 /// whole move, the ramps at either end,
 /// the two periods of dead time and the shaft's decay onto the arrived
 /// generator included. The rod then rings down. Four seconds covers both, with
@@ -956,7 +956,7 @@ mod tests {
     /// is what fails when either document moves;
     /// [`the_allowance_covers_the_widest_hold_this_stack_judges`] below is what
     /// then says whether the allowance still covers the travel.
-    const FOLD: [f64; 2] = [-3.459_133_736_422_664_6, 3.359_641_315_834_277_7];
+    const FOLD: [f64; 2] = [-3.32, 3.32];
     const REST: [f64; 2] = [-0.1745, 0.1745];
 
     /// The side every case here watches, unless it says otherwise.
@@ -1418,7 +1418,7 @@ mod tests {
         }
         // The figures the allowance's comment states, so a moved fold or a
         // moved pair fails here naming both of them.
-        assert_eq!(widest, 24, "the widest judged arc takes {widest} periods");
+        assert_eq!(widest, 25, "the widest judged arc takes {widest} periods");
         let travel = DRIVER_PERIOD * u32::try_from(widest).expect("a period count fits");
         assert!(
             travel + RING_DOWN <= SETTLE,

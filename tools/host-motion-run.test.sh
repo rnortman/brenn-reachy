@@ -71,6 +71,7 @@ pinion_namespace: ""
 CONFIG
 }
 stage_logger_config
+printf '%s\n' 'checkout names' >"${repo}/cogs/library.names.json"
 
 # Bazel's outputs, in a directory the stub answers with workspace-relative paths
 # into — the shape the subject resolves through the convenience symlink.
@@ -128,6 +129,7 @@ case "\$sub" in
 		chmod 0755 -- bazel-out/bin/robot_host_clk_exe bazel-out/bin/reachy_ask \\
 			bazel-out/bin/clockwork_prelaunch.sh bazel-out/bin/simplelaunch
 		echo 'app { name: "proc" }' >bazel-out/bin/hostcpu.textproto
+		printf '%s\n' '{"motions":[],"poses":[{"duration_ms":1,"name":"stow","pose_id":0}]}' >bazel-out/bin/library.names.json
 		for f in ${generated_files[*]}; do
 			echo "generated \$f" >"bazel-out/bin/\$f"
 		done
@@ -144,6 +146,9 @@ case "\$sub" in
 				# member the subject stages without querying for it is a
 				# \`bazel_named_in\` refusal here rather than in front of an
 				# operator.
+				case "\$target" in *library.names.json*)
+					echo bazel-out/bin/library.names.json ;;
+				esac
 				case "\$target" in *//cogs:robot_host_clk_exe*)
 					echo bazel-out/bin/robot_host_clk_exe ;;
 				esac
@@ -258,6 +263,10 @@ import time
 with open(os.environ["CALLS"], "a", encoding="utf-8") as calls:
     calls.write("ask " + " ".join(sys.argv[1:]) + "\n")
 
+if "--script-budget" in sys.argv:
+    print(os.environ.get("SCRIPT_BUDGET", "77"))
+    sys.exit(0)
+
 stopped = False
 
 
@@ -306,7 +315,7 @@ chmod 0755 -- "${stubs}/install"
 host_run() {
 	: >"$CALLS"
 	local out status=0
-	out=$(cd -- "$repo" && "$subject" 2>&1) || status=$?
+	out=$(cd -- "$repo" && "$subject" "$@" 2>&1) || status=$?
 	printf '%s\n---status %s\n' "$out" "$status"
 }
 
@@ -361,6 +370,10 @@ assert_contains "one cquery names the configuration" "$(calls)" \
 	"-- //cogs:host_config_files"
 assert_eq "and there are two cqueries, not one per target" 2 \
 	"$(calls | grep -c 'bazel cquery')"
+assert_lacks "default build omits the supplied-script analyzer" "$(calls)" \
+	"//cogs:script_run_report"
+assert_lacks "default output query omits the generated names" "$(calls)" \
+	"//cogs:library.names.json"
 
 # The analyzer reads the configuration a run was performed under out of the run's
 # own records and refuses a log without it, the way it does on a device. This run
@@ -518,5 +531,74 @@ assert_contains "a renamed gesture constant is red here" "$refusal" \
 	"one of the names has moved"
 assert_contains "and the refusal names the file it read" "$refusal" \
 	"${work}/renamed-gesture.rs"
+
+# ---------------------------------------------------------------------------
+# The arbitrary-script staging path and Makefile guards
+# ---------------------------------------------------------------------------
+
+script_file="${work}/script with spaces.json"
+printf '%s\n' '{"script":"fixture"}' >"$script_file"
+SCRIPT_BUDGET=47
+export SCRIPT_BUDGET
+rm -rf -- "${repo}/target"
+result=$(host_run --script "$script_file")
+assert_status "a supplied script run succeeds" 0 "$(status_of "$result")"
+assert_contains "script build includes the supplied-script analyzer" "$(calls)" \
+	"//cogs:script_run_report"
+assert_contains "script build and output query include generated names" "$(calls)" \
+	"//cogs:library.names.json"
+assert_file "the supplied script has the fixed staged name" "${staging}/script.json"
+assert_eq "the script bytes are staged unchanged" \
+	"$(cat -- "$script_file")" "$(cat -- "${staging}/script.json")"
+assert_contains "the budget output drives the timeout" "$(calls)" "launcher hostcpu.textproto"
+assert_contains "the sender receives the fixed script path" "$(calls)" "ask --script script.json"
+assert_contains "the budget is reported" "$(output_of "$result")" "47s"
+assert_contains "script mode retains the staged names bytes" \
+	"$(cat -- "${staging}/cogs/library.names.json")" '"motions":[]'
+assert_lacks "script mode does not retain checkout names bytes" \
+	"$(cat -- "${staging}/cogs/library.names.json")" 'checkout names'
+assert_lacks "default script mode does not request settle evidence" "$(calls)" "--settle-evidence"
+assert_contains "script mode retains names beside records" \
+	"$(cat -- "${logs}/1788832560362471129/config/cogs/library.names.json")" '"motions":[]'
+
+result=$(host_run --script "$script_file" --settle-evidence)
+assert_status "strict host script run succeeds" 0 "$(status_of "$result")"
+assert_contains "strict script build includes the supplied-script analyzer" "$(calls)" \
+	"//cogs:script_run_report"
+assert_contains "strict script output query includes generated names" "$(calls)" \
+	"//cogs:library.names.json"
+strict_report_call=$(calls | grep '//cogs:script_run_report' | tail -n 1)
+expected_suffix="-- //cogs:script_run_report ${logs}/1788832560362471129 ${logs}/1788832560362471129/config/cogs/library.names.json --settle-evidence"
+actual_suffix=${strict_report_call: -${#expected_suffix}}
+assert_eq "strict host report ends with its run directory, sidecar, and flag in order" \
+	"$expected_suffix" "$actual_suffix"
+
+result=$(host_run --script "${work}/missing;touch pwned.json")
+assert_status "a missing script with shell metacharacters refuses" 1 "$(status_of "$result")"
+assert_no_file "and a metacharacter is never evaluated" "${work}/pwned.json"
+result=$(host_run --script "$script_file" extra)
+assert_status "an extra script argument refuses" 1 "$(status_of "$result")"
+result=$(host_run --script "${work}/unreadable.json")
+assert_status "a missing script refuses" 1 "$(status_of "$result")"
+if [ "$(id -u)" -ne 0 ]; then
+	chmod 000 -- "${script_file}"
+	result=$(host_run --script "${script_file}")
+	assert_status "an unreadable script refuses" 1 "$(status_of "$result")"
+	chmod 600 -- "${script_file}"
+else
+	pass "the unreadable script check is guarded for root"
+fi
+
+makefile="${script_dir}/../Makefile"
+assert_contains "Makefile offers the host script target" "$(cat -- "$makefile")" \
+	'motion-host-script SCRIPT=...'
+assert_contains "Makefile guards the host script variable" "$(cat -- "$makefile")" \
+	"tools/host-motion-run.sh --script \"\$(SCRIPT)\""
+assert_contains "Makefile invokes the device script tool exactly" "$(cat -- "$makefile")" \
+	"tools/deploy-motion.sh \$(REACHY_HOST) --script \$(MOTION_RECORDS) \"\$(SCRIPT)\""
+assert_contains "Makefile validates the strict variable" "$(cat -- "$makefile")" \
+	'SETTLE_EVIDENCE must be empty or 1.'
+assert_contains "Makefile translates strict mode for the host" "$(cat -- "$makefile")" \
+	'--settle-evidence'
 
 tally

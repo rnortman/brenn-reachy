@@ -327,7 +327,10 @@ pub(crate) fn decide(
     let (samples, refused) = {
         let (mut layer, refusals) =
             Overlays::take_up(&mut state.players_mut()[..], windows, ask.now_ns);
-        (layer.sample(ask.period), refusals.players)
+        (
+            layer.sample(ask.period, setpoint.antennas),
+            refusals.players,
+        )
     };
     counters.players_refused += refused;
     let vacated = playing & !active_rows(state) != 0;
@@ -338,7 +341,8 @@ pub(crate) fn decide(
     // same setpoint as the last one, and the vacated contribution decays from
     // there as a planned, step-bounded move like any other.
     if vacated {
-        base = Base::held(uncompose(setpoint, samples.as_slice()));
+        let held = base.targets;
+        base = Base::held(uncompose(setpoint, samples.as_slice(), &held));
     }
     // A handover or a re-anchor is sent on toward wherever the schedule was
     // already sending the base; a period that merely carries on is not
@@ -423,9 +427,9 @@ fn asked_move(goal: Goal) -> MotionCommand {
 /// the rate the clock is floored against are this cog's.
 ///
 /// What a caller outside the control loop wants it for is the two things the
-/// postures alone do not say: where the move really ends -- an antenna routed
-/// the long way round travels further than the difference between the angles the
-/// postures name -- and where it stands at each period on the way.
+/// postures alone do not say: where the move really ends -- including the
+/// representative selected for each antenna -- and where it stands at each
+/// period on the way.
 ///
 /// The refusal is carried rather than dropped: a caller outside the loop is
 /// asking about a move it believes in, so which envelope or clock the planner
@@ -526,6 +530,16 @@ fn steer(
 mod tests {
     use super::*;
 
+    use brenn_reachy__cogs__config_clk_rs::ClipLibraryConfigWire;
+    use brenn_reachy__cogs__schedule_clk_rs::OverlayWindowWire;
+    use clockwork_rs::SyncTime;
+    use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
+    use reachy_clips::compose::{ChannelWeights, OverlayAnchors, OverlaySample};
+    use reachy_clips::config::write_clip;
+    use reachy_clips::envelope::ClipLimits;
+    use reachy_clips::format::{Channel, ChannelMask, Clip, ClipDoc, DeltaFrame, FrameDoc};
+    use reachy_motion::joints::JointTargets;
+
     use reachy_motion::joints::JointRef;
     use reachy_motion::phase::PhaseSeparation;
     use reachy_poses::{NEUTRAL_POSE, STOW_POSE};
@@ -535,6 +549,207 @@ mod tests {
 
     /// The cycle rate every clock below is floored against.
     const TICK_HZ: f64 = 50.0;
+
+    fn mover_fixture_windows() -> (
+        Windows<'static>,
+        Windows<'static>,
+        Windows<'static>,
+        Windows<'static>,
+        JointTargets,
+    ) {
+        let base = JointTargets::default();
+        let posed_anchor = JointTargets {
+            head_pose_body: Isometry3::from_parts(
+                Translation3::new(0.01, 0.0, 0.18),
+                UnitQuaternion::from_scaled_axis(Vector3::z() * 0.5),
+            ),
+            ..base
+        };
+        let posed = Clip::from_doc_resolved(
+            ClipDoc {
+                base: Some("posed".to_owned()),
+                version: 1,
+                kind: "clip".to_owned(),
+                name: "posed-head".to_owned(),
+                description: None,
+                channels: vec![Channel::Head],
+                frame_hz: 50.0,
+                blend_in_ms: Some(80),
+                blend_out_ms: Some(80),
+                frames: vec![0.0, 0.0001, 0.0002, 0.0003, 0.0004]
+                    .into_iter()
+                    .map(|z| FrameDoc {
+                        dt: Some([0.0, 0.0, z]),
+                        dq: Some([1.0, 0.0, 0.0, 0.0]),
+                        body_yaw: None,
+                        antennas: None,
+                    })
+                    .collect(),
+            },
+            &ClipLimits::default(),
+            |_| Some(posed_anchor),
+        )
+        .expect("posed fixture loads");
+        let antenna = Clip::from_doc(
+            ClipDoc {
+                base: None,
+                version: 1,
+                kind: "clip".to_owned(),
+                name: "antenna".to_owned(),
+                description: None,
+                channels: vec![Channel::Antennas],
+                frame_hz: 50.0,
+                blend_in_ms: None,
+                blend_out_ms: None,
+                frames: vec![FrameDoc {
+                    dt: None,
+                    dq: None,
+                    body_yaw: None,
+                    antennas: Some([0.2, -0.2]),
+                }],
+            },
+            &ClipLimits::default(),
+        )
+        .expect("antenna fixture loads");
+        let head_overlay = Clip::from_doc(
+            ClipDoc {
+                base: None,
+                version: 1,
+                kind: "clip".to_owned(),
+                name: "head-overlay".to_owned(),
+                description: None,
+                channels: vec![Channel::Head],
+                frame_hz: 50.0,
+                blend_in_ms: None,
+                blend_out_ms: None,
+                frames: vec![0.02, 0.02]
+                    .into_iter()
+                    .map(|x| FrameDoc {
+                        dt: Some([x, 0.0, 0.0]),
+                        dq: Some([1.0, 0.0, 0.0, 0.0]),
+                        body_yaw: None,
+                        antennas: None,
+                    })
+                    .collect(),
+            },
+            &ClipLimits::default(),
+        )
+        .expect("head fixture loads");
+        let mut library = ClipLibraryConfigWire::new_boxed();
+        {
+            let message = library.clear_valid();
+            for clip in [&posed, &antenna, &head_overlay] {
+                write_clip(clip, message.clips.try_grow().expect("clip slot"))
+                    .expect("fixture writes");
+            }
+            for clip_id in 0..3u16 {
+                let motion = message.motions.try_grow().expect("motion slot");
+                motion.lead_gap_ms = 0;
+                let segment = motion.segments.try_grow().expect("segment slot");
+                segment.clip_id = clip_id;
+                segment.speed = 1.0;
+                segment.gap_after_ms = 0;
+            }
+        }
+        let library: &'static ClipLibraryConfigWire = Box::leak(library);
+        let validated = ValidatedLibrary::of(library.validate().expect("fixture validates"))
+            .expect("fixture establishes");
+        let schedule = |rows: &[(u16, i64, i64)]| {
+            let mut message = brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire::new();
+            let mut windows = message.overlays_mut();
+            for &(motion_id, start, end) in rows {
+                let row: &mut OverlayWindowWire = windows.try_grow().expect("window slot");
+                row.set_motion_id(motion_id);
+                row.set_start(SyncTime::from_nanos(start));
+                row.set_end(SyncTime::from_nanos(end));
+                row.set_gain(1.0);
+                row.set_speed(1.0);
+            }
+            Windows::of(&message, &validated)
+        };
+        (
+            schedule(&[(0, 0, 1_000_000_000), (1, 0, 1_000_000_000)]),
+            schedule(&[(0, 0, 1_000_000_000)]),
+            schedule(&[(0, 0, 1_000_000_000), (2, 0, 1_000_000_000)]),
+            schedule(&[(0, 0, 1_000_000_000)]),
+            base,
+        )
+    }
+
+    /// One posed antenna motion whose authored right target is -0.8304 radians
+    /// over the -0.1745-radian anchor. Its lifted representative is the held
+    /// base used by the mover cases below.
+    fn posed_antenna_windows(rows: &[(i64, i64)]) -> (Windows<'static>, JointTargets) {
+        const AUTHORED_RIGHT: f64 = -0.8304;
+        const AUTHORED_ANCHOR_RIGHT: f64 = -0.1745;
+        const LIFTED_RIGHT: f64 = AUTHORED_RIGHT + core::f64::consts::TAU;
+        let base = JointTargets {
+            antennas: [LIFTED_RIGHT, -0.2361],
+            ..JointTargets::default()
+        };
+        let anchor = JointTargets {
+            antennas: [AUTHORED_ANCHOR_RIGHT, -0.2361],
+            ..JointTargets::default()
+        };
+        let clip = Clip::from_doc_resolved(
+            ClipDoc {
+                base: Some("posed".to_owned()),
+                version: 1,
+                kind: "clip".to_owned(),
+                name: "posed-antennas".to_owned(),
+                description: None,
+                channels: vec![Channel::Antennas],
+                frame_hz: TICK_HZ,
+                blend_in_ms: Some(100),
+                blend_out_ms: Some(100),
+                frames: (0..60)
+                    .map(|_| FrameDoc {
+                        antennas: Some([AUTHORED_RIGHT - AUTHORED_ANCHOR_RIGHT, 0.0]),
+                        ..FrameDoc::default()
+                    })
+                    .collect(),
+            },
+            &ClipLimits::default(),
+            |_| Some(anchor),
+        )
+        .expect("posed antenna fixture loads");
+        let mut library = ClipLibraryConfigWire::new_boxed();
+        {
+            let message = library.clear_valid();
+            write_clip(&clip, message.clips.try_grow().expect("clip slot"))
+                .expect("fixture writes");
+            let motion = message.motions.try_grow().expect("motion slot");
+            motion.lead_gap_ms = 0;
+            let segment = motion.segments.try_grow().expect("segment slot");
+            segment.clip_id = 0;
+            segment.speed = 1.0;
+            segment.gap_after_ms = 0;
+        }
+        let library: &'static ClipLibraryConfigWire = Box::leak(library);
+        let validated = ValidatedLibrary::of(library.validate().expect("fixture validates"))
+            .expect("fixture establishes");
+        let mut schedule = brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire::new();
+        let mut overlays = schedule.overlays_mut();
+        for &(start, end) in rows {
+            let window = overlays.try_grow().expect("window slots");
+            window.set_motion_id(0);
+            window.set_start(SyncTime::from_nanos(start));
+            window.set_end(SyncTime::from_nanos(end));
+            window.set_gain(1.0);
+            window.set_speed(1.0);
+        }
+        (Windows::of(&schedule, &validated), base)
+    }
+
+    fn assert_fractional_posed_head(windows: &Windows<'_>) {
+        let mut state = MoverStateWire::new();
+        let (mut layer, refusals) = Overlays::take_up(&mut state.players_mut()[..], windows, 0);
+        assert_eq!(refusals.players, 0);
+        let _ = layer.sample(Duration::from_millis(20), [0.0, 0.0]);
+        let sample = layer.sample(Duration::from_millis(20), [0.0, 0.0]);
+        let weight = sample.as_slice()[0].weights.get(Channel::Head);
+        assert!(weight > 0.0 && weight < 1.0, "posed head weight: {weight}");
+    }
 
     /// A measurement of a pair standing `offset` from mirrored.
     fn parted(offset: f64) -> PhaseSeparation {
@@ -609,6 +824,447 @@ mod tests {
             (1, 0),
             "a pair the pass could not part is the anomaly this total is for"
         );
+    }
+
+    #[test]
+    fn reanchor_keeps_a_posed_target_while_unwinding_the_surviving_overlay() {
+        let base = JointTargets::default();
+        let anchor = JointTargets {
+            head_pose_body: Isometry3::from_parts(
+                Translation3::new(0.01, 0.0, 0.18),
+                UnitQuaternion::from_scaled_axis(Vector3::z() * 0.2),
+            ),
+            ..base
+        };
+        let mut posed = OverlaySample {
+            frame: DeltaFrame {
+                head: Some(Isometry3::identity()),
+                ..DeltaFrame::zero(ChannelMask::of(Channel::Head))
+            },
+            weights: ChannelWeights::full(),
+            anchors: OverlayAnchors {
+                head: Some(anchor.head_pose_body),
+                body_yaw: None,
+                antennas: None,
+            },
+        };
+        posed.weights.set(Channel::Antennas, 0.0);
+        let mut ordinary = OverlaySample::silent();
+        ordinary.frame.antennas = Some([0.1, -0.1]);
+        ordinary.weights.set(Channel::Antennas, 1.0);
+        let commanded = compose(base, &[posed, ordinary]);
+        let reanchored = uncompose(commanded, &[posed, ordinary], &base);
+        assert_eq!(reanchored.head_pose_body, base.head_pose_body);
+        assert_eq!(reanchored.antennas, base.antennas);
+
+        let vacated = uncompose(commanded, &[ordinary], &base);
+        assert_eq!(vacated.head_pose_body, commanded.head_pose_body);
+    }
+
+    #[test]
+    fn posed_antenna_composition_keeps_the_held_base_representative() {
+        let (windows, base) = posed_antenna_windows(&[(0, 1_000_000_000)]);
+        let mut state = MoverStateWire::new();
+        let mut counters = MoverCounters::default();
+        let mut setpoint = base;
+        for tick in 0..20 {
+            let result = decide(
+                &MotionConfig::default(),
+                &mut state,
+                &windows,
+                false,
+                &Ask {
+                    now_ns: i64::from(tick) * 20_000_000,
+                    period: Duration::from_millis(20),
+                    tick_hz: TICK_HZ,
+                    fresh: None,
+                    standing: None,
+                },
+                &Anchor {
+                    setpoint,
+                    margin: 1.0,
+                },
+                &mut counters,
+            );
+            let MotionCommand::Track(command) = result.command.expect("overlay command") else {
+                panic!("the open window tracks the composed setpoint");
+            };
+            assert!((command.antennas[0] - base.antennas[0]).abs() < 1e-9);
+            assert!((command.antennas[1] + 0.2361).abs() < 1e-9);
+            setpoint = command;
+        }
+        assert_eq!(counters.refused_base, 0);
+
+        let (raw_windows, raw_base) = posed_antenna_windows(&[(0, 1_000_000_000)]);
+        let mut raw_state = MoverStateWire::new();
+        let mut raw_counters = MoverCounters::default();
+        let mut raw_setpoint = JointTargets {
+            antennas: [-0.8304, -0.2361],
+            ..raw_base
+        };
+        for tick in 0..3 {
+            let result = decide(
+                &MotionConfig::default(),
+                &mut raw_state,
+                &raw_windows,
+                false,
+                &Ask {
+                    now_ns: i64::from(tick) * 20_000_000,
+                    period: Duration::from_millis(20),
+                    tick_hz: TICK_HZ,
+                    fresh: None,
+                    standing: None,
+                },
+                &Anchor {
+                    setpoint: raw_setpoint,
+                    margin: 1.0,
+                },
+                &mut raw_counters,
+            );
+            let MotionCommand::Track(command) = result.command.expect("overlay command") else {
+                panic!("the raw representative tracks");
+            };
+            assert!((command.antennas[0] + 0.8304).abs() < 1e-9);
+            raw_setpoint = command;
+        }
+    }
+
+    #[test]
+    fn posed_antenna_composition_keeps_the_representative_over_a_moving_base() {
+        let (windows, fixture_base) = posed_antenna_windows(&[(0, 1_000_000_000)]);
+        let mut start = committed_poses::targets(STOW_POSE);
+        start.antennas = fixture_base.antennas;
+        let mut target = committed_poses::targets(NEUTRAL_POSE);
+        target.antennas = [5.0, fixture_base.antennas[1]];
+        let path = planned_path(
+            &MotionConfig::default(),
+            &start,
+            Goal {
+                target,
+                durations: MoveDurations::uniform(Duration::from_secs(8)),
+            },
+            TICK_HZ,
+        )
+        .expect("the moving base fixture plans");
+        let mut moving = Base::held(start);
+        moving.retarget(&path);
+        let mut state = MoverStateWire::new();
+        write_base(state.base_mut(), Some(&moving));
+        let mut expected_base = moving;
+        let mut counters = MoverCounters::default();
+        let mut setpoint = start;
+        for tick in 0..20 {
+            let expected = expected_base.step(Duration::from_millis(20));
+            let result = decide(
+                &MotionConfig::default(),
+                &mut state,
+                &windows,
+                false,
+                &Ask {
+                    now_ns: i64::from(tick) * 20_000_000,
+                    period: Duration::from_millis(20),
+                    tick_hz: TICK_HZ,
+                    fresh: None,
+                    standing: None,
+                },
+                &Anchor {
+                    setpoint,
+                    margin: 1.0,
+                },
+                &mut counters,
+            );
+            let MotionCommand::Track(command) = result.command.expect("overlay command") else {
+                panic!("the moving base tracks the composed setpoint");
+            };
+            assert_eq!(command.head_pose_body, expected.head_pose_body);
+            if tick >= 8 {
+                assert!((command.antennas[0] - fixture_base.antennas[0]).abs() < 1e-9);
+                assert!((command.antennas[0] + 0.8304).abs() > 1.0);
+            }
+            setpoint = command;
+        }
+        assert_ne!(expected_base.targets.head_pose_body, start.head_pose_body);
+        assert_eq!(counters.refused_base, 0);
+    }
+
+    #[test]
+    fn a_later_posed_row_chooses_against_the_composed_setpoint() {
+        let (windows, base) =
+            posed_antenna_windows(&[(0, 1_000_000_000), (200_000_000, 1_000_000_000)]);
+        let mut state = MoverStateWire::new();
+        let mut counters = MoverCounters::default();
+        let mut setpoint = base;
+        for tick in 0..20 {
+            let result = decide(
+                &MotionConfig::default(),
+                &mut state,
+                &windows,
+                false,
+                &Ask {
+                    now_ns: i64::from(tick) * 20_000_000,
+                    period: Duration::from_millis(20),
+                    tick_hz: TICK_HZ,
+                    fresh: None,
+                    standing: None,
+                },
+                &Anchor {
+                    setpoint,
+                    margin: 1.0,
+                },
+                &mut counters,
+            );
+            let MotionCommand::Track(command) = result.command.expect("overlay command") else {
+                panic!("the open windows track the composed setpoint");
+            };
+            assert!((command.antennas[0] - setpoint.antennas[0]).abs() <= core::f64::consts::PI);
+            if tick >= 12 {
+                assert!((command.antennas[0] - base.antennas[0]).abs() < 1e-9);
+            }
+            setpoint = command;
+        }
+        assert_eq!(counters.refused_base, 0);
+    }
+
+    #[test]
+    fn unrelated_antenna_vacate_preserves_posed_head_without_refusal() {
+        let (both, posed_only, _, _, base) = mover_fixture_windows();
+        let mut state = MoverStateWire::new();
+        let mut control = MoverStateWire::new();
+        let mut counters = MoverCounters::default();
+        let ask = |now_ns| Ask {
+            now_ns,
+            period: Duration::from_millis(20),
+            tick_hz: TICK_HZ,
+            fresh: None,
+            standing: None,
+        };
+        let first = decide(
+            &MotionConfig::default(),
+            &mut state,
+            &both,
+            false,
+            &ask(0),
+            &Anchor {
+                setpoint: base,
+                margin: 1.0,
+            },
+            &mut counters,
+        );
+        let MotionCommand::Track(pre_first) = first.command.expect("initial composed command")
+        else {
+            panic!("initial command is not tracked")
+        };
+        let second = decide(
+            &MotionConfig::default(),
+            &mut state,
+            &both,
+            false,
+            &ask(20_000_000),
+            &Anchor {
+                setpoint: pre_first,
+                margin: 1.0,
+            },
+            &mut counters,
+        );
+        let MotionCommand::Track(pre_vacate) = second.command.expect("pre-vacate command") else {
+            panic!("pre-vacate command is not tracked")
+        };
+        let control_first = decide(
+            &MotionConfig::default(),
+            &mut control,
+            &posed_only,
+            false,
+            &ask(0),
+            &Anchor {
+                setpoint: base,
+                margin: 1.0,
+            },
+            &mut counters,
+        );
+        let MotionCommand::Track(control_first) = control_first.command.expect("control command")
+        else {
+            panic!("control command is not tracked")
+        };
+        let control_second = decide(
+            &MotionConfig::default(),
+            &mut control,
+            &posed_only,
+            false,
+            &ask(20_000_000),
+            &Anchor {
+                setpoint: control_first,
+                margin: 1.0,
+            },
+            &mut counters,
+        );
+        let MotionCommand::Track(control_second) = control_second.command.expect("control command")
+        else {
+            panic!("control command is not tracked")
+        };
+        assert_fractional_posed_head(&posed_only);
+        assert_ne!(pre_vacate.head_pose_body, base.head_pose_body);
+        let vacated = decide(
+            &MotionConfig::default(),
+            &mut state,
+            &posed_only,
+            false,
+            &ask(40_000_000),
+            &Anchor {
+                setpoint: pre_vacate,
+                margin: 1.0,
+            },
+            &mut counters,
+        );
+        let MotionCommand::Track(after) = vacated.command.expect("vacate commands") else {
+            panic!("vacate keeps the composed setpoint")
+        };
+        let control_third = decide(
+            &MotionConfig::default(),
+            &mut control,
+            &posed_only,
+            false,
+            &ask(40_000_000),
+            &Anchor {
+                setpoint: control_second,
+                margin: 1.0,
+            },
+            &mut counters,
+        );
+        let MotionCommand::Track(control_after) = control_third.command.expect("control command")
+        else {
+            panic!("control command is not tracked")
+        };
+        assert_eq!(after.head_pose_body, control_after.head_pose_body);
+        assert_ne!(after.head_pose_body, pre_vacate.head_pose_body);
+        assert_eq!(
+            read_base(state.base())
+                .expect("base reads")
+                .expect("base is held")
+                .targets
+                .head_pose_body,
+            base.head_pose_body
+        );
+        assert_eq!(counters.refused_base, 0);
+    }
+
+    #[test]
+    fn same_head_vacate_holds_the_held_base_and_does_not_refuse() {
+        let (_, _, both, posed_only, base) = mover_fixture_windows();
+        let mut state = MoverStateWire::new();
+        let mut control = MoverStateWire::new();
+        let mut counters = MoverCounters::default();
+        let ask = |now_ns| Ask {
+            now_ns,
+            period: Duration::from_millis(20),
+            tick_hz: TICK_HZ,
+            fresh: None,
+            standing: None,
+        };
+        let first = decide(
+            &MotionConfig::default(),
+            &mut state,
+            &both,
+            false,
+            &ask(0),
+            &Anchor {
+                setpoint: base,
+                margin: 1.0,
+            },
+            &mut counters,
+        );
+        let MotionCommand::Track(first) = first.command.expect("initial command") else {
+            panic!("initial command is not tracked")
+        };
+        let second = decide(
+            &MotionConfig::default(),
+            &mut state,
+            &both,
+            false,
+            &ask(20_000_000),
+            &Anchor {
+                setpoint: first,
+                margin: 1.0,
+            },
+            &mut counters,
+        );
+        let MotionCommand::Track(pre_vacate) = second.command.expect("pre-vacate command") else {
+            panic!("pre-vacate command is not tracked")
+        };
+        let control_first = decide(
+            &MotionConfig::default(),
+            &mut control,
+            &posed_only,
+            false,
+            &ask(0),
+            &Anchor {
+                setpoint: base,
+                margin: 1.0,
+            },
+            &mut counters,
+        );
+        let MotionCommand::Track(control_first) = control_first.command.expect("control command")
+        else {
+            panic!("control command is not tracked")
+        };
+        let control_second = decide(
+            &MotionConfig::default(),
+            &mut control,
+            &posed_only,
+            false,
+            &ask(20_000_000),
+            &Anchor {
+                setpoint: control_first,
+                margin: 1.0,
+            },
+            &mut counters,
+        );
+        let MotionCommand::Track(control_second) = control_second.command.expect("control command")
+        else {
+            panic!("control command is not tracked")
+        };
+        assert_ne!(pre_vacate.head_pose_body, control_second.head_pose_body);
+        assert_fractional_posed_head(&posed_only);
+        let vacated = decide(
+            &MotionConfig::default(),
+            &mut state,
+            &posed_only,
+            false,
+            &ask(40_000_000),
+            &Anchor {
+                setpoint: pre_vacate,
+                margin: 1.0,
+            },
+            &mut counters,
+        );
+        let MotionCommand::Track(after) = vacated.command.expect("vacate commands") else {
+            panic!("vacate command is not tracked")
+        };
+        let control_third = decide(
+            &MotionConfig::default(),
+            &mut control,
+            &posed_only,
+            false,
+            &ask(40_000_000),
+            &Anchor {
+                setpoint: control_second,
+                margin: 1.0,
+            },
+            &mut counters,
+        );
+        let MotionCommand::Track(control_after) = control_third.command.expect("control command")
+        else {
+            panic!("control command is not tracked")
+        };
+        assert_eq!(after.head_pose_body, control_after.head_pose_body);
+        assert_eq!(
+            read_base(state.base())
+                .expect("base reads")
+                .expect("base is held")
+                .targets
+                .head_pose_body,
+            base.head_pose_body
+        );
+        assert_eq!(counters.refused_base, 0);
     }
 
     /// The clocks a scenario derives are the floored ones, not the asked ones.

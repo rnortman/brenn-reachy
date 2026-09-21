@@ -489,10 +489,9 @@ impl PostureWalk {
 /// makes these the machine's own numbers -- a joint chasing a min-jerk goal
 /// spends its first cycles slower than the profile allows, because the goal is,
 /// so it saturates late and arrives later than a straight-line travel of the
-/// same distance would. Two things the postures alone do not say are in it: an
-/// antenna routed the long way round travels further than the difference
-/// between the angles the postures name, and the clock the planner floors the
-/// move onto is not the clock it was asked for.
+/// same distance would. Two things the postures alone do not say are in it:
+/// the representative selected for each antenna, and the clock the planner
+/// floors the move onto is not the clock it was asked for.
 ///
 /// The commanded lag every goal carries is the padding at the head of the walk;
 /// the response delay the servos answer a setpoint at is in the walk itself.

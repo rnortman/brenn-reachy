@@ -37,229 +37,40 @@
 //! is read off what it says.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire;
-use brenn_reachy__cogs__script_clk_rs::ScriptWire;
-use brenn_reachy__driver__health_clk_rs::{DriverEventWire, EventKindWire, HealthReportWire};
-use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
-use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
-use log_read::{Bound, Census, Complaints, Logged, Streams, binding, read_with, typed};
-use motion_channels::{
-    EVENT_CHANNEL, FAULT_CHANNEL, HEALTH_CHANNEL, POSE_CHANNEL, SCHEDULE_CHANNEL, SCRIPT_CHANNEL,
-};
-use pose_reading::{
-    Grid, Residual, RunConfig, Skips, capabilities, capability, commanded_rows, health_summary,
-    lag_scan, lag_scans, lags, no_faults, present_rows, residual_stream, residuals,
-};
-use reachy_driver::NOMINAL_CYCLE_NS;
+#[cfg(test)]
+use brenn_reachy__driver__health_clk_rs::{DriverEventWire, EventKindWire};
+use pose_reading::{RunConfig, no_faults};
 use reachy_edge::names::MotionTable;
-use reachy_motion::joints::{JointRef, Name, ROWS, row};
-use reachy_motion::phase::{ANTENNA_CONTACT_BAND_RAD, inside_band, mirror_offset};
-use reachy_motion::plant::GroupPlants;
 use run_report::{Report, verdict};
-use stillness_report::{Standard, Stillness, say};
 
-/// How far a goal has to move for the window it moved in to count as having
-/// driven the machine, radians.
-///
-/// A hair above nothing rather than a tolerance: the question is whether the
-/// composed setpoint changed at all across the window, and a window the mover
-/// refused or latched off holds the base's own goal bit for bit. Anything a
-/// clip does moves a joint by orders of magnitude more than this.
-const MOVED_RAD: f64 = 1e-9;
+mod motion_run_report;
 
-/// How far apart two consecutive samples may sit before the stretch between
-/// them is a gap in the record, nanoseconds.
-///
-/// Half a period of slack on top of the period. Consecutive samples sit exactly
-/// one period apart on the driver's grid; anything past this threshold is a
-/// sample the log does not hold.
-const SAMPLE_GAP_NS: i64 = NOMINAL_CYCLE_NS + NOMINAL_CYCLE_NS / 2;
+use motion_run_report::{
+    Run, Window, every_window_moved, held_standard, named_motion, overlay_spans, prepare, read,
+    settle, stillness, the_stream_held, whole_stream_measurements, window_measurements, windows,
+};
 
-/// Everything one tour put in the log.
-///
-/// Six streams, which is the whole of what a tour is judged on: what was
-/// asked, what the session planned, what the driver read and held, what it
-/// could not do, what the decision tick raised, and what the health rotation
-/// saw. The last is what says whether a tour the machine played whole was one
-/// its motors were comfortable playing.
-#[derive(Default)]
-struct Run {
-    /// What the sender asked for.
-    scripts: Vec<Logged<ScriptWire>>,
-    /// What the session planned, republished whole on every change.
-    schedules: Vec<Logged<SessionScheduleWire>>,
-    /// The driver's heartbeat: one per cycle, always.
-    samples: Vec<Logged<PoseSampleWire>>,
-    /// What the driver did that the sample stream does not show.
-    events: Vec<Logged<DriverEventWire>>,
-    /// What the decision tick raised.
-    faults: Vec<Logged<TickFaultWire>>,
-    /// What the health rotation read, one report per servo visit.
-    readings: Vec<Logged<HealthReportWire>>,
-    /// Every channel the log carries and how many messages each held.
-    census: Census,
-    /// Anything that went wrong reading the log itself.
-    complaints: Complaints,
-}
-
-impl Streams for Run {
-    fn census(&mut self) -> &mut Census {
-        &mut self.census
-    }
-
-    fn complaints(&mut self) -> &mut Complaints {
-        &mut self.complaints
-    }
-}
-
-/// Every channel this analyzer reads.
-///
-/// Only channels a tour has something to say about: a channel bound here that
-/// the tour has no use for would report as missing on a log that is fine.
-const CHANNELS: [Bound<Run>; 6] = [
-    Bound {
-        name: SCRIPT_CHANNEL,
-        check: binding::<ScriptWire>,
-        route: |run, message| typed(message, &mut run.scripts, &mut run.complaints),
-    },
-    Bound {
-        name: SCHEDULE_CHANNEL,
-        check: binding::<SessionScheduleWire>,
-        route: |run, message| typed(message, &mut run.schedules, &mut run.complaints),
-    },
-    Bound {
-        name: POSE_CHANNEL,
-        check: binding::<PoseSampleWire>,
-        route: |run, message| typed(message, &mut run.samples, &mut run.complaints),
-    },
-    Bound {
-        name: EVENT_CHANNEL,
-        check: binding::<DriverEventWire>,
-        route: |run, message| typed(message, &mut run.events, &mut run.complaints),
-    },
-    Bound {
-        name: FAULT_CHANNEL,
-        check: binding::<TickFaultWire>,
-        route: |run, message| typed(message, &mut run.faults, &mut run.complaints),
-    },
-    Bound {
-        name: HEALTH_CHANNEL,
-        check: binding::<HealthReportWire>,
-        route: |run, message| typed(message, &mut run.readings, &mut run.complaints),
-    },
-];
-
-impl Run {
-    /// Read the log under `dir`.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the shared pass refuses about the log as a whole. A message the
-    /// reader yielded and this build could not make sense of is a complaint
-    /// rather than an error: the point of the report is to state everything at
-    /// once.
-    fn read(dir: &Path) -> Result<Self, clockwork_logs::LogError> {
-        read_with(dir, &CHANNELS)
-    }
-
-    /// Every sample the log holds, in time order.
-    ///
-    /// Sorted regardless of arrival order because every window measurement
-    /// reads consecutive pairs, and a pair out of order would be read as a step
-    /// the machine never took. Sorted once, by `analyze`, and handed to
-    /// everything that walks a window: the walks are windows x samples
-    /// otherwise, and both factors grow with the library this tool exists to
-    /// grow.
-    fn ordered_samples(&self) -> Vec<&Logged<PoseSampleWire>> {
-        let mut ordered: Vec<&Logged<PoseSampleWire>> = self.samples.iter().collect();
-        ordered.sort_by_key(|sample| sample.message.nominal_time().as_nanos());
-        ordered
-    }
-
-    /// Every driver event the log holds, in time order, so a window's share of
-    /// them is a slice rather than a scan.
-    fn ordered_events(&self) -> Vec<&Logged<DriverEventWire>> {
-        let mut ordered: Vec<&Logged<DriverEventWire>> = self.events.iter().collect();
-        ordered.sort_by_key(|event| event.message.time().as_nanos());
-        ordered
-    }
-}
-
-/// One motion's window, as the session last published it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Window {
-    /// Which motion, as its index in the deployed library.
-    motion_id: u16,
-    /// When the window opened, inclusive.
-    start_ns: i64,
-    /// When it closed, exclusive.
-    end_ns: i64,
-}
-
-/// Every overlay window the run planned, in the order they opened.
-///
-/// The schedule is republished whole on every change, so the same window
-/// arrives many times. Keyed by the motion and the instant it opened -- which
-/// is what makes it that window rather than another -- and the end is where the
-/// window actually stopped being planned, which is not always the end it was
-/// published with: a replacement script does not shorten a window, it publishes
-/// a schedule that no longer holds it. So a window is closed at the first
-/// schedule that has dropped it, and a window still carried by the last
-/// schedule keeps the end it was published with.
-///
-/// Reading the published end for a window a replacement cut would stretch that
-/// motion's measurements over the hand-back and the first samples of the next
-/// script, which is a wrong number rather than a missing one.
-fn windows(run: &Run) -> Vec<Window> {
-    let mut ordered: Vec<&Logged<SessionScheduleWire>> = run.schedules.iter().collect();
-    ordered.sort_by_key(|schedule| schedule.at_ns);
-    // Per window: the end last published for it, and whether the session is
-    // still carrying it. A window dropped and then published again is a new
-    // window with a start of its own, so the closed ones stay closed.
-    let mut planned: BTreeMap<(i64, u16), (i64, bool)> = BTreeMap::new();
-    for schedule in ordered {
-        let mut carried: BTreeSet<(i64, u16)> = BTreeSet::new();
-        for window in schedule.message.overlays().iter() {
-            let key = (window.start().as_nanos(), window.motion_id());
-            carried.insert(key);
-            let end = window.end().as_nanos();
-            planned
-                .entry(key)
-                .and_modify(|held| {
-                    if held.1 {
-                        held.0 = end;
-                    }
-                })
-                .or_insert((end, true));
-        }
-        for (key, held) in &mut planned {
-            if held.1 && !carried.contains(key) {
-                held.0 = held.0.min(schedule.at_ns);
-                held.1 = false;
-            }
-        }
-    }
-    planned
-        .into_iter()
-        .map(|((start_ns, motion_id), (end_ns, _))| Window {
-            motion_id,
-            start_ns,
-            end_ns,
-        })
-        .collect()
-}
-
-/// What the sidecar calls the motion at `motion_id`, or the index itself where
-/// it names none.
-fn named_motion(by_id: &BTreeMap<u16, String>, motion_id: u16) -> String {
-    by_id
-        .get(&motion_id)
-        .cloned()
-        .unwrap_or_else(|| format!("motion {motion_id}, which the sidecar does not name"))
-}
+#[cfg(test)]
+use brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire;
+#[cfg(test)]
+use brenn_reachy__cogs__script_clk_rs::ScriptWire;
+#[cfg(test)]
+use brenn_reachy__driver__health_clk_rs::HealthReportWire;
+#[cfg(test)]
+use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
+#[cfg(test)]
+use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
+#[cfg(test)]
+use log_read::Logged;
+#[cfg(test)]
+use motion_channels::POSE_CHANNEL;
+#[cfg(test)]
+use motion_run_report::CHANNELS;
+#[cfg(test)]
+use reachy_motion::phase::ANTENNA_CONTACT_BAND_RAD;
 
 /// Every motion the library holds was asked for, once, in the order the library
 /// numbers them.
@@ -360,375 +171,6 @@ fn every_asked_motion_was_scheduled(
     }
 }
 
-/// The samples the sorted stream holds inside `window`.
-///
-/// A slice of the one sorted stream rather than a scan of it: every check below
-/// walks every window, and a scan apiece is windows x samples on a tool whose
-/// two factors both grow with the library.
-fn inside<'a>(
-    ordered: &'a [&'a Logged<PoseSampleWire>],
-    window: &Window,
-) -> &'a [&'a Logged<PoseSampleWire>] {
-    let at = |sample: &&Logged<PoseSampleWire>| sample.message.nominal_time().as_nanos();
-    let lo = ordered.partition_point(|sample| at(sample) < window.start_ns);
-    let hi = ordered.partition_point(|sample| at(sample) < window.end_ns);
-    &ordered[lo..hi]
-}
-
-/// The driver events the sorted stream holds inside `window`.
-fn events_inside<'a>(
-    ordered: &'a [&'a Logged<DriverEventWire>],
-    window: &Window,
-) -> &'a [&'a Logged<DriverEventWire>] {
-    let at = |event: &&Logged<DriverEventWire>| event.message.time().as_nanos();
-    let lo = ordered.partition_point(|event| at(event) < window.start_ns);
-    let hi = ordered.partition_point(|event| at(event) < window.end_ns);
-    &ordered[lo..hi]
-}
-
-/// Every window moved the machine.
-///
-/// A window the mover refused, or one whose layer was latched off for the
-/// schedule epoch, leaves the composed setpoint exactly where the base was
-/// holding it. So a window across which the goal never changed is a motion the
-/// machine did not play, whatever the plan said -- and that is this tool's
-/// whole-library assertion: it fails on the first clip the envelope refuses
-/// over the raised base, which is the discovery the run exists for.
-fn every_window_moved(
-    ordered: &[&Logged<PoseSampleWire>],
-    planned: &[Window],
-    by_id: &BTreeMap<u16, String>,
-    report: &mut Report,
-) {
-    for window in planned {
-        let samples = inside(ordered, window);
-        let mut held: Option<[f64; ROWS.len()]> = None;
-        let mut moved = false;
-        for sample in samples {
-            let Some(commanded) = commanded_rows(&sample.message) else {
-                continue;
-            };
-            match held {
-                None => held = Some(commanded),
-                Some(first) => {
-                    if first
-                        .iter()
-                        .zip(commanded.iter())
-                        .any(|(a, b)| (a - b).abs() > MOVED_RAD)
-                    {
-                        moved = true;
-                    }
-                }
-            }
-        }
-        if samples.is_empty() {
-            report.fail(format!(
-                "the window over {} carries no sample at all, so nothing says what the machine \
-                 did in it",
-                named_motion(by_id, window.motion_id)
-            ));
-            continue;
-        }
-        if held.is_none() {
-            report.fail(format!(
-                "no sample inside the window over {} carried a setpoint, so the machine was \
-                 under no command for the whole of it",
-                named_motion(by_id, window.motion_id)
-            ));
-            continue;
-        }
-        if !moved {
-            report.fail(format!(
-                "the goal never changed across the window over {}, which is a composed setpoint \
-                 the mover refused or a layer latched off rather than a motion that played",
-                named_motion(by_id, window.motion_id)
-            ));
-        }
-    }
-    if planned.is_empty() {
-        report.fail(
-            "the session planned no overlay window at all, so the tour asked the machine for \
-             nothing it could play"
-                .to_string(),
-        );
-    }
-}
-
-/// The sample stream held for the whole of the tour.
-///
-/// The record is the point of the run, so a stretch of it the log does not hold
-/// is a finding whatever else the run did. Judged between the first window
-/// opening and the last one closing: what the driver did before the tour began
-/// and after it ended is not the tour's.
-///
-/// A gap the driver itself reported as skipped cycles is not one of those. It
-/// is the machine saying it missed its slots, which is a reading the run was
-/// taken to get, and the two are classified oppositely: a hole in the record is
-/// a harness defect to fix and re-run, a skipped cycle is the plant's own
-/// answer. So the gaps a skip report accounts for are counted apart and said
-/// apart.
-///
-/// One finding rather than one per gap: a run that dropped a stretch drops
-/// hundreds of samples, and a report of hundreds of identical lines is one
-/// nobody reads to the end.
-fn the_stream_held(
-    ordered: &[&Logged<PoseSampleWire>],
-    planned: &[Window],
-    grid: Grid,
-    skips: &Skips<'_>,
-    report: &mut Report,
-) {
-    let (Some(first), Some(last)) = (
-        planned.iter().map(|window| window.start_ns).min(),
-        planned.iter().map(|window| window.end_ns).max(),
-    ) else {
-        return;
-    };
-    let held: Vec<i64> = ordered
-        .iter()
-        .map(|sample| sample.message.nominal_time().as_nanos())
-        .filter(|at| *at >= first && *at < last)
-        .collect();
-    if held.is_empty() {
-        report.fail(
-            "the log holds no sample between the first window opening and the last one closing"
-                .to_string(),
-        );
-        return;
-    }
-    let mut gaps = 0_usize;
-    let mut accounted = 0_usize;
-    let mut worst = (0_i64, 0_i64);
-    // The stretch the tour is judged over runs from the first window opening to
-    // the last one closing, so the two ends are gaps of their own: a stream
-    // that started late or stopped early holds no pair to read them off.
-    let mut ends = vec![(first, held[0])];
-    ends.extend(held.windows(2).map(|pair| (pair[0], pair[1])));
-    ends.push((held[held.len() - 1], last));
-    for (from, to) in ends {
-        if to - from <= SAMPLE_GAP_NS {
-            continue;
-        }
-        let missing = grid.at(from).0 + 1..grid.at(to).0;
-        if !missing.is_empty() && skips.account_for(missing) {
-            accounted += 1;
-            continue;
-        }
-        gaps += 1;
-        if to - from > worst.0 {
-            worst = (to - from, from);
-        }
-    }
-    if gaps > 0 {
-        report.fail(format!(
-            "the sample stream has {gaps} gap(s) over the tour that no skipped-cycle report \
-             accounts for; the longest is {:.1} ms from {}",
-            worst.0 as f64 / 1e6,
-            worst.1
-        ));
-    }
-    if accounted > 0 {
-        report.note(format!(
-            "{accounted} further stretch(es) of the stream are cycles the driver reported as \
-             skipped, which is the machine's own answer rather than a hole in the record"
-        ));
-    }
-    report.note(format!(
-        "{} sample(s) between the first window opening and the last one closing",
-        held.len()
-    ));
-}
-
-/// The worst figure over the nine rows, and the joint that carried it.
-#[derive(Clone, Copy, Default)]
-struct Worst {
-    /// The figure itself, radians.
-    figure: f64,
-    /// Which joint stood at it.
-    joint: Option<JointRef>,
-}
-
-impl Worst {
-    /// Keep `figure` if `joint` stands further out than anything so far.
-    fn offer(&mut self, joint: JointRef, figure: f64) {
-        if self.joint.is_none() || figure > self.figure {
-            self.figure = figure;
-            self.joint = Some(joint);
-        }
-    }
-}
-
-impl std::fmt::Display for Worst {
-    /// The figure and the joint, or what a window nothing was measured over
-    /// says instead.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.joint {
-            Some(joint) => write!(f, "{:.4} rad at {}", self.figure, Name(joint)),
-            None => f.write_str("nothing measured"),
-        }
-    }
-}
-
-/// How near a pair of antennas came to meeting over a stretch of samples.
-///
-/// The measurement that stands in for a crossing check on content: nothing
-/// screens a clip's antenna track at import, so what the tips did is read off
-/// the run. Only samples with both antennas inside the contact band count --
-/// outside it a pair is clear of the other's arc whatever it is doing, and a
-/// mirror offset taken there says nothing about meeting.
-#[derive(Clone, Copy, Default)]
-struct Nearest {
-    /// The smallest mirror offset seen with both antennas inside the band.
-    offset: Option<f64>,
-}
-
-impl Nearest {
-    /// Offer one sample's pair.
-    fn offer(&mut self, rows: &[f64; ROWS.len()]) {
-        let (Some(right), Some(left)) = (row(JointRef::AntennaRight), row(JointRef::AntennaLeft))
-        else {
-            return;
-        };
-        if !inside_band(rows[right], ANTENNA_CONTACT_BAND_RAD)
-            || !inside_band(rows[left], ANTENNA_CONTACT_BAND_RAD)
-        {
-            return;
-        }
-        let offset = mirror_offset(rows[right], rows[left]);
-        self.offset = Some(match self.offset {
-            Some(nearest) => nearest.min(offset),
-            None => offset,
-        });
-    }
-}
-
-impl std::fmt::Display for Nearest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.offset {
-            Some(offset) => write!(f, "{offset:.3} rad from mirrored"),
-            None => f.write_str("never both inside the band"),
-        }
-    }
-}
-
-/// What each motion's window measured, one line apiece.
-///
-/// The numbers a plant model is fitted from and the numbers an operator reads
-/// the run by, which are the same numbers. Nothing here fails a run: a lag is a
-/// reading, and what a reading means is not this tool's to decide until
-/// something knows what the servo can do.
-fn measurements(
-    ordered: &[&Logged<PoseSampleWire>],
-    events: &[&Logged<DriverEventWire>],
-    planned: &[Window],
-    by_id: &BTreeMap<u16, String>,
-    stream: &[(i64, [Residual; ROWS.len()])],
-    report: &mut Report,
-) {
-    for window in planned {
-        let mut samples = 0_usize;
-        let mut lag = Worst::default();
-        let mut residual = Worst::default();
-        let mut step = Worst::default();
-        let mut commanded_tips = Nearest::default();
-        let mut present_tips = Nearest::default();
-        let mut previous: Option<[f64; ROWS.len()]> = None;
-        for sample in inside(ordered, window) {
-            samples += 1;
-            let commanded = commanded_rows(&sample.message);
-            if let Some(commanded) = commanded {
-                commanded_tips.offer(&commanded);
-                if let Some(before) = previous {
-                    for joint in ROWS {
-                        let Some(index) = row(joint) else { continue };
-                        step.offer(joint, (commanded[index] - before[index]).abs());
-                    }
-                }
-                previous = Some(commanded);
-            }
-            if let Some(present) = present_rows(&sample.message) {
-                present_tips.offer(&present);
-                if let Some(commanded) = commanded {
-                    for joint in ROWS {
-                        let Some(index) = row(joint) else { continue };
-                        lag.offer(joint, (commanded[index] - present[index]).abs());
-                    }
-                }
-            }
-        }
-        // The residuals are the whole run's, stepped once in nominal order --
-        // a prediction is history and cannot be restarted at a window's edge --
-        // so a window reads the slice of them its own instants cover.
-        let lo = stream.partition_point(|(nominal, _)| *nominal < window.start_ns);
-        let hi = stream.partition_point(|(nominal, _)| *nominal < window.end_ns);
-        for (_, figures) in &stream[lo..hi] {
-            for joint in ROWS {
-                let Some(index) = row(joint) else { continue };
-                // The magnitude: the window's line names the joint furthest off
-                // its own model, and which side of the model it stood is the
-                // whole run's reading rather than a window's.
-                residual.offer(joint, figures[index].magnitude());
-            }
-        }
-        let skipped = events_inside(events, window)
-            .iter()
-            .filter(|event| event.message.kind() == EventKindWire::CYCLE_SKIPPED)
-            .count();
-        // The window's own two instants, printed so an operator can hand them
-        // to `//cogs:trace_export` to cut a replay fixture.
-        report.note(format!(
-            "{} [{} .. {}]: {samples} sample(s), worst residual {residual}, worst lag {lag}, \
-             peak step {step} per period, {skipped} skipped cycle(s), commanded tips \
-             {commanded_tips}, present tips {present_tips}",
-            named_motion(by_id, window.motion_id),
-            window.start_ns,
-            window.end_ns
-        ));
-    }
-}
-
-/// Whether the antennas stood still where the head let them.
-///
-/// The tour's own stillness verdict, over the same measurement the motion
-/// report prints: the holds are cut out of the sample stream, and an antenna
-/// hold is judged only where no head row was commanded somewhere new across it.
-/// A tour holds the antennas mostly while the head is moving, and such a hold
-/// reads the rod following the platform it is mounted on rather than the
-/// antenna's own loop -- so it is printed with its figures and no verdict, and
-/// a tour that held none with the head still says it measured nothing rather
-/// than failing.
-///
-/// The whole stream rather than the windows: a hold that opens inside one
-/// motion and closes inside the next is a hold, and the raise and the closing
-/// stow are where the head stands longest.
-///
-/// `standard` is the one thing this tool's two kinds of run disagree about, and
-/// it comes off the table the run was asked for: see [`held_standard`].
-fn stillness(ordered: &[&Logged<PoseSampleWire>], standard: Standard, report: &mut Report) {
-    let mut held = Stillness::default();
-    for sample in ordered {
-        held.sample(&sample.message);
-    }
-    held.finish();
-    say(&held, standard, report);
-}
-
-/// Which stillness standard the run this table describes is judged under.
-///
-/// A probe run's table holds instruments alone, and a probe is a step goal
-/// followed by a hold with the head standing at the raised base: the head-still
-/// hold is the whole run, so a run that produced none measured nothing it was
-/// asked to measure and fails. A content tour holds the antennas almost only
-/// while the head moves, so the same absence there is a reading of the content
-/// and fails nothing.
-fn held_standard(table: &MotionTable) -> Standard {
-    if table.probes_only() {
-        Standard::JudgedWhereHeadStillRequired
-    } else {
-        Standard::JudgedWhereHeadStill
-    }
-}
-
 /// Everything this tool has to say about one tour.
 fn analyze(run: &Run, table: &MotionTable, config: &RunConfig) -> Report {
     let mut report = Report::default();
@@ -751,51 +193,36 @@ fn analyze(run: &Run, table: &MotionTable, config: &RunConfig) -> Report {
         .map(|(name, entry)| (entry.motion_id, name.to_string()))
         .collect();
     let planned = windows(run);
-    let ordered = run.ordered_samples();
-    let events = run.ordered_events();
-    // The grid the run's own first sample starts, and the slots the driver said
-    // it missed on it. A driver computes each cycle's instant from an absolute
-    // grid rather than measuring it, so a hardware log's samples land on exact
-    // multiples of the period and no jitter is allowed for.
-    let grid = Grid {
-        origin_ns: ordered[0].message.nominal_time().as_nanos(),
-        period_ns: NOMINAL_CYCLE_NS,
-    };
-    let skips = Skips::of(&run.events, grid, 0);
-    // The plant the run's own machine was commissioned with, on the run's own
-    // grid. A log recorded under another pair is judged under that pair, which
-    // is why the profile is an argument and not a constant.
-    let plant = match GroupPlants::from_profiles(&config.profiles, grid.period_ns) {
-        Ok(plant) => plant,
+    let prepared = match prepare(run, config) {
+        Ok(prepared) => prepared,
         Err(error) => {
-            report.fail(format!(
-                "the profile {:?} on a {}ns grid is no plant to judge this run against: {error}",
-                config.profiles, grid.period_ns
-            ));
+            report.fail(error);
             return report;
         }
     };
-    let stream = residual_stream(&run.samples, grid, &plant);
     let asked = asked_for(run, &by_id, &mut report);
     no_faults(&run.faults, &mut report);
     every_asked_motion_was_scheduled(&asked, &planned, &by_id, &mut report);
-    every_window_moved(&ordered, &planned, &by_id, &mut report);
-    the_stream_held(&ordered, &planned, grid, &skips, &mut report);
-    measurements(&ordered, &events, &planned, &by_id, &stream, &mut report);
-    residuals(&stream, &run.samples, &plant, &mut report);
-    lags(&run.samples, &mut report);
-    // The tour is the run the library's whole load is applied in, so it is
-    // the run these two are worth taking off: a capability figure is only as
-    // good as the content that demanded it, and a temperature only means
-    // something over a long play.
-    let measured = capability(&run.samples, grid);
-    capabilities(&measured, &mut report);
-    match lag_scan(&run.samples, grid, &config.profiles, &measured) {
-        Ok(scans) => lag_scans(&scans, &mut report),
-        Err(error) => report.fail(error),
+    every_window_moved(&prepared.ordered, &planned, &by_id, &mut report);
+    if planned.is_empty() {
+        report.fail(
+            "the session planned no overlay window at all, so the tour asked the machine for \
+             nothing it could play"
+                .to_string(),
+        );
     }
-    stillness(&ordered, held_standard(table), &mut report);
-    health_summary(&run.readings, &mut report);
+    the_stream_held(
+        &prepared.ordered,
+        &overlay_spans(&planned),
+        prepared.grid,
+        &prepared.skips,
+        &mut report,
+    );
+    window_measurements(&prepared, &planned, &by_id, &mut report);
+    whole_stream_measurements(&prepared, run, config, &mut report);
+    stillness(&prepared.ordered, held_standard(table), &mut report);
+    let settle_result = settle(run, &prepared.ordered, &planned, config, &mut report);
+    let _ = (&settle_result.moves, &settle_result.maxima);
     report
 }
 
@@ -829,7 +256,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let run = match Run::read(&PathBuf::from(log_dir)) {
+    let run = match read(&PathBuf::from(log_dir)) {
         Ok(run) => run,
         Err(err) => {
             eprintln!("reading the log under {log_dir}: {err}");
@@ -853,16 +280,18 @@ mod tests {
     //! is under test is the reading. A fixture run is two motions long, which
     //! is enough for order, repetition and omission to be different things.
 
+    use super::motion_run_report::SETTLE_BOUND_COUNTS;
     use super::{
         ANTENNA_CONTACT_BAND_RAD, CHANNELS, DriverEventWire, EventKindWire, HealthReportWire,
         Logged, MotionTable, POSE_CHANNEL, PoseSampleWire, Report, Run, RunConfig, ScriptWire,
-        SessionScheduleWire, TickFaultWire, Window, analyze, windows,
+        SessionScheduleWire, TickFaultWire, Window, analyze, settle, windows,
     };
     use pose_reading::TEMPERATURE_STOP_C;
     use reachy_motion::arm::DEFAULT_GAINS;
-    use reachy_motion::plant::SHIPPED_PROFILES;
+    use reachy_motion::plant::{ClassProfile, GroupProfiles, SHIPPED_PROFILES};
 
     use brenn_reachy__cogs__schedule_clk_rs::OverlayWindowWire;
+    use brenn_reachy__cogs__schedule_clk_rs::{ScheduledStepWire, StepKindWire};
     use brenn_reachy__cogs__script_clk_rs::ScriptOverlayWire;
     use brenn_reachy__motion__faults_clk_rs::FaultKindWire;
     use clockwork_rs::SyncTime;
@@ -1009,6 +438,474 @@ mod tests {
     /// machine and not about the configuration.
     fn shipped() -> RunConfig {
         RunConfig::stated(SHIPPED_PROFILES, DEFAULT_GAINS, true)
+    }
+
+    #[test]
+    fn preparation_reports_a_profile_that_cannot_form_a_plant() {
+        let run = clean();
+        let profiles = GroupProfiles::of_each(|_| ClassProfile {
+            acceleration: 0,
+            velocity: 0,
+            following_lag_us: 0,
+        });
+        let result = super::motion_run_report::prepare(
+            &run,
+            &RunConfig::stated(profiles, DEFAULT_GAINS, true),
+        );
+        let error = match result {
+            Ok(_) => panic!("zero profiles cannot form a plant"),
+            Err(error) => error,
+        };
+        assert!(error.contains("do not form a plant"), "{error}");
+    }
+
+    /// A schedule carrying one absolute base-posture step.
+    fn base_schedule(
+        sequence: i64,
+        start: i64,
+        end: i64,
+        pose_id: u16,
+        pace: i64,
+    ) -> Logged<SessionScheduleWire> {
+        let mut message = SessionScheduleWire::new();
+        message.set_engaged(true);
+        let mut steps = message.steps_mut();
+        let step: &mut ScheduledStepWire = steps.try_grow().expect("one base step fits");
+        step.set_start(SyncTime::from_nanos(start));
+        step.set_end(SyncTime::from_nanos(end));
+        step.set_kind(StepKindWire::BASE_POSTURE);
+        step.set_pose_id(pose_id);
+        step.set_pace(clockwork_rs::Duration::from_nanos(pace));
+        Logged {
+            at_ns: start,
+            sequence_number: sequence as u32,
+            message,
+        }
+    }
+
+    /// A direct settle report fixture, without the unrelated tour verdicts.
+    fn settle_report(
+        schedules: Vec<Logged<SessionScheduleWire>>,
+        samples: Vec<Logged<PoseSampleWire>>,
+    ) -> Report {
+        let run = Run {
+            schedules,
+            samples,
+            ..Run::default()
+        };
+        let ordered = run.ordered_samples();
+        let mut report = Report::default();
+        settle(&run, &ordered, &[], &shipped(), &mut report);
+        report
+    }
+
+    fn settle_report_with_windows(
+        schedules: Vec<Logged<SessionScheduleWire>>,
+        samples: Vec<Logged<PoseSampleWire>>,
+        planned: &[Window],
+    ) -> Report {
+        let run = Run {
+            schedules,
+            samples,
+            ..Run::default()
+        };
+        let ordered = run.ordered_samples();
+        let mut report = Report::default();
+        settle(&run, &ordered, planned, &shipped(), &mut report);
+        report
+    }
+
+    /// One sample with one leg's commanded-present error in encoder counts.
+    fn leg_sample(n: i64, leg: usize, counts: f64) -> Logged<PoseSampleWire> {
+        let mut counts_by_leg = [0.0; 6];
+        counts_by_leg[leg] = counts;
+        legs_sample(n, counts_by_leg)
+    }
+
+    /// One valid sample with an error for each leg.
+    fn legs_sample(n: i64, counts: [f64; 6]) -> Logged<PoseSampleWire> {
+        let mut commanded = [0.0; ROW_COUNT];
+        let present = [0.0; ROW_COUNT];
+        for (leg, count) in counts.into_iter().enumerate() {
+            commanded[row(JointRef::Leg0).expect("leg row") + leg] = count * COUNT_RAD;
+        }
+        at(n, sample(n, &present, &commanded))
+    }
+
+    #[test]
+    fn base_move_settle_deduplicates_republishes_and_keeps_both_reading_provenances() {
+        let start = T0;
+        let pace = 5 * NOMINAL_CYCLE_NS;
+        let end = T0 + 100 * NOMINAL_CYCLE_NS;
+        let schedules = vec![
+            base_schedule(0, start, end, 7, pace),
+            base_schedule(1, start, end, 7, pace),
+        ];
+        let report = settle_report(
+            schedules,
+            vec![
+                at(1, sample(1, &[0.0; ROW_COUNT], &[0.0; ROW_COUNT])),
+                legs_sample(10, [SETTLE_BOUND_COUNTS, 10.0, 10.0, 10.0, 10.0, 10.0]),
+                legs_sample(60, [SETTLE_BOUND_COUNTS, 10.0, 10.0, 10.0, 10.0, 10.0]),
+            ],
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line == "1 measured, 0 skipped base moves"),
+            "{:?}",
+            report.measured
+        );
+        assert_eq!(
+            report
+                .measured
+                .iter()
+                .filter(|line| line.contains("base-move pose 7 measured"))
+                .count(),
+            1
+        );
+        for leg in 1..=6 {
+            assert!(
+                measured(&report, &format!("leg {leg}")),
+                "{:?}",
+                report.measured
+            );
+        }
+        assert!(measured(&report, "pose 7"), "{:?}", report.measured);
+    }
+
+    #[test]
+    fn base_move_settle_accepts_eighteen_and_rejects_eighteen_point_one_counts() {
+        let schedule = base_schedule(0, T0, T0 + 20 * NOMINAL_CYCLE_NS, 9, 5 * NOMINAL_CYCLE_NS);
+        let clean = settle_report(
+            vec![base_schedule(
+                0,
+                T0,
+                T0 + 20 * NOMINAL_CYCLE_NS,
+                9,
+                5 * NOMINAL_CYCLE_NS,
+            )],
+            vec![
+                legs_sample(1, [0.0; 6]),
+                legs_sample(10, [SETTLE_BOUND_COUNTS; 6]),
+                legs_sample(19, [SETTLE_BOUND_COUNTS; 6]),
+            ],
+        );
+        assert!(clean.findings.is_empty(), "{:?}", clean.findings);
+        let red = settle_report(
+            vec![schedule],
+            vec![
+                legs_sample(1, [0.0; 6]),
+                legs_sample(
+                    10,
+                    [
+                        18.1,
+                        SETTLE_BOUND_COUNTS,
+                        SETTLE_BOUND_COUNTS,
+                        SETTLE_BOUND_COUNTS,
+                        SETTLE_BOUND_COUNTS,
+                        SETTLE_BOUND_COUNTS,
+                    ],
+                ),
+                legs_sample(
+                    19,
+                    [
+                        18.1,
+                        SETTLE_BOUND_COUNTS,
+                        SETTLE_BOUND_COUNTS,
+                        SETTLE_BOUND_COUNTS,
+                        SETTLE_BOUND_COUNTS,
+                        SETTLE_BOUND_COUNTS,
+                    ],
+                ),
+            ],
+        );
+        assert!(found(&red, "leg 1"), "{:?}", red.findings);
+        assert!(found(&red, "18.1 counts"), "{:?}", red.findings);
+    }
+
+    #[test]
+    fn base_move_settle_reports_missing_intervals_and_invalid_rows() {
+        let pace = 5 * NOMINAL_CYCLE_NS;
+        let no_hold = base_schedule(0, T0, T0 + pace, 3, pace);
+        let no_hold_report = settle_report(vec![no_hold], Vec::new());
+        assert!(
+            no_hold_report
+                .measured
+                .iter()
+                .any(|line| line.contains(&format!(
+                    "base move pose 3 skipped: no commanded change in [{T0}, {})",
+                    T0 + pace
+                )))
+        );
+        assert_eq!(
+            no_hold_report
+                .measured
+                .iter()
+                .filter(|line| line.contains("base-move settle") && line.contains("unavailable"))
+                .count(),
+            6,
+            "{:?}",
+            no_hold_report.measured
+        );
+
+        let schedule = base_schedule(1, T0, T0 + 20 * NOMINAL_CYCLE_NS, 4, pace);
+        let missing_endpoint = settle_report(
+            vec![base_schedule(1, T0, T0 + 20 * NOMINAL_CYCLE_NS, 4, pace)],
+            vec![legs_sample(1, [0.0; 6]), leg_sample(4, 0, 1.0)],
+        );
+        assert!(
+            missing_endpoint
+                .measured
+                .iter()
+                .any(|line| line.contains(&format!(
+                    "hold shorter than the following lag: endpoint {}, first eligible {}, clean end {}",
+                    T0 + 4 * NOMINAL_CYCLE_NS,
+                    T0 + 4 * NOMINAL_CYCLE_NS + 24_000_000,
+                    T0 + 20 * NOMINAL_CYCLE_NS
+                ))),
+            "{:?}",
+            missing_endpoint.measured
+        );
+        let mut invalid = sample(10, &[0.0; ROW_COUNT], &[0.0; ROW_COUNT]);
+        invalid.set_present_valid(false);
+        let invalid_report = settle_report(
+            vec![schedule],
+            vec![
+                at(1, sample(1, &[0.0; ROW_COUNT], &[0.0; ROW_COUNT])),
+                at(10, invalid),
+            ],
+        );
+        assert!(
+            invalid_report
+                .measured
+                .iter()
+                .any(|line| line.contains(&format!(
+                    "no commanded change in [{}, {})",
+                    T0,
+                    T0 + 20 * NOMINAL_CYCLE_NS
+                )))
+        );
+
+        let mut invalid_endpoint = sample(19, &[0.0; ROW_COUNT], &[COUNT_RAD; ROW_COUNT]);
+        invalid_endpoint.set_present_valid(false);
+        let invalid_endpoint_report = settle_report(
+            vec![base_schedule(0, T0, T0 + 20 * NOMINAL_CYCLE_NS, 4, pace)],
+            vec![
+                at(1, sample(1, &[0.0; ROW_COUNT], &[0.0; ROW_COUNT])),
+                at(4, sample(4, &[0.0; ROW_COUNT], &[COUNT_RAD; ROW_COUNT])),
+                at(19, invalid_endpoint),
+            ],
+        );
+        assert!(
+            invalid_endpoint_report
+                .measured
+                .iter()
+                .any(|line| line.contains(&format!(
+                    "endpoint reading at {} missing commanded or present rows before clean end {}",
+                    T0 + 19 * NOMINAL_CYCLE_NS,
+                    T0 + 20 * NOMINAL_CYCLE_NS
+                ))),
+            "{:?}",
+            invalid_endpoint_report.measured
+        );
+
+        let mut invalid_hold_end = sample(19, &[0.0; ROW_COUNT], &[COUNT_RAD; ROW_COUNT]);
+        invalid_hold_end.set_present_valid(false);
+        let malformed = settle_report(
+            vec![base_schedule(0, T0, T0 + 20 * NOMINAL_CYCLE_NS, 5, pace)],
+            vec![
+                at(1, sample(1, &[0.0; ROW_COUNT], &[0.0; ROW_COUNT])),
+                legs_sample(4, [1.0; 6]),
+                legs_sample(10, [1.0; 6]),
+                at(19, invalid_hold_end),
+            ],
+        );
+        assert!(
+            malformed
+                .measured
+                .iter()
+                .any(|line| line.contains("0 measured, 1 skipped base moves")),
+            "{:?}",
+            malformed.measured
+        );
+        assert!(
+            malformed
+                .measured
+                .iter()
+                .any(|line| line.contains("hold-end reading at 1772000000503456789 missing commanded or present rows before clean end 1772000000523456789")),
+            "{:?}",
+            malformed.measured
+        );
+        assert!(
+            !malformed
+                .measured
+                .iter()
+                .any(|line| line.contains("base-move pose 5 measured")),
+            "{:?}",
+            malformed.measured
+        );
+        assert_eq!(
+            malformed
+                .measured
+                .iter()
+                .filter(|line| line.contains("base-move settle") && line.contains("unavailable"))
+                .count(),
+            6,
+            "{:?}",
+            malformed.measured
+        );
+
+        let repeated = settle_report(
+            vec![
+                base_schedule(0, T0, T0 + 20 * NOMINAL_CYCLE_NS, 15, pace),
+                base_schedule(
+                    0,
+                    T0 + 30 * NOMINAL_CYCLE_NS,
+                    T0 + 50 * NOMINAL_CYCLE_NS,
+                    15,
+                    pace,
+                ),
+            ],
+            Vec::new(),
+        );
+        assert!(repeated.measured.iter().any(|line| line.contains(&format!(
+            "no commanded change in [{}, {})",
+            T0,
+            T0 + 20 * NOMINAL_CYCLE_NS
+        ))));
+        assert!(repeated.measured.iter().any(|line| line.contains(&format!(
+            "no commanded change in [{}, {})",
+            T0 + 30 * NOMINAL_CYCLE_NS,
+            T0 + 50 * NOMINAL_CYCLE_NS
+        ))));
+    }
+
+    #[test]
+    fn base_move_settle_uses_the_last_sample_before_clean_end_for_hold_end() {
+        let pace = 5 * NOMINAL_CYCLE_NS;
+        let reading = |n: i64, present_count: f64| {
+            let present = [present_count * COUNT_RAD; ROW_COUNT];
+            let commanded = [COUNT_RAD; ROW_COUNT];
+            at(n, sample(n, &present, &commanded))
+        };
+        let report = settle_report(
+            vec![base_schedule(0, T0, T0 + 20 * NOMINAL_CYCLE_NS, 15, pace)],
+            vec![
+                at(1, sample(1, &[0.0; ROW_COUNT], &[0.0; ROW_COUNT])),
+                reading(4, 0.9),
+                reading(10, 0.9),
+                reading(19, 0.0),
+            ],
+        );
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains(&format!("hold-end at {}", T0 + 19 * NOMINAL_CYCLE_NS))),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    #[test]
+    fn base_move_settle_uses_record_changes_and_excludes_overlay_intervals() {
+        let start = T0 + NOMINAL_CYCLE_NS;
+        let end = T0 + 100 * NOMINAL_CYCLE_NS;
+        let samples = || {
+            vec![
+                legs_sample(1, [0.0; 6]),
+                legs_sample(5, [1.0; 6]),
+                legs_sample(9, [2.0; 6]),
+                legs_sample(10, [SETTLE_BOUND_COUNTS; 6]),
+                legs_sample(60, [SETTLE_BOUND_COUNTS; 6]),
+            ]
+        };
+        let record_keyed = settle_report(
+            vec![base_schedule(0, start, end, 12, 5 * NOMINAL_CYCLE_NS)],
+            samples(),
+        );
+        assert!(measured(
+            &record_keyed,
+            &format!("endpoint {}", T0 + 10 * NOMINAL_CYCLE_NS)
+        ));
+
+        let mixed_samples = || {
+            let mut samples = Vec::new();
+            for (n, legs, antenna) in [
+                (1, 0.0, 0.0),
+                (5, 1.0, 0.0),
+                (9, 2.0, 0.0),
+                (10, 2.0, 1.0),
+                (11, 2.0, 2.0),
+                (60, 2.0, 3.0),
+            ] {
+                let mut commanded = [0.0; ROW_COUNT];
+                for leg in 0..6 {
+                    commanded[row(JointRef::Leg0).expect("leg row") + leg] = legs;
+                }
+                commanded[row(JointRef::AntennaLeft).expect("antenna row")] = antenna;
+                samples.push(at(n, sample(n, &[0.0; ROW_COUNT], &commanded)));
+            }
+            samples
+        };
+        let mixed = settle_report(
+            vec![base_schedule(0, start, end, 16, 5 * NOMINAL_CYCLE_NS)],
+            mixed_samples(),
+        );
+        assert!(
+            measured(&mixed, &format!("endpoint {}", T0 + 9 * NOMINAL_CYCLE_NS)),
+            "{:?}",
+            mixed.measured
+        );
+        assert!(
+            mixed.measured.iter().any(|line| {
+                line.contains("base-move settle leg 1")
+                    && line.contains(&format!("at {}", T0 + 11 * NOMINAL_CYCLE_NS))
+            }),
+            "{:?}",
+            mixed.measured
+        );
+
+        let opening = Window {
+            motion_id: 3,
+            start_ns: T0 + 80 * NOMINAL_CYCLE_NS,
+            end_ns: T0 + 90 * NOMINAL_CYCLE_NS,
+        };
+        let truncated = settle_report_with_windows(
+            vec![base_schedule(0, start, end, 13, 5 * NOMINAL_CYCLE_NS)],
+            samples(),
+            &[opening],
+        );
+        assert!(measured(
+            &truncated,
+            &format!("clean end {}", opening.start_ns)
+        ));
+
+        let covered = settle_report_with_windows(
+            vec![base_schedule(0, start, end, 14, 5 * NOMINAL_CYCLE_NS)],
+            vec![legs_sample(5, [1.0; 6]), legs_sample(19, [1.0; 6])],
+            &[Window {
+                motion_id: 4,
+                start_ns: start,
+                end_ns: end,
+            }],
+        );
+        assert!(covered.measured.iter().any(|line| line.contains(&format!(
+            "base move pose 14 skipped: overlay motion 4 begins at {} before base start {}",
+            start, start
+        ))));
+
+        let unchanged = settle_report(
+            vec![base_schedule(0, start, end, 15, 5 * NOMINAL_CYCLE_NS)],
+            vec![legs_sample(1, [0.0; 6]), legs_sample(19, [0.0; 6])],
+        );
+        assert!(unchanged.measured.iter().any(|line| line.contains(&format!(
+            "base move pose 15 skipped: no commanded change in [{}, {})",
+            start, end
+        ))));
     }
 
     /// Whether any finding says `what`.
@@ -1257,6 +1154,16 @@ mod tests {
                 "the goal never changed across the window over \
                             pollen/emotions/curious1"
             ),
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|finding| finding.contains("the goal never changed across the window"))
+                .count(),
+            1,
             "{:?}",
             report.findings
         );

@@ -163,5 +163,15 @@ schema ClipPlayerSnap
 
         // Whether the motion and its fade-out are both over.
         #9 finished: Bool;
+
+        // Whole turns added to a posed right-antenna target while the antenna
+        // weights.antennas > 0. Chosen when the posed antenna channel comes in
+        // and discarded when it fades out; meaningless at other times.
+        #10 antenna_turns_right: Int32;
+
+        // Whole turns added to a posed left-antenna target while the antenna
+        // weights.antennas > 0. Chosen when the posed antenna channel comes in
+        // and discarded when it fades out; meaningless at other times.
+        #11 antenna_turns_left: Int32;
     }
 }

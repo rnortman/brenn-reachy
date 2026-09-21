@@ -792,7 +792,7 @@ mod tests {
     /// Every committed document fits the field it is written into.
     #[test]
     fn the_committed_descriptions_fit_the_document() {
-        for name in ["stow", "neutral", "peek"] {
+        for name in ["stow", "neutral", "peek", "peek_tilt", "hello"] {
             let pose = committed(name);
             assert!(pose.description().len() <= MAX_DESCRIPTION_LEN);
         }
@@ -996,7 +996,7 @@ mod tests {
     /// emitted from, so this fails before the emitter does.
     #[test]
     fn the_committed_documents_load_under_their_own_names() {
-        for name in ["stow", "neutral", "peek"] {
+        for name in ["stow", "neutral", "peek", "peek_tilt", "hello"] {
             let pose = committed(name);
             assert_eq!(pose.name(), name, "a document's name is its file stem");
             assert!(pose.duration_ms() > 0);
@@ -1018,7 +1018,7 @@ mod tests {
     /// checks an antenna for finiteness alone, so a re-extraction or a hand-edit
     /// that moved the fold — or swapped the two sides — would change where the
     /// antennas go with every other test still passing.
-    const STOW_ANTENNAS_RAD: [f64; 2] = [-3.4591, 3.3596];
+    const STOW_ANTENNAS_RAD: [f64; 2] = [-3.32, 3.32];
 
     /// Where the committed peek leans its antennas, on the same grounds.
     const PEEK_ANTENNAS_RAD: [f64; 2] = [-0.2824, 0.2040];
@@ -1043,18 +1043,19 @@ mod tests {
                     "{name} antenna {side} is at {angle} rad, outside what may be commanded"
                 );
             }
-            assert_eq!(
-                reduce_antennas(antennas),
-                antennas,
-                "{name} states a multi-turn spelling of its fold rather than the direction"
-            );
+            let reduced = reduce_antennas(antennas);
+            for (side, angle) in reduced.into_iter().enumerate() {
+                assert!(
+                    (angle - antennas[side]).abs() < 1e-12,
+                    "{name} antenna {side} changed representative"
+                );
+            }
         }
     }
 
     /// What the committed stow clears the linkage's singular configurations by,
-    /// metres, as the committed document and the present geometry give it. The
-    /// tightest committed pose in the tree, and the reason the clearance floor
-    /// is where it is.
+    /// metres. This golden is local to stow and is not the tightest future
+    /// committed pose or the derivation of the command floor.
     const STOW_MARGIN_M: f64 = 2.660e-3;
 
     /// The stow's clearance, pinned as a number rather than as an inequality
@@ -1064,8 +1065,8 @@ mod tests {
     /// check, so a geometry change that ate the headroom would panic at the load
     /// and this assertion would only ever be reached when it already held. Read
     /// this way, a change that halves the clearance fails here with both numbers
-    /// while the pose is still readable, which is the early warning a guard on
-    /// the tightest pose in the tree is for.
+    /// while the pose is still readable, which is the early warning this local
+    /// stow golden provides.
     #[test]
     fn the_committed_stow_clears_the_clearance_floor() {
         let doc = parse_document(&committed_text("stow")).expect("the committed stow parses");

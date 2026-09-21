@@ -35,17 +35,18 @@ use nalgebra::Isometry3;
 use reachy_kin::{
     EnvelopeConfig, EnvelopeReport, check_envelope, default_geometry, neutral_head_pose,
 };
-use reachy_motion::tick::ANTENNA_OUTBOARD;
 use thiserror::Error;
 
 use crate::format::PoseDoc;
+
+const REDUCTION_CENTRES: [f64; 2] = [-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2];
 
 /// Both antenna readings reduced to the directions they name, right then left.
 #[must_use]
 pub fn reduce_antennas(readings: [f64; 2]) -> [f64; 2] {
     [
-        reduce_to_turn(readings[0], ANTENNA_OUTBOARD[0]),
-        reduce_to_turn(readings[1], ANTENNA_OUTBOARD[1]),
+        reduce_to_turn(readings[0], REDUCTION_CENTRES[0]),
+        reduce_to_turn(readings[1], REDUCTION_CENTRES[1]),
     ]
 }
 
@@ -298,8 +299,6 @@ mod tests {
     use core::f64::consts::{PI, TAU};
     use nalgebra::{Translation3, UnitQuaternion, Vector3};
     use reachy_kin::ik::min_pose_margin;
-    use reachy_motion::tick::ANTENNA_OUTBOARD;
-
     /// The same direction, to within the arithmetic.
     fn same_direction(a: f64, b: f64) {
         let gap = (a - b).rem_euclid(TAU);
@@ -312,14 +311,14 @@ mod tests {
     /// straight up, at −0.29.
     #[test]
     fn the_recorded_readings_reduce_to_where_the_rods_stood() {
-        let left = reduce_to_turn(-2.92, ANTENNA_OUTBOARD[1]);
+        let left = reduce_to_turn(-2.92, REDUCTION_CENTRES[1]);
         assert!(
             (left - 3.3632).abs() < 1e-3,
             "left read -2.92, reduced to {left}"
         );
         same_direction(left, -2.92);
 
-        let right = reduce_to_turn(-6.57, ANTENNA_OUTBOARD[0]);
+        let right = reduce_to_turn(-6.57, REDUCTION_CENTRES[0]);
         assert!(
             (right - -0.2868).abs() < 1e-3,
             "right read -6.57, reduced to {right}"
@@ -335,7 +334,7 @@ mod tests {
     fn a_reading_already_in_its_window_is_untouched() {
         // Each side's own travel: the rest lean off straight up, the fold past
         // straight down, and straight up between them.
-        for (side, (&outboard, travel)) in ANTENNA_OUTBOARD
+        for (side, (&outboard, travel)) in REDUCTION_CENTRES
             .iter()
             .zip([[-0.1745, -3.32, 0.0], [0.1745, 3.32, 0.0]])
             .enumerate()
@@ -354,7 +353,7 @@ mod tests {
     /// folds up to the upper one, so one direction has exactly one spelling.
     #[test]
     fn the_window_is_half_open_at_its_lower_edge() {
-        for &outboard in &ANTENNA_OUTBOARD {
+        for &outboard in &REDUCTION_CENTRES {
             let upper = outboard + PI;
             assert!((reduce_to_turn(upper, outboard) - upper).abs() < 1e-12);
             assert!((reduce_to_turn(outboard - PI, outboard) - upper).abs() < 1e-12);
@@ -365,7 +364,7 @@ mod tests {
     /// spelling.
     #[test]
     fn whole_turns_either_way_reduce_to_one_spelling() {
-        for &outboard in &ANTENNA_OUTBOARD {
+        for &outboard in &REDUCTION_CENTRES {
             let stood = outboard + 0.4;
             for turns in [-3.0, -1.0, 0.0, 1.0, 2.0] {
                 let read = stood + turns * TAU;
@@ -381,8 +380,8 @@ mod tests {
     /// the loader's question.
     #[test]
     fn a_reading_that_is_not_a_number_is_carried_through() {
-        assert!(reduce_to_turn(f64::NAN, ANTENNA_OUTBOARD[0]).is_nan());
-        assert!(reduce_to_turn(f64::INFINITY, ANTENNA_OUTBOARD[1]).is_infinite());
+        assert!(reduce_to_turn(f64::NAN, REDUCTION_CENTRES[0]).is_nan());
+        assert!(reduce_to_turn(f64::INFINITY, REDUCTION_CENTRES[1]).is_infinite());
     }
 
     /// A hold recorded with the head a little below neutral, the antennas read

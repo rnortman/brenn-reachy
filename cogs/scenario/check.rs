@@ -669,9 +669,8 @@ pub fn estimates_valid(run: &Run, failures: &mut Vec<String>) {
 /// The antennas are compared as directions rather than as angles. They run in
 /// extended position mode with no travel limit, and a posture names where an
 /// antenna points, not how many turns of thread it took to get there: the motion
-/// library takes the long way round whenever the short arc would sweep an
-/// antenna out sideways, so a machine that arrived correctly can be a whole turn
-/// from the number the posture states.
+/// library chooses the shortest representable planned arc, so a machine that
+/// arrived correctly can be a whole turn from the number the posture states.
 pub fn arrived_at(
     run: &Run,
     what: &str,

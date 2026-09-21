@@ -140,13 +140,13 @@ pub use stillness::{
     StillnessCounts, StillnessError, StillnessWatch, judge,
 };
 pub use tick::{
-    ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, ANTENNA_OUTBOARD, BusFailureSource, ClockStretch,
-    CommandDisposition, CommandRejection, DryPassPeaks, FLOOR_TICK_HZ, Fault, HEAD_GROUP_FLOOR_S,
-    MIN_JERK_PEAK_RATE, MotionCommand, MotionConfig, MotionSnap, MotionSnapWire, MoveAbort,
-    ResponseKind, StateError, TickInputs, TickOutputs, TickReport, TrackingFaultConfig,
-    TrackingLook, WireFailure, YAW_GOAL_COUNT_MAX, arm, default_motion_config, dry_pass_peaks,
-    dry_pass_separation, duration_floor_s, floor_move_clock, last_goal, last_targets, motion_tick,
-    plan_move, resume, standing_fault, tracking, yaw_goal_counts,
+    ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, BusFailureSource, ClockStretch, CommandDisposition,
+    CommandRejection, DryPassPeaks, FLOOR_TICK_HZ, Fault, HEAD_GROUP_FLOOR_S, MIN_JERK_PEAK_RATE,
+    MotionCommand, MotionConfig, MotionSnap, MotionSnapWire, MoveAbort, ResponseKind, StateError,
+    TickInputs, TickOutputs, TickReport, TrackingFaultConfig, TrackingLook, WireFailure,
+    YAW_GOAL_COUNT_MAX, arm, default_motion_config, dry_pass_peaks, dry_pass_separation,
+    duration_floor_s, floor_move_clock, last_goal, last_targets, motion_tick, plan_move, resume,
+    standing_fault, tracking, yaw_goal_counts,
 };
 pub use traj::{MoveDurations, SeedError, Trajectory, TrajectoryError, WarpKind};
 pub use txn::{AuxOpKind, BusTxn, BusTxnWire};

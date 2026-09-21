@@ -27,6 +27,7 @@ use thiserror::Error;
 
 use reachy_motion::FLOOR_TICK_HZ;
 use reachy_motion::asset_name::{AssetNameError, check_asset_name};
+use reachy_motion::joints::JointTargets;
 
 use crate::envelope::{ClipLimits, FrameError, check_frames};
 
@@ -333,6 +334,17 @@ pub enum ClipError {
         source: AssetNameError,
     },
 
+    /// The authored base name is not a usable asset name.
+    #[error("clip base name {name:?} is unusable: {source}")]
+    BaseName {
+        name: String,
+        source: AssetNameError,
+    },
+
+    /// The authored base is not among the poses supplied to the loader.
+    #[error("clip base {name:?} is not a named pose")]
+    UnknownBase { name: String },
+
     /// A `frame_hz` other than the tick rate the whole stack is floored at.
     ///
     /// Refused rather than resampled at load: resampling is the importer's job,
@@ -478,6 +490,9 @@ pub struct ClipDoc {
     pub kind: String,
     /// The library name this asset is invoked by.
     pub name: String,
+    /// The named pose this clip was authored over, if it is a posed clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
     /// Free text, carried from the recording or written by the author.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -612,7 +627,29 @@ pub struct Clip {
     blend_in_ms: u32,
     blend_out_ms: u32,
     frames: Vec<DeltaFrame>,
+    anchor: Option<ResolvedAnchor>,
     notes: Vec<ClipNote>,
+}
+
+/// The validated pose a clip's deltas were authored over.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedAnchor {
+    pub(crate) name: String,
+    pub(crate) targets: JointTargets,
+}
+
+impl ResolvedAnchor {
+    /// The authored pose name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The absolute pose baked into the runtime asset.
+    #[must_use]
+    pub fn targets(&self) -> JointTargets {
+        self.targets
+    }
 }
 
 /// Something a load changed about a clip, or found worth saying about it.
@@ -651,6 +688,21 @@ impl Clip {
         Self::from_doc(doc, limits)
     }
 
+    /// Parse and validate a clip against named pose targets.
+    pub fn from_json_resolved<F>(
+        json: &str,
+        limits: &ClipLimits,
+        resolve: F,
+    ) -> Result<Self, ClipError>
+    where
+        F: Fn(&str) -> Option<JointTargets>,
+    {
+        let doc: ClipDoc = serde_json::from_str(json).map_err(|err| ClipError::Malformed {
+            detail: err.to_string(),
+        })?;
+        Self::from_doc_resolved(doc, limits, resolve)
+    }
+
     /// Validate a parsed document.
     ///
     /// The order is deliberate: the document-level facts first — version, kind,
@@ -660,6 +712,18 @@ impl Clip {
     /// kinematics and it has nothing to say about a document whose shape is
     /// already wrong.
     pub fn from_doc(doc: ClipDoc, limits: &ClipLimits) -> Result<Self, ClipError> {
+        Self::from_doc_resolved(doc, limits, |_| None)
+    }
+
+    /// Validate a parsed document against named pose targets.
+    pub fn from_doc_resolved<F>(
+        doc: ClipDoc,
+        limits: &ClipLimits,
+        resolve: F,
+    ) -> Result<Self, ClipError>
+    where
+        F: Fn(&str) -> Option<JointTargets>,
+    {
         if doc.version != FORMAT_VERSION {
             return Err(ClipError::UnsupportedVersion {
                 version: doc.version,
@@ -690,12 +754,27 @@ impl Clip {
             return Err(ClipError::NoFrames);
         }
 
+        let anchor = match doc.base.as_deref() {
+            None => None,
+            Some(name) => {
+                check_asset_name(name).map_err(|source| ClipError::BaseName {
+                    name: name.to_owned(),
+                    source,
+                })?;
+                Some(ResolvedAnchor {
+                    name: name.to_owned(),
+                    targets: resolve(name).ok_or_else(|| ClipError::UnknownBase {
+                        name: name.to_owned(),
+                    })?,
+                })
+            }
+        };
         let mut frames = Vec::with_capacity(doc.frames.len());
         for (index, frame) in doc.frames.iter().enumerate() {
             frames.push(delta_frame(index, frame, mask)?);
         }
 
-        check_frames(&frames, limits)?;
+        check_frames(&frames, anchor.as_ref(), limits)?;
 
         let clip_ms = clip_duration_ms(frames.len());
         let blend_in_ms = authored_blend(doc.blend_in_ms, BlendEnd::In, clip_ms)?;
@@ -708,6 +787,7 @@ impl Clip {
             blend_in_ms,
             blend_out_ms,
             frames,
+            anchor,
             notes: Vec::new(),
         })
     }
@@ -728,6 +808,12 @@ impl Clip {
     #[must_use]
     pub fn mask(&self) -> ChannelMask {
         self.mask
+    }
+
+    /// The resolved authored base, if this is a posed clip.
+    #[must_use]
+    pub fn anchor(&self) -> Option<&ResolvedAnchor> {
+        self.anchor.as_ref()
     }
 
     /// What the load changed about this clip, in the order it changed it.
@@ -797,6 +883,7 @@ impl Clip {
             version: FORMAT_VERSION,
             kind: CLIP_KIND.to_owned(),
             name: self.name.clone(),
+            base: self.anchor.as_ref().map(|anchor| anchor.name.clone()),
             description: self.description.clone(),
             channels: self.mask.iter().collect(),
             frame_hz: FLOOR_TICK_HZ,
@@ -1021,6 +1108,7 @@ mod tests {
             version: FORMAT_VERSION,
             kind: "clip".to_owned(),
             name: "pollen/emotions/loving1".to_owned(),
+            base: None,
             description: Some("a test".to_owned()),
             channels: vec![Channel::Head, Channel::Antennas, Channel::BodyYaw],
             frame_hz: FLOOR_TICK_HZ,
@@ -1063,6 +1151,138 @@ mod tests {
         // One frame is 20 ms of clip, so the omitted default is capped there.
         assert_eq!(clip.blend_in_ms(), 20);
         assert_eq!(clip.blend_out_ms(), 20);
+    }
+
+    #[test]
+    fn posed_document_round_trips_and_refuses_bad_base_names() {
+        let mut doc = full_doc();
+        doc.base = Some("neutral".to_owned());
+        let anchor = JointTargets::default();
+        let clip = Clip::from_doc_resolved(doc.clone(), &limits(), |_| Some(anchor))
+            .expect("posed document loads");
+        let json = serde_json::to_string(&clip.to_doc()).expect("clip serializes");
+        let round_trip = Clip::from_json_resolved(&json, &limits(), |_| Some(anchor))
+            .expect("posed JSON round-trips");
+        assert_eq!(round_trip.anchor().expect("anchor").name(), "neutral");
+        assert_eq!(round_trip.frames(), clip.frames());
+
+        let mut unknown = doc.clone();
+        unknown.base = Some("missing".to_owned());
+        assert!(matches!(
+            Clip::from_doc_resolved(unknown, &limits(), |_| None),
+            Err(ClipError::UnknownBase { name }) if name == "missing"
+        ));
+        let mut malformed = doc;
+        malformed.base = Some("bad name".to_owned());
+        assert!(matches!(
+            Clip::from_doc_resolved(malformed, &limits(), |_| Some(anchor)),
+            Err(ClipError::BaseName { name, .. }) if name == "bad name"
+        ));
+    }
+
+    #[test]
+    fn unposed_document_preserves_frame_and_composition_bits() {
+        let clip = Clip::from_doc(full_doc(), &limits()).expect("unposed document loads");
+        let again = Clip::from_json(&serde_json::to_string(&clip.to_doc()).unwrap(), &limits())
+            .expect("JSON round-trips");
+        assert_eq!(clip, again);
+        assert_eq!(clip.anchor(), None);
+    }
+
+    #[test]
+    fn posed_load_screens_absolute_targets_and_names_failures() {
+        let yaw_doc = ClipDoc {
+            channels: vec![Channel::BodyYaw],
+            frames: vec![FrameDoc {
+                body_yaw: Some(0.3),
+                ..FrameDoc::default()
+            }],
+            ..full_doc()
+        };
+        assert!(Clip::from_doc(yaw_doc.clone(), &limits()).is_ok());
+        let error = Clip::from_doc_resolved(
+            ClipDoc {
+                base: Some("wide".to_owned()),
+                ..yaw_doc
+            },
+            &limits(),
+            |_| {
+                Some(JointTargets {
+                    body_yaw: 2.8,
+                    ..JointTargets::default()
+                })
+            },
+        )
+        .unwrap_err();
+        match error {
+            ClipError::Frames {
+                source:
+                    FrameError::AnchoredEnvelope {
+                        frame,
+                        base,
+                        violations,
+                    },
+            } => {
+                assert_eq!(frame, 0);
+                assert_eq!(base, "wide");
+                assert!(violations.body_yaw);
+                assert!(!violations.cone);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let antenna_doc = ClipDoc {
+            channels: vec![Channel::Antennas],
+            frames: vec![FrameDoc {
+                antennas: Some([0.01, 0.0]),
+                ..FrameDoc::default()
+            }],
+            ..full_doc()
+        };
+        let error = Clip::from_doc_resolved(
+            ClipDoc {
+                base: Some("antenna-base".to_owned()),
+                ..antenna_doc
+            },
+            &limits(),
+            |_| {
+                Some(JointTargets {
+                    antennas: [reachy_motion::ANTENNA_GOAL_MAX_RAD, 0.0],
+                    ..JointTargets::default()
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ClipError::Frames {
+                source: FrameError::AnchoredAntennaGoal { frame: 0, base, side: 0, .. }
+            } if base == "antenna-base"
+        ));
+
+        let head_doc = ClipDoc {
+            base: Some("near-edge".to_owned()),
+            channels: vec![Channel::Head],
+            frames: vec![FrameDoc {
+                dt: Some([0.0, 0.0, 0.2]),
+                dq: Some([1.0, 0.0, 0.0, 0.0]),
+                ..FrameDoc::default()
+            }],
+            ..full_doc()
+        };
+        let error = Clip::from_doc_resolved(head_doc, &limits(), |_| {
+            Some(JointTargets {
+                head_pose_body: reachy_kin::geometry::rest_head_pose(),
+                ..JointTargets::default()
+            })
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ClipError::Frames {
+                source: FrameError::AnchoredEnvelope { frame: 0, base, violations }
+            } if base == "near-edge" && violations.any()
+        ));
     }
 
     /// The two whole-frame checks a consumer of an unvalidated source makes

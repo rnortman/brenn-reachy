@@ -19,7 +19,7 @@
 //! stops meaning what the analyzer says it means.
 
 use motion_proto::{MotionScript, STOW_POSE, Step};
-use reachy_edge::PoseTable;
+use reachy_edge::{MotionTable, PoseTable};
 
 /// The names sidecar of the two libraries this build emits.
 ///
@@ -63,12 +63,20 @@ pub const NEUTRAL_POSE: &str = "neutral";
 /// stow, and the drift test refuses a sidecar that is not this emit's.
 #[must_use]
 pub fn poses() -> &'static PoseTable {
-    static POSES: std::sync::OnceLock<PoseTable> = std::sync::OnceLock::new();
-    POSES.get_or_init(|| {
-        reachy_edge::parse(LIBRARY_NAMES)
-            .expect("the sidecar this binary was built beside")
-            .1
+    &tables().1
+}
+
+#[must_use]
+pub fn tables() -> &'static (MotionTable, PoseTable) {
+    static TABLES: std::sync::OnceLock<(MotionTable, PoseTable)> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        reachy_edge::parse(LIBRARY_NAMES).expect("the sidecar this binary was built beside")
     })
+}
+
+#[must_use]
+pub fn motions() -> &'static MotionTable {
+    &tables().0
 }
 
 /// How long the closing stow of a harness script takes, milliseconds.
@@ -156,7 +164,7 @@ pub fn body(pod: &str) -> String {
 mod tests {
     use brenn_reachy__cogs__schedule_clk_rs::StepKindWire;
     use clockwork_rs::SyncTime;
-    use motion_proto::{MotionScript, STOW_POSE};
+    use motion_proto::{MotionScript, Play, STOW_POSE, Step};
     use reachy_edge::{Edge, EdgeConfig, MotionTable};
 
     use super::{STOW_DURATION_MS, poses};
@@ -168,6 +176,59 @@ mod tests {
 
     /// A round instant, so a stamp read off the wrong side of the edge shows.
     const ARRIVAL_NS: i64 = 1_700_000_000_000_000_000;
+
+    #[test]
+    fn the_embedded_edge_accepts_assets_and_rejects_unknown_names() {
+        let edge_config = EdgeConfig::for_pod(ASK_POD);
+        let valid = MotionScript::new(
+            ASK_POD,
+            1,
+            vec![
+                Step::new(0, super::NEUTRAL_POSE),
+                Step::play(1, Play::new("bench/nod")),
+            ],
+            600_000,
+        )
+        .expect("valid asset names");
+        let mut edge = Edge::new(
+            edge_config.clone(),
+            super::motions().clone(),
+            poses().clone(),
+        );
+        assert!(
+            edge.accept(valid.encode().as_bytes(), SyncTime::from_nanos(ARRIVAL_NS))
+                .is_ok()
+        );
+
+        let unknown_motion = MotionScript::new(
+            ASK_POD,
+            2,
+            vec![
+                Step::new(0, super::NEUTRAL_POSE),
+                Step::play(1, Play::new("unknown/motion")),
+            ],
+            600_000,
+        )
+        .expect("wire-valid unknown motion");
+        assert!(
+            edge.accept(
+                unknown_motion.encode().as_bytes(),
+                SyncTime::from_nanos(ARRIVAL_NS)
+            )
+            .is_err()
+        );
+
+        let unknown_pose =
+            MotionScript::new(ASK_POD, 3, vec![Step::new(0, "unknown/pose")], 600_000)
+                .expect("wire-valid unknown pose");
+        assert!(
+            edge.accept(
+                unknown_pose.encode().as_bytes(),
+                SyncTime::from_nanos(ARRIVAL_NS)
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn the_gesture_is_a_raise_and_a_fold_at_the_pinned_offsets() {

@@ -414,6 +414,31 @@ schema ClipConfig
 
         // The frame track, in time order. Never empty.
         #4 frames: VarArray<ClipFrame, 1024>;
+
+        // Whether the clip was authored over a named pose. When false, the
+        // remaining fields are deterministic placeholders; when true, they
+        // are the complete absolute anchor targets.
+        #5 has_anchor: Bool;
+        // Absolute anchor head translation x, metres.
+        #6 anchor_head_dx: Float64;
+        // Absolute anchor head translation y, metres.
+        #7 anchor_head_dy: Float64;
+        // Absolute anchor head translation z, metres.
+        #8 anchor_head_dz: Float64;
+        // Absolute anchor head quaternion w.
+        #9 anchor_head_qw: Float64;
+        // Absolute anchor head quaternion x.
+        #10 anchor_head_qx: Float64;
+        // Absolute anchor head quaternion y.
+        #11 anchor_head_qy: Float64;
+        // Absolute anchor head quaternion z.
+        #12 anchor_head_qz: Float64;
+        // Absolute anchor body yaw, radians.
+        #13 anchor_body_yaw: Float64;
+        // Absolute right antenna angle, radians.
+        #14 anchor_antenna_right: Float64;
+        // Absolute left antenna angle, radians.
+        #15 anchor_antenna_left: Float64;
     }
 }
 

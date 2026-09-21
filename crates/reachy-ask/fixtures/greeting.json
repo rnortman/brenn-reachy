@@ -1,0 +1,14 @@
+{
+  "type": "motion-script",
+  "pod": "reachy-ask",
+  "seq": 1,
+  "steps": [
+    {"after_ms": 8000, "pose": "peek_tilt"},
+    {"after_ms": 10000, "pose": "hello"},
+    {"after_ms": 11200, "play": {"name": "hello_wave", "speed": 1.0}},
+    {"after_ms": 16000, "pose": "neutral"},
+    {"after_ms": 17200, "play": {"name": "dance", "speed": 1.0}},
+    {"after_ms": 31500, "pose": "stow"}
+  ],
+  "timeout_ms": 33500
+}

@@ -552,9 +552,15 @@ fn emit(texts: &[(String, String)], poses: &[LoadedPose]) -> anyhow::Result<Emit
     // The geometry and envelope the loader walks every clip's frames against:
     // the machine's own, so what this accepts is what the tick can command.
     let limits = ClipLimits::default();
-    let (library, skips) = Library::load(
+    let (library, skips) = Library::load_resolved(
         texts.iter().map(|(source, text)| (source.clone(), text)),
         &limits,
+        |name| {
+            poses
+                .iter()
+                .find(|pose| pose.name() == name)
+                .map(|pose| *pose.targets())
+        },
     );
     if !skips.is_empty() {
         let listed: Vec<String> = skips
@@ -744,6 +750,25 @@ fn print_library(library: &ClipLibraryConfig, clips: &Numbering, motions: &Numbe
         let _ = writeln!(out, "  frame_rate_hz: {}", number(clip.frame_rate_hz));
         let _ = writeln!(out, "  blend_in_ms: {}", clip.blend_in_ms);
         let _ = writeln!(out, "  blend_out_ms: {}", clip.blend_out_ms);
+        let _ = writeln!(out, "  has_anchor: {}", clip.has_anchor);
+        let _ = writeln!(out, "  anchor_head_dx: {}", number(clip.anchor_head_dx));
+        let _ = writeln!(out, "  anchor_head_dy: {}", number(clip.anchor_head_dy));
+        let _ = writeln!(out, "  anchor_head_dz: {}", number(clip.anchor_head_dz));
+        let _ = writeln!(out, "  anchor_head_qw: {}", number(clip.anchor_head_qw));
+        let _ = writeln!(out, "  anchor_head_qx: {}", number(clip.anchor_head_qx));
+        let _ = writeln!(out, "  anchor_head_qy: {}", number(clip.anchor_head_qy));
+        let _ = writeln!(out, "  anchor_head_qz: {}", number(clip.anchor_head_qz));
+        let _ = writeln!(out, "  anchor_body_yaw: {}", number(clip.anchor_body_yaw));
+        let _ = writeln!(
+            out,
+            "  anchor_antenna_right: {}",
+            number(clip.anchor_antenna_right)
+        );
+        let _ = writeln!(
+            out,
+            "  anchor_antenna_left: {}",
+            number(clip.anchor_antenna_left)
+        );
         for frame in clip.frames.iter() {
             print_frame(&mut out, frame);
         }
@@ -837,10 +862,12 @@ fn write(path: &Path, text: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
     use std::sync::OnceLock;
 
     use brenn_reachy__cogs__config_clk_rs::ClipFrameWire;
     use reachy_clips::config::{MAX_MOTIONS, MAX_SEGMENTS};
+    use reachy_clips::format::{Channel, ClipDoc, document_kind};
     use reachy_scratch::scratch_dir;
 
     use super::probe_clips::Pose;
@@ -894,9 +921,14 @@ mod tests {
     /// would otherwise emit an empty library, and comparing that against the
     /// committed asset fails in a way that reads as staleness and invites a
     /// regeneration that would delete the library.
-    fn texts() -> Vec<(String, String)> {
+    fn texts_ref() -> &'static [(String, String)] {
         static READ: OnceLock<Vec<(String, String)>> = OnceLock::new();
-        READ.get_or_init(|| texts_under(&documents_root())).clone()
+        READ.get_or_init(|| texts_under(&documents_root()))
+    }
+
+    /// A cloned corpus for cases that change document order or content.
+    fn texts() -> Vec<(String, String)> {
+        texts_ref().to_vec()
     }
 
     /// Every committed pose document, by path ascending, through the tool's own
@@ -940,7 +972,7 @@ mod tests {
     /// mutates what this hands back.
     fn baseline() -> &'static Emitted {
         static EMITTED: OnceLock<Emitted> = OnceLock::new();
-        EMITTED.get_or_init(|| emit(&texts(), poses()).expect("the checked-in documents emit"))
+        EMITTED.get_or_init(|| emit(texts_ref(), poses()).expect("the checked-in documents emit"))
     }
 
     /// [`texts`] over a named directory, so the guard below has something to
@@ -960,6 +992,58 @@ mod tests {
                 (source, text)
             })
             .collect()
+    }
+
+    /// The committed clip documents, keyed by the names scripts invoke.
+    fn documents_by_name() -> &'static BTreeMap<String, ClipDoc> {
+        static DOCUMENTS: OnceLock<BTreeMap<String, ClipDoc>> = OnceLock::new();
+        DOCUMENTS.get_or_init(|| {
+            let mut documents = BTreeMap::new();
+            for (source, text) in texts_ref() {
+                if document_kind(text)
+                    .unwrap_or_else(|error| panic!("{source} does not identify its kind: {error}"))
+                    != "clip"
+                {
+                    continue;
+                }
+                let document: ClipDoc = serde_json::from_str(text).expect("the document parses");
+                let name = document.name.clone();
+                if documents.insert(name.clone(), document).is_some() {
+                    panic!("duplicate clip document name {name:?} in {source}");
+                }
+            }
+            documents
+        })
+    }
+
+    /// The committed clip document named by its library name.
+    fn document(name: &str) -> ClipDoc {
+        documents_by_name()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} is not a committed document"))
+    }
+
+    /// Count nonzero sign runs around `centre`, retaining the prior sign over
+    /// samples inside the deadband.
+    fn sign_runs(values: impl IntoIterator<Item = f64>, centre: f64) -> usize {
+        let mut previous = 0;
+        let mut runs = 0;
+        for value in values {
+            let delta = value - centre;
+            let sign = if delta > 1e-12 {
+                1
+            } else if delta < -1e-12 {
+                -1
+            } else {
+                0
+            };
+            if sign != 0 && sign != previous {
+                runs += 1;
+                previous = sign;
+            }
+        }
+        runs
     }
 
     /// One document, as text, with `patch` applied to its parsed form.
@@ -985,12 +1069,390 @@ mod tests {
     /// library-config` would read, not against a list of names in this file.
     #[test]
     fn the_walk_finds_the_committed_documents_in_the_tree() {
-        let sources: Vec<String> = texts().into_iter().map(|(source, _)| source).collect();
+        let sources: Vec<&str> = texts_ref()
+            .iter()
+            .map(|(source, _)| source.as_str())
+            .collect();
         assert!(
             sources.iter().any(|source| source.ends_with("nod.json")),
             "{sources:?}"
         );
         assert!(sources.windows(2).all(|pair| pair[0] < pair[1]), "sorted");
+    }
+
+    #[test]
+    fn the_authored_wave_overlays_are_zero_centred_mirrors() {
+        let left_doc = document("wave_left");
+        let right_doc = document("wave_right");
+        for (name, doc) in [("wave_left", &left_doc), ("wave_right", &right_doc)] {
+            assert_eq!(doc.name, name);
+            assert!(doc.base.is_none());
+            assert_eq!(doc.channels, vec![Channel::Antennas]);
+            assert_eq!(doc.frame_hz, 50.0);
+            assert_eq!(doc.blend_in_ms, Some(200));
+            assert_eq!(doc.blend_out_ms, Some(200));
+            assert_eq!(doc.frames.len(), 136);
+        }
+
+        let limits = ClipLimits::default();
+        let left = Clip::from_doc(left_doc, &limits).expect("wave_left loads");
+        let right = Clip::from_doc(right_doc, &limits).expect("wave_right loads");
+        assert!(left.anchor().is_none() && right.anchor().is_none());
+        assert!(left.mask().contains(Channel::Antennas));
+        assert!(right.mask().contains(Channel::Antennas));
+        for (index, (left_frame, right_frame)) in
+            left.frames().iter().zip(right.frames()).enumerate()
+        {
+            let left_antennas = left_frame.antennas.expect("left antennas are present");
+            let right_antennas = right_frame.antennas.expect("right antennas are present");
+            assert_eq!(left_antennas[0], 0.0, "left right delta at {index}");
+            assert_eq!(right_antennas[1], 0.0, "right left delta at {index}");
+            assert!(
+                (right_antennas[0] + left_antennas[1]).abs() <= 1e-12,
+                "mirror at {index}"
+            );
+        }
+        for index in [0, 45, 90, 135] {
+            assert_eq!(
+                left.frames()[index].antennas.expect("left antennas")[1],
+                0.0
+            );
+            assert_eq!(
+                right.frames()[index].antennas.expect("right antennas")[0],
+                0.0
+            );
+        }
+        for start in [0, 45, 90] {
+            let left_sum: f64 = left.frames()[start..start + 45]
+                .iter()
+                .map(|frame| frame.antennas.expect("left antennas")[1])
+                .sum();
+            let right_sum: f64 = right.frames()[start..start + 45]
+                .iter()
+                .map(|frame| frame.antennas.expect("right antennas")[0])
+                .sum();
+            assert!(left_sum.abs() <= 1e-12, "left cycle {start}: {left_sum}");
+            assert!(right_sum.abs() <= 1e-12, "right cycle {start}: {right_sum}");
+        }
+        let left_track: Vec<f64> = left
+            .frames()
+            .iter()
+            .map(|frame| frame.antennas.expect("left antennas")[1])
+            .collect();
+        let right_track: Vec<f64> = right
+            .frames()
+            .iter()
+            .map(|frame| frame.antennas.expect("right antennas")[0])
+            .collect();
+        for (name, track) in [("wave_left", &left_track), ("wave_right", &right_track)] {
+            assert_eq!(sign_runs(track.iter().copied(), 0.0), 6, "{name} cycles");
+            let minimum = track.iter().copied().fold(f64::INFINITY, f64::min);
+            let maximum = track.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                (minimum + 0.7333333333333333).abs() <= 1e-12,
+                "{name} minimum"
+            );
+            assert!(
+                (maximum - 0.7333333333333333).abs() <= 1e-12,
+                "{name} maximum"
+            );
+        }
+    }
+
+    #[test]
+    fn the_recorded_hello_wave_is_a_resolved_greeting() {
+        let doc = document("hello_wave");
+        assert_eq!(doc.version, 1);
+        assert_eq!(doc.name, "hello_wave");
+        assert_eq!(doc.base.as_deref(), Some("neutral"));
+        assert_eq!(doc.channels, vec![Channel::Head, Channel::Antennas]);
+        assert_eq!(doc.frame_hz, 50.0);
+        assert_eq!(doc.blend_in_ms, Some(200));
+        assert_eq!(doc.blend_out_ms, Some(200));
+        assert_eq!(doc.frames.len(), 136);
+
+        let neutral = *poses()
+            .iter()
+            .find(|pose| pose.name() == "neutral")
+            .expect("neutral is committed")
+            .targets();
+        let hello = *poses()
+            .iter()
+            .find(|pose| pose.name() == "hello")
+            .expect("hello is committed")
+            .targets();
+        let clip = Clip::from_doc_resolved(doc, &ClipLimits::default(), |name| {
+            poses()
+                .iter()
+                .find(|pose| pose.name() == name)
+                .map(|pose| *pose.targets())
+        })
+        .expect("hello_wave resolves and passes the envelope screen");
+        assert_eq!(
+            clip.anchor().expect("posed clip has an anchor").name(),
+            "neutral"
+        );
+        assert_eq!(
+            clip.anchor().expect("posed clip has an anchor").targets(),
+            neutral
+        );
+
+        let expected_dt = [
+            0.0006690716310147473,
+            0.011657214299538974,
+            0.011019355907297057,
+        ];
+        let expected_dq = [
+            0.9727091900478037,
+            0.22862791097815874,
+            0.009840924041276436,
+            0.03833100745248597,
+        ];
+        let expected_right = -0.6558838173726208;
+        for (index, frame) in clip.frames().iter().enumerate() {
+            let head = frame.head.expect("head is present");
+            for (got, want) in head.translation.vector.iter().zip(expected_dt) {
+                assert_eq!(*got, want, "head translation at {index}");
+            }
+            let q = head.rotation.quaternion();
+            for (got, want) in [q.w, q.i, q.j, q.k].into_iter().zip(expected_dq) {
+                assert!((got - want).abs() <= 1e-12, "head rotation at {index}");
+            }
+            assert_eq!(
+                frame.antennas.expect("antennas are present")[0],
+                expected_right,
+                "right antenna at {index}"
+            );
+        }
+
+        let first = clip.frames()[0].head.expect("head is present");
+        let composed = neutral.head_pose_body * first;
+        assert!(
+            (composed.translation.vector - hello.head_pose_body.translation.vector).norm() < 1e-12
+        );
+        assert!(composed.rotation.angle_to(&hello.head_pose_body.rotation) < 1e-12);
+        assert_eq!(neutral.antennas[0] + expected_right, -0.8303838173726208);
+        assert!((neutral.antennas[0] + expected_right - hello.antennas[0]).abs() < 1e-12);
+
+        for index in [0, 45, 90, 135] {
+            let centre = clip.frames()[index].antennas.expect("antennas are present")[1];
+            assert!((centre - 0.2872683519680999).abs() <= 1e-12);
+        }
+        for start in [0, 45, 90] {
+            let mean: f64 = clip.frames()[start..start + 45]
+                .iter()
+                .map(|frame| frame.antennas.expect("antennas are present")[1])
+                .sum::<f64>()
+                / 45.0;
+            assert!(
+                (mean - 0.2872683519680999).abs() <= 1e-12,
+                "cycle {start}: {mean}"
+            );
+        }
+        let left: Vec<f64> = clip
+            .frames()
+            .iter()
+            .map(|frame| frame.antennas.expect("antennas are present")[1])
+            .collect();
+        assert_eq!(
+            sign_runs(left.iter().copied(), 0.2872683519680999),
+            6,
+            "hello_wave left antenna cycles"
+        );
+        assert!(left.iter().any(|value| *value < 0.2872683519680999));
+        assert!(left.iter().any(|value| *value > 0.2872683519680999));
+    }
+
+    #[test]
+    fn the_recorded_dance_is_a_resolved_clip() {
+        let doc = document("dance");
+        assert_eq!(doc.version, 1);
+        assert_eq!(doc.kind, "clip");
+        assert_eq!(doc.name, "dance");
+        assert_eq!(doc.base.as_deref(), Some("neutral"));
+        assert!(
+            doc.description
+                .as_deref()
+                .is_some_and(|description| description.contains("S018"))
+        );
+        assert_eq!(
+            doc.channels,
+            vec![Channel::Head, Channel::BodyYaw, Channel::Antennas]
+        );
+        assert_eq!(doc.frame_hz, 50.0);
+        assert_eq!(doc.blend_in_ms, Some(400));
+        assert_eq!(doc.blend_out_ms, Some(800));
+        assert_eq!(doc.frames.len(), 650);
+        assert_eq!(
+            doc.frames[0].dt,
+            Some([
+                0.006480514813959866,
+                -0.0009933644307734695,
+                0.01102205186999745
+            ])
+        );
+        assert_eq!(
+            doc.frames[0].dq,
+            Some([
+                0.9992271405262544,
+                0.008569476403373952,
+                -0.038307510142397895,
+                0.002054355516246501
+            ])
+        );
+        assert_eq!(
+            doc.frames[649].dt,
+            Some([
+                -0.01751625164223465,
+                0.00014378718547920316,
+                -0.03414675607663002
+            ])
+        );
+        assert_eq!(
+            doc.frames[649].dq,
+            Some([
+                0.9818949619914762,
+                0.013759037503941416,
+                0.18891995529276592,
+                -0.0014909711271409649
+            ])
+        );
+        assert!(doc.frames.iter().all(|frame| frame.dt.is_some()
+            && frame.dq.is_some()
+            && frame.body_yaw.is_some()
+            && frame.antennas.is_some()));
+
+        let neutral = *poses()
+            .iter()
+            .find(|pose| pose.name() == "neutral")
+            .expect("neutral is committed")
+            .targets();
+        let clip = Clip::from_doc_resolved(doc, &ClipLimits::default(), |name| {
+            poses()
+                .iter()
+                .find(|pose| pose.name() == name)
+                .map(|pose| *pose.targets())
+        })
+        .expect("dance resolves and passes the envelope screen");
+        assert_eq!(
+            clip.anchor().expect("posed clip has an anchor").name(),
+            "neutral"
+        );
+        assert_eq!(
+            clip.anchor().expect("posed clip has an anchor").targets(),
+            neutral
+        );
+        let yaws: Vec<f64> = clip
+            .frames()
+            .iter()
+            .map(|frame| frame.body_yaw.expect("body yaw"))
+            .collect();
+        assert!(
+            (yaws.iter().copied().fold(f64::INFINITY, f64::min) + 0.23999929703873568).abs()
+                <= 1e-12
+        );
+        assert!(
+            (yaws.iter().copied().fold(f64::NEG_INFINITY, f64::max) - 0.23999929703873568).abs()
+                <= 1e-12
+        );
+        assert_eq!(sign_runs(yaws.iter().copied(), 0.0), 16, "body-yaw sways");
+        let antennas: Vec<f64> = clip
+            .frames()
+            .iter()
+            .flat_map(|frame| frame.antennas.expect("antennas"))
+            .collect();
+        assert!(
+            (antennas.iter().copied().fold(f64::INFINITY, f64::min) + 0.2599992384586303).abs()
+                <= 1e-12
+        );
+        assert!(
+            (antennas.iter().copied().fold(f64::NEG_INFINITY, f64::max) - 0.2599992384586303).abs()
+                <= 1e-12
+        );
+        let right_antenna: Vec<f64> = clip
+            .frames()
+            .iter()
+            .map(|frame| frame.antennas.expect("antennas")[0])
+            .collect();
+        assert_eq!(
+            sign_runs(right_antenna.iter().copied(), 0.0),
+            16,
+            "right antenna beats"
+        );
+        assert!(clip.frames().iter().all(|frame| {
+            let antennas = frame.antennas.expect("antennas");
+            (antennas[0] + antennas[1]).abs() <= 1e-12
+        }));
+    }
+
+    #[test]
+    fn emit_bakes_a_supplied_pose_and_refuses_an_absent_one() {
+        let pose = &poses()[0];
+        let document = serde_json::to_string(&json!({
+            "version": 1,
+            "kind": "clip",
+            "name": "synthetic/posed",
+            "base": pose.name(),
+            "channels": ["antennas"],
+            "frame_hz": 50.0,
+            "frames": [{"antennas": [0.0, 0.0]}]
+        }))
+        .unwrap();
+        let emitted = emit(&[("synthetic.json".to_owned(), document)], poses())
+            .expect("supplied pose resolves");
+        assert!(emitted.textproto.contains("has_anchor: true"));
+        let expected = pose.targets();
+        for (key, value) in [
+            (
+                "anchor_head_dx",
+                expected.head_pose_body.translation.vector.x,
+            ),
+            (
+                "anchor_head_dy",
+                expected.head_pose_body.translation.vector.y,
+            ),
+            (
+                "anchor_head_dz",
+                expected.head_pose_body.translation.vector.z,
+            ),
+            (
+                "anchor_head_qw",
+                expected.head_pose_body.rotation.quaternion().w,
+            ),
+            (
+                "anchor_head_qx",
+                expected.head_pose_body.rotation.quaternion().i,
+            ),
+            (
+                "anchor_head_qy",
+                expected.head_pose_body.rotation.quaternion().j,
+            ),
+            (
+                "anchor_head_qz",
+                expected.head_pose_body.rotation.quaternion().k,
+            ),
+            ("anchor_body_yaw", expected.body_yaw),
+            ("anchor_antenna_right", expected.antennas[0]),
+            ("anchor_antenna_left", expected.antennas[1]),
+        ] {
+            assert!(
+                emitted.textproto.contains(&format!("{key}: {:?}", value)),
+                "emitted anchor lacks {key}={value:?}"
+            );
+        }
+
+        let missing = serde_json::to_string(&json!({
+            "version": 1,
+            "kind": "clip",
+            "name": "synthetic/missing",
+            "base": "not-a-pose",
+            "channels": ["antennas"],
+            "frame_hz": 50.0,
+            "frames": [{"antennas": [0.0, 0.0]}]
+        }))
+        .unwrap();
+        let error = emit(&[("missing.json".to_owned(), missing)], poses()).unwrap_err();
+        assert!(error.to_string().contains("not-a-pose"));
     }
 
     /// The whole point of the tool having a committed output: the emit is
@@ -1086,7 +1548,7 @@ mod tests {
     /// `make library-config`, which rewrites them.
     #[test]
     fn the_committed_probe_documents_are_what_the_table_authors() {
-        let texts = texts();
+        let texts = texts_ref();
         for probe in PROBES {
             let suffix = format!("{}.json", probe.name);
             let (source, text) = texts
@@ -1104,7 +1566,7 @@ mod tests {
         // And nothing under `probe/` is a hand-authored document the table has
         // never heard of: such a file would emit into the library, be playable
         // by name, and answer to nothing.
-        for (source, _) in &texts {
+        for (source, _) in texts {
             // The last `clips/` in the path and not the first: a checkout, or a
             // documents directory, that itself sits under a `clips/` would
             // otherwise leave `rest` starting somewhere above the tree and skip
@@ -1267,13 +1729,17 @@ mod tests {
     #[test]
     fn one_document_that_will_not_load_refuses_the_whole_emit() {
         let mut broken = texts();
-        broken[1].1 = doc(&broken[1].1, |value| {
+        let (_, text) = broken
+            .iter_mut()
+            .find(|(source, _)| source.ends_with("nod.json"))
+            .expect("nod is a committed document");
+        *text = doc(text, |value| {
             value["frame_hz"] = json!(30.0);
         });
         let error = emit(&broken, poses()).expect_err("a clip on another grid is refused");
         let text = format!("{error:#}");
         assert!(text.contains("numbering is refused"), "{text}");
-        assert!(text.contains("perk"), "{text}");
+        assert!(text.contains("nod"), "{text}");
     }
 
     /// Two documents claiming one name is the authoring mistake that attacks the
@@ -1283,7 +1749,11 @@ mod tests {
     #[test]
     fn two_documents_claiming_one_name_refuse_the_whole_emit() {
         let mut clashing = texts();
-        clashing[1].1 = doc(&clashing[1].1, |value| {
+        let (_, text) = clashing
+            .iter_mut()
+            .find(|(source, _)| source.ends_with("perk.json"))
+            .expect("perk is a committed document");
+        *text = doc(text, |value| {
             value["name"] = json!("bench/nod");
         });
         let error = emit(&clashing, poses()).expect_err("a duplicate name is refused");
@@ -1400,6 +1870,8 @@ mod tests {
     #[test]
     fn every_clip_is_also_a_motion_of_one_segment() {
         let emitted = baseline();
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&emitted.names_json()).expect("the sidecar is JSON");
         assert!(emitted.motions.len() >= emitted.clips.len());
         for clip in &emitted.clips.entries {
             let motion = emitted
@@ -1409,6 +1881,25 @@ mod tests {
                 .find(|motion| motion.name == clip.name)
                 .unwrap_or_else(|| panic!("{} plays as a motion", clip.name));
             assert_eq!(motion.parts, Some(1));
+            let window = match motion.extra {
+                Some(Extra::Window(window)) => window,
+                _ => panic!("{} has no motion window", clip.name),
+            };
+            let sidecar_motion = sidecar["motions"]
+                .as_array()
+                .expect("motions are an array")
+                .iter()
+                .find(|row| row["name"] == clip.name)
+                .unwrap_or_else(|| panic!("{} is absent from the sidecar", clip.name));
+            assert_eq!(sidecar_motion["duration_ms"], json!(window.duration_ms));
+            assert_eq!(sidecar_motion["blend_out_ms"], json!(window.blend_out_ms));
+            let document = document(&clip.name);
+            assert_eq!(
+                clip.parts,
+                Some(document.frames.len()),
+                "{} frame count",
+                clip.name
+            );
         }
     }
 
@@ -1616,7 +2107,7 @@ mod tests {
             std::fs::write(pose_dir.join(name), text).expect("the pose document is written");
         }
         let root = documents_root();
-        for (source, text) in texts() {
+        for (source, text) in texts_ref() {
             // Copied at the same relative depth: a document's id is its full
             // path's position in the sort, so flattening the tree here would
             // emit a different numbering than the committed one.
@@ -1697,7 +2188,13 @@ mod tests {
     #[test]
     fn the_walk_finds_the_committed_pose_documents() {
         let sources: Vec<String> = pose_texts().into_iter().map(|(source, _)| source).collect();
-        for name in ["neutral.textproto", "peek.textproto", "stow.textproto"] {
+        for name in [
+            "neutral.textproto",
+            "peek.textproto",
+            "peek_tilt.textproto",
+            "hello.textproto",
+            "stow.textproto",
+        ] {
             assert!(
                 sources.iter().any(|source| source.ends_with(name)),
                 "{name}: {sources:?}"
@@ -1718,7 +2215,10 @@ mod tests {
             .iter()
             .map(|pose| pose.name.as_str())
             .collect();
-        assert_eq!(names, vec!["neutral", "peek", "stow"]);
+        for name in ["neutral", "peek", "peek_tilt", "hello", "stow"] {
+            assert!(names.contains(&name), "{name}: {names:?}");
+        }
+        assert_eq!(names.len(), 5);
         assert_eq!(
             usize::from(
                 emitted
@@ -1890,7 +2390,23 @@ mod tests {
         for (pose_id, pose) in poses().iter().enumerate() {
             let id = u16::try_from(pose_id).expect("a pose id fits");
             let (targets, pace) = screened.targets(id).expect("the pose is in the library");
-            assert_eq!(targets, *pose.targets());
+            assert_eq!(
+                targets.head_pose_body.translation,
+                pose.targets().head_pose_body.translation
+            );
+            // The loader's UnitQuaternion normalization is the observed source
+            // of the permitted round-trip difference in quaternion components.
+            for (actual, expected) in targets
+                .head_pose_body
+                .rotation
+                .coords
+                .iter()
+                .zip(pose.targets().head_pose_body.rotation.coords.iter())
+            {
+                assert!((actual - expected).abs() <= 1e-12);
+            }
+            assert_eq!(targets.body_yaw, pose.targets().body_yaw);
+            assert_eq!(targets.antennas, pose.targets().antennas);
             assert_eq!(pace.as_millis(), u128::from(pose.duration_ms()));
         }
         assert_eq!(
@@ -1907,7 +2423,11 @@ mod tests {
     #[test]
     fn a_pose_document_that_is_not_named_for_its_file_is_refused() {
         let mut renamed = pose_texts();
-        renamed[0].0 = renamed[0].0.replace("neutral", "resting");
+        let neutral = renamed
+            .iter()
+            .position(|(source, _)| source.ends_with("neutral.textproto"))
+            .expect("the neutral document is present");
+        renamed[neutral].0 = renamed[neutral].0.replace("neutral", "resting");
         let error = load_poses(&renamed).expect_err("the stem and the name disagree");
         assert!(format!("{error:#}").contains("file stem"), "{error:#}");
     }
@@ -1920,7 +2440,7 @@ mod tests {
         let mut without = pose_texts();
         without.retain(|(source, _)| !source.ends_with("stow.textproto"));
         let loaded = load_poses(&without).expect("the rest still load");
-        let error = emit(&texts(), &loaded).expect_err("a library needs a stow");
+        let error = emit(texts_ref(), &loaded).expect_err("a library needs a stow");
         assert!(
             format!("{error:#}").contains("no pose named stow"),
             "{error:#}"
@@ -1940,7 +2460,7 @@ mod tests {
             .iter()
             .map(|(_, text)| LoadedPose::from_text(text).expect("the document loads"))
             .collect();
-        let error = emit(&texts(), &loaded).expect_err("two poses under one name");
+        let error = emit(texts_ref(), &loaded).expect_err("two poses under one name");
         assert!(
             format!("{error:#}").contains("two poses named"),
             "{error:#}"

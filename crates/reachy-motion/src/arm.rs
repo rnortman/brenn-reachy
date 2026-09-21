@@ -1915,10 +1915,7 @@ mod tests {
             record.min_margin,
             min_pose_margin(&geom, &record.head_pose_body)
         );
-        // Still far below the clearance floor: the pin buys windows, not
-        // clearance, and the margin baseline is what carries the first lift.
-        assert!(record.min_margin > 0.0);
-        assert!(record.min_margin < EnvelopeConfig::default().min_toggle_margin);
+        assert!(record.min_margin > EnvelopeConfig::default().min_toggle_margin);
 
         // The round trip: the pose the pins hold solves back to angles inside
         // every window the command path checks. Against the servo-side fence the

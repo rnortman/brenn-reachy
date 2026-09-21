@@ -224,6 +224,11 @@ impl std::fmt::Display for Base {
 /// The name is the join key between this wire and the library, and nothing here
 /// can check it — a publisher may have no library at all. Resolution, and the
 /// motion's own speed ceiling, are checked by the daemon at acceptance.
+// TODO(play-mirrored): Add a mirrored play invocation whose spatial map is head
+// translation y -> -y, quaternion (w, x, y, z) -> (w, -x, y, -z), body yaw
+// sign reversal, and antenna side-swap plus sign reversal, with both original
+// and mirrored forms screened at load. This changes the shared wire contract
+// and brenn-pod's cue vocabulary, so both repositories need one design cycle.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Play {
     /// The motion's name in the daemon's library.

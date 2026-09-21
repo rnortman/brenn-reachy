@@ -52,9 +52,7 @@ use core::time::Duration;
 use motion_slots::{configured, counters};
 use mover_overlay::{Anchor, Ask, Screen};
 use nalgebra::Isometry3;
-use reachy_kin::{
-    EnvelopeViolations, FkOptions, FkStats, LegAngles, default_geometry, forward_kinematics,
-};
+use reachy_kin::{FkOptions, FkStats, LegAngles, default_geometry, forward_kinematics};
 use reachy_motion::arm::{ArmRecord, Gains, GroupGains, rest_pose_seeds};
 use reachy_motion::fault::{self, FaultKind};
 use reachy_motion::joints::{JointRef, JointVector, flags, rows_of, vector_of, write_vector};
@@ -616,6 +614,7 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
         msg.joint = raise.joint;
         msg.detail = raise.detail;
         msg.count = raise.count;
+        msg.envelope_checks = raise.envelope_checks;
         out.mark_for_publish();
     }
 
@@ -960,6 +959,8 @@ struct Raise {
     detail: f64,
     /// The count that carried it.
     count: u32,
+    /// The exact envelope checks that failed, or zero for other raises.
+    envelope_checks: u32,
 }
 
 /// What an execution has to report, and how much of it fits.
@@ -1032,20 +1033,25 @@ impl Raise {
             joint: fault::joint(raised),
             detail: fault::detail(raised),
             count: fault::count(raised),
+            envelope_checks: 0,
         }
     }
 
     /// A move the tick abandoned.
     fn of_abort(abort: &MoveAbort, nominal: i64) -> Self {
-        let (kind, joint, detail, count) = match abort {
-            MoveAbort::EnvelopePath(violations) => (
-                FaultKind::MoveAbortedEnvelope,
-                JointRef::None,
-                0.0,
-                failed_checks(violations),
-            ),
+        let (kind, joint, detail, count, envelope_checks) = match abort {
+            MoveAbort::EnvelopePath(violations) => {
+                let bits = violations.bits();
+                (
+                    FaultKind::MoveAbortedEnvelope,
+                    JointRef::None,
+                    0.0,
+                    bits.count_ones(),
+                    u32::from(bits),
+                )
+            }
             MoveAbort::StepTooLarge { joint, delta } => {
-                (FaultKind::MoveAbortedStep, *joint, *delta, 0)
+                (FaultKind::MoveAbortedStep, *joint, *delta, 0, 0)
             }
         };
         Self {
@@ -1054,6 +1060,7 @@ impl Raise {
             joint,
             detail,
             count,
+            envelope_checks,
         }
     }
 
@@ -1071,19 +1078,21 @@ impl Raise {
             joint: JointRef::None,
             detail: 0.0,
             count: 0,
+            envelope_checks: 0,
         }
     }
 
     /// A command the tick refused, which changed nothing.
     fn of_rejection(rejection: &CommandRejection, nominal: i64) -> Self {
-        let (joint, detail, count) = match rejection {
+        let (joint, detail, count, envelope_checks) = match rejection {
             CommandRejection::Envelope(violations) => {
-                (JointRef::None, 0.0, failed_checks(violations))
+                let bits = violations.bits();
+                (JointRef::None, 0.0, bits.count_ones(), u32::from(bits))
             }
             // No magnitude this message has a field for, and the count of
             // nothing is nothing.
-            CommandRejection::Trajectory(_) => (JointRef::None, 0.0, 0),
-            CommandRejection::AntennaUnreachable { joint, angle } => (*joint, *angle, 0),
+            CommandRejection::Trajectory(_) => (JointRef::None, 0.0, 0, 0),
+            CommandRejection::AntennaUnreachable { joint, angle } => (*joint, *angle, 0, 0),
         };
         Self {
             time_ns: nominal,
@@ -1091,27 +1100,9 @@ impl Raise {
             joint,
             detail,
             count,
+            envelope_checks,
         }
     }
-}
-
-/// How many envelope checks a pose failed.
-///
-/// The evidence an envelope refusal has is a set of failing checks rather than
-/// a magnitude, so what this message can carry of it is how many -- one is a
-/// pose just outside one bound, and six is a pose nowhere near the machine.
-fn failed_checks(violations: &EnvelopeViolations) -> u32 {
-    let flags = violations
-        .unreachable
-        .iter()
-        .chain(violations.window.iter())
-        .chain([
-            &violations.margin,
-            &violations.body_yaw,
-            &violations.relative_yaw,
-            &violations.cone,
-        ]);
-    u32::try_from(flags.filter(|failed| **failed).count()).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -1124,7 +1115,7 @@ mod tests {
     //! arriving on one tick are not all reachable from a schedule. They are all
     //! reachable here, where the mapping is a function over the tick's report.
 
-    use super::{Raise, Reports, failed_checks};
+    use super::{Raise, Reports};
     use brenn_reachy__motion__joints_clk_rs::JointFlags;
     use reachy_kin::EnvelopeViolations;
     use reachy_motion::fault::FaultKind;
@@ -1157,7 +1148,8 @@ mod tests {
         assert_eq!(refused.time_ns, AT);
         assert_eq!(refused.joint, JointRef::None, "the pose, not a servo");
         assert_eq!(refused.detail, 0.0, "an envelope refusal has no magnitude");
-        assert_eq!(refused.count, 2, "how many checks the pose failed");
+        assert_eq!(refused.count, refused.envelope_checks.count_ones());
+        assert_eq!(refused.envelope_checks, u32::from(two_violations().bits()));
 
         let refused = Raise::of_rejection(
             &CommandRejection::Trajectory(TrajectoryError::NonPositiveDuration),
@@ -1167,6 +1159,7 @@ mod tests {
         assert_eq!(refused.joint, JointRef::None);
         assert_eq!(refused.detail, 0.0);
         assert_eq!(refused.count, 0, "a path refused has nothing to count");
+        assert_eq!(refused.envelope_checks, 0);
 
         let refused = Raise::of_rejection(
             &CommandRejection::AntennaUnreachable {
@@ -1182,6 +1175,7 @@ mod tests {
         );
         assert_eq!(refused.detail, 1600.5, "the arc it was asked for");
         assert_eq!(refused.count, 0);
+        assert_eq!(refused.envelope_checks, 0);
     }
 
     #[test]
@@ -1191,7 +1185,11 @@ mod tests {
         assert_eq!(abandoned.time_ns, AT);
         assert_eq!(abandoned.joint, JointRef::None, "the path, not a servo");
         assert_eq!(abandoned.detail, 0.0);
-        assert_eq!(abandoned.count, 2);
+        assert_eq!(abandoned.count, abandoned.envelope_checks.count_ones());
+        assert_eq!(
+            abandoned.envelope_checks,
+            u32::from(two_violations().bits())
+        );
 
         let abandoned = Raise::of_abort(
             &MoveAbort::StepTooLarge {
@@ -1204,22 +1202,7 @@ mod tests {
         assert_eq!(abandoned.joint, JointRef::BodyYaw);
         assert_eq!(abandoned.detail, 0.9);
         assert_eq!(abandoned.count, 0);
-    }
-
-    #[test]
-    fn how_many_checks_a_pose_failed_counts_every_bound() {
-        assert_eq!(failed_checks(&EnvelopeViolations::default()), 0);
-        let mut all = EnvelopeViolations {
-            unreachable: [true; 6],
-            window: [true; 6],
-            margin: true,
-            body_yaw: true,
-            relative_yaw: true,
-            cone: true,
-        };
-        assert_eq!(failed_checks(&all), 16, "six, six, and the four singles");
-        all.unreachable = [false; 6];
-        assert_eq!(failed_checks(&all), 10);
+        assert_eq!(abandoned.envelope_checks, 0);
     }
 
     /// One tick can say more than one thing, and an execution has one slot for

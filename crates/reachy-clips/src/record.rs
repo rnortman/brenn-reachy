@@ -141,6 +141,7 @@ pub fn clip_doc(draft: &Draft, frames: &[RecordedFrame]) -> Result<ClipDoc, Reco
         .map(|(index, frame)| delta(index, frame, draft.mask, &draft.over))
         .collect::<Result<Vec<FrameDoc>, RecordError>>()?;
     Ok(ClipDoc {
+        base: None,
         version: FORMAT_VERSION,
         kind: CLIP_KIND.to_owned(),
         name: draft.name.to_owned(),

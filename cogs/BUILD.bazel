@@ -241,8 +241,10 @@ rust_library(
         # intent edge, and this crate reads it the same way rather than walking
         # the JSON a second time.
         "//crates/reachy-edge:reachy_edge",
+        "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
         "//crates/reachy-poses:reachy_poses",
+        "@brenn_reachy_crates//:nalgebra",
     ],
 )
 
@@ -542,7 +544,10 @@ merge_simplelaunch_config(
 # indices and the list a tour is judged against is a list of names.
 rust_binary(
     name = "library_tour_report",
-    srcs = ["library_tour_report.rs"],
+    srcs = [
+        "library_tour_report.rs",
+        "motion_run_report.rs",
+    ],
     # This tree's own copies of the three configuration files, for the reason
     # `first_motion_report`'s `data` gives.
     data = [
@@ -579,6 +584,7 @@ rust_test(
     crate = ":library_tour_report",
     deps = [
         "//crates/motion-proto:motion_proto",
+        "//crates/reachy-kin:reachy_kin",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
@@ -679,6 +685,8 @@ rust_test(
     size = "small",
     srcs = ["motion_cog_test.rs"],
     data = [
+        "clips/dance.json",
+        "clips/hello_wave.json",
         "servo_profile.textproto",
         "session_params.textproto",
     ],
@@ -960,6 +968,7 @@ rust_library(
         ":log_read",
         ":run_report",
         "//crates/dxl-proto:dxl_proto",
+        "//crates/reachy-kin:reachy_kin",
         "//crates/reachy-motion:reachy_motion",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
@@ -1011,6 +1020,7 @@ rust_binary(
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
+        ":committed_poses",
         # The fetched audio store, cut the way the speech run report cuts it.
         ":run_audio",
         ":run_report",
@@ -1896,6 +1906,47 @@ rust_clk_module(
 clk_schema_module(
     name = "script",
     imports = SCRIPT_MODULES,
+)
+
+# What one supplied script did, judged against its retained compilation names.
+rust_binary(
+    name = "script_run_report",
+    srcs = [
+        "motion_run_report.rs",
+        "script_run_report.rs",
+    ],
+    data = [
+        "mover_params.textproto",
+        "servo_gains.textproto",
+        "servo_profile.textproto",
+    ],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":log_read",
+        ":motion_channels",
+        ":pose_reading",
+        ":run_report",
+        ":schedule_clk_rs",
+        ":script_clk_rs",
+        ":stillness_report",
+        "//crates/motion-proto:motion_proto",
+        "//crates/reachy-driver:reachy_driver",
+        "//crates/reachy-edge:reachy_edge",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:health_clk_rs",
+        "//driver:pose_clk_rs",
+        "//motion:faults_clk_rs",
+        "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+rust_test(
+    name = "script_run_report_test",
+    size = "small",
+    crate = ":script_run_report",
+    deps = ["//crates/reachy-kin:reachy_kin"],
 )
 
 # The seam's port numbers, as the compositions type them and as the driver names

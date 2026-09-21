@@ -1,10 +1,10 @@
-//! The player: one overlay's clock, its ramps, and the delta it contributes
+//! The player: one clip clock, its ramps, and the delta plus provenance it contributes
 //! this tick.
 //!
 //! A [`ClipPlayer`] plays one configured motion: its segments, the speed it was
 //! invoked at, and where on the motion's clock it currently is. Each tick the
 //! caller advances it by the elapsed period and gets back the deltas to hand
-//! the compositor, or the terminal marker that says this overlay is finished
+//! the compositor, or the terminal marker that says this clip is finished
 //! and can be dropped.
 //!
 //! Three rules do most of the work:
@@ -25,6 +25,11 @@
 //!   that is fading holds the last delta it was given, so it returns to the
 //!   base gradually instead of vanishing.
 //!
+//! Posed antenna channels choose their whole-turn representative when their
+//! weight first rises, against the last commanded antenna setpoint. That turn
+//! is held across segment seams and base motion, then discarded when the weight
+//! reaches zero; unposed antenna deltas remain relative to the standing base.
+//!
 //! Sans-I/O like the rest of the crate: the elapsed period arrives as a
 //! parameter and nothing here reads a clock.
 //!
@@ -44,11 +49,13 @@ use std::time::Duration;
 
 use brenn_reachy__clips__player_clk_rs::{ClipDelta, ClipPlayerSnap, ClipRamps, ClipWeights};
 use reachy_motion::FLOOR_TICK_HZ;
+use reachy_motion::joints::{JointRef, Name};
 use reachy_motion::record::{clear_pose, read_pose, write_pose};
 use reachy_motion::snap::PoseSnapshotError;
+use reachy_motion::tick::{ANTENNA_TURNS_MAX, resolve_antenna};
 use thiserror::Error;
 
-use crate::compose::{ChannelWeights, OverlaySample, interpolate_pose, lerp};
+use crate::compose::{ChannelWeights, OverlayAnchors, OverlaySample, interpolate_pose, lerp};
 use crate::config::{ClipView, MotionView, SegmentView, motion_fingerprint};
 use crate::format::{Channel, ChannelMask, DeltaFrame, PerChannel};
 
@@ -89,6 +96,7 @@ enum Position<'c> {
     Playing {
         /// Which segment.
         segment: SegmentView<'c>,
+        index: usize,
         /// Elapsed within the clip, clip-native seconds.
         local_s: f64,
     },
@@ -96,6 +104,7 @@ enum Position<'c> {
     Holding {
         /// Which segment's hold.
         segment: SegmentView<'c>,
+        index: usize,
     },
     /// Past the final hold: the motion is over and its channels are fading.
     Ended,
@@ -111,7 +120,7 @@ impl Position<'_> {
     fn live_mask(self) -> ChannelMask {
         match self {
             Self::Lead | Self::Ended => ChannelMask::empty(),
-            Self::Playing { segment, .. } | Self::Holding { segment } => segment.clip.mask(),
+            Self::Playing { segment, .. } | Self::Holding { segment, .. } => segment.clip.mask(),
         }
     }
 
@@ -221,6 +230,15 @@ pub enum PlayerStateError {
         /// What the motion drives.
         motion: ChannelMask,
     },
+    /// A whole-turn lift exists where no posed antenna channel can own it.
+    #[error("{antenna} has stray posed turn {turns}", antenna = Name(*.antenna))]
+    StrayTurn { antenna: JointRef, turns: i32 },
+    /// A whole-turn lift cannot fit in the antenna goal interval.
+    #[error(
+        "{antenna} has antenna turn {turns}, outside +/-{ANTENNA_TURNS_MAX}",
+        antenna = Name(*.antenna)
+    )]
+    BadTurn { antenna: JointRef, turns: i32 },
 }
 
 /// One playing overlay.
@@ -298,6 +316,8 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
         write_ramps(&mut state.ramps, &PerChannel::new([0; Channel::COUNT]));
         state.started = false.into();
         state.finished = false.into();
+        state.antenna_turns_right = 0;
+        state.antenna_turns_left = 0;
         Self { motion, state }
     }
 
@@ -378,6 +398,7 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
         if !frozen.is_finite() {
             return Err(PlayerStateError::NonFiniteDelta);
         }
+        validate_antenna_turns(motion, state, weights.get(Channel::Antennas))?;
         let started = bool::from(state.started);
         if bool::from(state.finished) {
             // A finish is one tick's conclusion: the motion over, and nothing
@@ -455,8 +476,14 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
     /// ramps by one period, not by the lateness. The first call takes no
     /// elapsed time at all — it reports the overlay at its start offset, with
     /// every weight still at zero — so the first frame it plays is commanded
-    /// rather than skipped past.
-    pub fn advance(&mut self, elapsed: Duration) -> Option<OverlaySample> {
+    /// rather than skipped past. `commanded_antennas` is the last commanded
+    /// setpoint; a posed antenna channel uses it only on its zero-to-positive
+    /// edge and holds the resulting whole turns until fade-out.
+    pub fn advance(
+        &mut self,
+        elapsed: Duration,
+        commanded_antennas: [f64; 2],
+    ) -> Option<OverlaySample> {
         if self.is_finished() {
             return None;
         }
@@ -477,7 +504,13 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
         let mut frozen = self.frozen();
         let mut weights = self.weights();
         self.sample_live(position, &mut frozen);
-        self.ramp(dt_s, position, &mut weights);
+        let edges = self.ramp(dt_s, position, &mut weights);
+        if edges.antenna_rising {
+            self.choose_antenna_turns(position, frozen.antennas, commanded_antennas);
+        } else if edges.antenna_falling {
+            self.state.antenna_turns_right = 0;
+            self.state.antenna_turns_left = 0;
+        }
         write_frozen(&mut self.state.frozen, &frozen);
         write_weights(&mut self.state.weights, weights);
 
@@ -504,7 +537,58 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
                 Channel::Antennas => frame.antennas = frozen.antennas,
             }
         }
-        Some(OverlaySample { frame, weights })
+        let active_mask = live.union(weights.mask());
+        let anchors = self.driver_anchors(position, active_mask);
+        let sample = OverlaySample {
+            frame,
+            weights,
+            anchors,
+        };
+        Some(sample)
+    }
+
+    /// Find the latest segment that supplied each active channel's provenance.
+    /// The library guarantees one provenance kind per channel, so an active
+    /// channel's anchor remains valid across masked segments and fades. Posed
+    /// antenna anchors are returned already lifted by the turn chosen at
+    /// activation, including across a segment seam.
+    fn driver_anchors(&self, position: Position<'c>, active_mask: ChannelMask) -> OverlayAnchors {
+        let mut anchors = self.driving_anchors(position, active_mask);
+        if let Some([right, left]) = anchors.antennas {
+            anchors.antennas = Some([
+                right + core::f64::consts::TAU * f64::from(self.state.antenna_turns_right),
+                left + core::f64::consts::TAU * f64::from(self.state.antenna_turns_left),
+            ]);
+        }
+        anchors
+    }
+
+    /// Find the latest unlifted provenance for each active channel.
+    fn driving_anchors(&self, position: Position<'c>, active_mask: ChannelMask) -> OverlayAnchors {
+        let mut anchors = OverlayAnchors::silent();
+        let mut resolved = ChannelMask::empty();
+        let mut index = match position {
+            Position::Playing { index, .. } | Position::Holding { index, .. } => index,
+            Position::Ended => self.motion.segments().saturating_sub(1),
+            Position::Lead => return anchors,
+        };
+        loop {
+            let segment = self.motion.segment(index);
+            for channel in active_mask.iter() {
+                if !resolved.contains(channel) && segment.clip.mask().contains(channel) {
+                    match channel {
+                        Channel::Head => anchors.set_head(segment.clip.anchor_head()),
+                        Channel::BodyYaw => anchors.set_body_yaw(segment.clip.anchor_body_yaw()),
+                        Channel::Antennas => anchors.set_antennas(segment.clip.anchor_antennas()),
+                    }
+                    resolved.insert(channel);
+                }
+            }
+            if resolved == active_mask || index == 0 {
+                return anchors;
+            }
+            index -= 1;
+        }
     }
 
     /// Where the clock sits on the motion.
@@ -527,6 +611,7 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
             if local_s + CLOCK_EPS_S < segment.play_span_s() {
                 return Position::Playing {
                     segment,
+                    index,
                     // The clip's own time: the motion clock runs in the
                     // motion's, and the flattening's speed is what stands
                     // between the two.
@@ -534,7 +619,7 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
                 };
             }
             if local_s + CLOCK_EPS_S < segment.span_s() {
-                return Position::Holding { segment };
+                return Position::Holding { segment, index };
             }
             start_s += segment.span_s();
         }
@@ -555,11 +640,13 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
     /// channel fades out of the last delta it was given.
     fn sample_live(&mut self, position: Position<'c>, frozen: &mut DeltaFrame) {
         let (sampled, blend_out_ms) = match position {
-            Position::Playing { segment, local_s } => {
+            Position::Playing {
+                segment, local_s, ..
+            } => {
                 let clip = segment.clip;
                 (sample_clip(&clip, local_s), clip.blend_out_ms())
             }
-            Position::Holding { segment } => {
+            Position::Holding { segment, .. } => {
                 let clip = segment.clip;
                 (clip.frame(clip.frames() - 1), clip.blend_out_ms())
             }
@@ -583,8 +670,14 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
     /// the clip that is bringing it in; a channel falling uses the ramp recorded
     /// when it was last driven, which is the clip whose delta it is fading out
     /// of.
-    fn ramp(&mut self, dt_s: f64, position: Position<'c>, weights: &mut ChannelWeights) {
+    fn ramp(
+        &mut self,
+        dt_s: f64,
+        position: Position<'c>,
+        weights: &mut ChannelWeights,
+    ) -> RampEdges {
         let live = position.live_mask();
+        let mut edges = RampEdges::default();
         for channel in Channel::ALL {
             let current = weights.get(channel);
             let target = if live.contains(channel) { 1.0 } else { 0.0 };
@@ -619,8 +712,46 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
             } else {
                 next
             };
+            if channel == Channel::Antennas {
+                edges.antenna_rising = current == 0.0 && next > 0.0;
+                edges.antenna_falling = current > 0.0 && next == 0.0;
+            }
             weights.set(channel, next);
         }
+        edges
+    }
+
+    /// Choose the representatives for a posed antenna channel's activation.
+    fn choose_antenna_turns(
+        &mut self,
+        position: Position<'c>,
+        sampled: Option<[f64; 2]>,
+        commanded: [f64; 2],
+    ) {
+        let Some([right_delta, left_delta]) = sampled else {
+            self.state.antenna_turns_right = 0;
+            self.state.antenna_turns_left = 0;
+            return;
+        };
+        let Some([right_anchor, left_anchor]) = self
+            .driving_anchors(position, ChannelMask::of(Channel::Antennas))
+            .antennas
+        else {
+            self.state.antenna_turns_right = 0;
+            self.state.antenna_turns_left = 0;
+            return;
+        };
+        let turns = [
+            (commanded[0], right_anchor + right_delta),
+            (commanded[1], left_anchor + left_delta),
+        ]
+        .map(|(last, target)| {
+            resolve_antenna(last, target)
+                .map(|resolved| ((resolved - target) / core::f64::consts::TAU).round() as i32)
+                .unwrap_or(0)
+        });
+        self.state.antenna_turns_right = turns[0];
+        self.state.antenna_turns_left = turns[1];
     }
 
     /// The entry ramp a channel rising right now runs on, milliseconds.
@@ -630,12 +761,50 @@ impl<'a, 'c> ClipPlayer<'a, 'c> {
     /// motion is over, neither of which drives anything anyway.
     fn entering_ramp_ms(&self, position: Position<'c>) -> u32 {
         let segment = match position {
-            Position::Playing { segment, .. } | Position::Holding { segment } => segment,
+            Position::Playing { segment, .. } | Position::Holding { segment, .. } => segment,
             Position::Lead => self.motion.segment(0),
             Position::Ended => self.motion.segment(self.motion.segments() - 1),
         };
         segment.clip.blend_in_ms()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RampEdges {
+    antenna_rising: bool,
+    antenna_falling: bool,
+}
+
+/// Check that stored turns belong to a live posed antenna channel and fit the
+/// extended-position interval.
+#[allow(clippy::manual_range_contains)]
+fn validate_antenna_turns(
+    motion: &MotionView<'_>,
+    state: &ClipPlayerSnap,
+    antenna_weight: f64,
+) -> Result<(), PlayerStateError> {
+    let provenance = antenna_provenance(motion);
+    for (antenna, turns) in [
+        (JointRef::AntennaRight, state.antenna_turns_right),
+        (JointRef::AntennaLeft, state.antenna_turns_left),
+    ] {
+        if turns != 0 && (antenna_weight <= 0.0 || provenance != Some(true)) {
+            return Err(PlayerStateError::StrayTurn { antenna, turns });
+        }
+        if turns < -ANTENNA_TURNS_MAX || turns > ANTENNA_TURNS_MAX {
+            return Err(PlayerStateError::BadTurn { antenna, turns });
+        }
+    }
+    Ok(())
+}
+
+/// The one antenna provenance kind carried by a motion, if it drives antennas.
+fn antenna_provenance(motion: &MotionView<'_>) -> Option<bool> {
+    // All antenna-driving segments share a single provenance (validated at construction).
+    (0..motion.segments())
+        .map(|index| motion.segment(index).clip)
+        .find(|clip| clip.mask().contains(Channel::Antennas))
+        .map(|clip| clip.anchor_antennas().is_some())
 }
 
 /// Which of the three recorded fade-out ramps no clip of `motion`'s drives that
@@ -900,6 +1069,7 @@ mod tests {
             version: 1,
             kind: "clip".to_owned(),
             name: name.to_owned(),
+            base: None,
             description: None,
             channels: vec![Channel::Antennas],
             frame_hz: FLOOR_TICK_HZ,
@@ -916,12 +1086,45 @@ mod tests {
         Clip::from_doc(doc, &limits()).expect("clip is valid")
     }
 
+    /// An antenna clip with a declared absolute base direction.
+    fn posed_antenna_clip(
+        name: &str,
+        values: &[f64],
+        anchor_antennas: [f64; 2],
+        blend_ms: u32,
+    ) -> Clip {
+        let doc = ClipDoc {
+            version: 1,
+            kind: "clip".to_owned(),
+            name: name.to_owned(),
+            base: Some("neutral".to_owned()),
+            description: None,
+            channels: vec![Channel::Antennas],
+            frame_hz: FLOOR_TICK_HZ,
+            blend_in_ms: Some(blend_ms),
+            blend_out_ms: Some(blend_ms),
+            frames: values
+                .iter()
+                .map(|value| FrameDoc {
+                    antennas: Some([*value, -*value]),
+                    ..FrameDoc::default()
+                })
+                .collect(),
+        };
+        let anchor = JointTargets {
+            antennas: anchor_antennas,
+            ..JointTargets::default()
+        };
+        Clip::from_doc_resolved(doc, &limits(), |_| Some(anchor)).expect("posed clip is valid")
+    }
+
     /// A head-only clip whose translation walks `values` along z.
     fn head_clip(name: &str, values: &[f64], blend_ms: u32) -> Clip {
         let doc = ClipDoc {
             version: 1,
             kind: "clip".to_owned(),
             name: name.to_owned(),
+            base: None,
             description: None,
             channels: vec![Channel::Head],
             frame_hz: FLOOR_TICK_HZ,
@@ -939,6 +1142,39 @@ mod tests {
         Clip::from_doc(doc, &limits()).expect("clip is valid")
     }
 
+    fn posed_head_clip(name: &str, values: &[f64], blend_ms: u32) -> Clip {
+        let doc = {
+            let mut doc = ClipDoc {
+                version: 1,
+                kind: "clip".to_owned(),
+                name: name.to_owned(),
+                base: None,
+                description: None,
+                channels: vec![Channel::Head],
+                frame_hz: FLOOR_TICK_HZ,
+                blend_in_ms: Some(blend_ms),
+                blend_out_ms: Some(blend_ms),
+                frames: values
+                    .iter()
+                    .map(|value| FrameDoc {
+                        dt: Some([0.0, 0.0, *value]),
+                        dq: Some([1.0, 0.0, 0.0, 0.0]),
+                        ..FrameDoc::default()
+                    })
+                    .collect(),
+            };
+            doc.base = Some("neutral".to_owned());
+            doc
+        };
+        let anchor = JointTargets {
+            head_pose_body: reachy_kin::neutral_head_pose()
+                * Isometry3::translation(0.0013, -0.0011, 0.002),
+            body_yaw: 0.17,
+            antennas: [0.21, -0.31],
+        };
+        Clip::from_doc_resolved(doc, &limits(), |_| Some(anchor)).expect("posed clip is valid")
+    }
+
     /// A head-only clip whose frames carry `rotations` and no translation.
     fn head_rotation_clip(name: &str, rotations: &[UnitQuaternion<f64>]) -> Clip {
         let doc = ClipDoc {
@@ -947,6 +1183,7 @@ mod tests {
             name: name.to_owned(),
             description: None,
             channels: vec![Channel::Head],
+            base: None,
             frame_hz: FLOOR_TICK_HZ,
             blend_in_ms: Some(0),
             blend_out_ms: Some(0),
@@ -1020,6 +1257,7 @@ mod tests {
             name: "busy".to_owned(),
             description: None,
             channels: vec![Channel::Head, Channel::BodyYaw, Channel::Antennas],
+            base: None,
             frame_hz: FLOOR_TICK_HZ,
             blend_in_ms: Some(100),
             blend_out_ms: Some(100),
@@ -1043,7 +1281,7 @@ mod tests {
     fn run(player: &mut ClipPlayer<'_, '_>, limit: usize) -> Vec<OverlaySample> {
         let mut samples = Vec::new();
         for _ in 0..limit {
-            match player.advance(TICK) {
+            match player.advance(TICK, [0.0, 0.0]) {
                 Some(sample) => samples.push(sample),
                 None => return samples,
             }
@@ -1066,11 +1304,11 @@ mod tests {
         let _ = held.join(track.view(), speed, join);
         let _ = crossed.join(track.view(), speed, join);
         for tick in 0..500 {
-            let expected = ClipPlayer::over(track.view(), held.state()).advance(TICK);
+            let expected = ClipPlayer::over(track.view(), held.state()).advance(TICK, [0.0, 0.0]);
             let got = crossed
                 .resume(track.view())
                 .unwrap_or_else(|error| panic!("tick {tick}: a live player's own state: {error}"))
-                .advance(TICK);
+                .advance(TICK, [0.0, 0.0]);
             assert_eq!(got, expected, "tick {tick}");
             assert_eq!(
                 crossed.bytes(),
@@ -1142,6 +1380,75 @@ mod tests {
         assert_eq!(right, step);
     }
 
+    #[test]
+    fn posed_antenna_turn_is_chosen_held_across_a_seam_cleared_and_rechosen() {
+        let first = posed_antenna_clip("first", &[-0.8304; 20], [-0.1745, 0.0], 100);
+        let second = posed_antenna_clip("second", &[-0.8304; 20], [0.37, 0.0], 100);
+        let track = Track::composed(&[&first, &second], 0, &[(0, 1.0, 0), (1, 1.0, 0)]);
+        let first_segment_calls =
+            (track.view().segment(0).play_span_s() / TICK.as_secs_f64()).round() as usize;
+        let mut row = Row::new();
+        let mut player = row.play(track.view(), 1.0);
+        let mut validated_second = 0;
+        for call in 0..25 {
+            let sample = player
+                .advance(TICK, [5.4528, 0.0])
+                .expect("the motion is still live");
+            if sample.weights.get(Channel::Antennas) > 0.0 {
+                let [right, _] = sample.anchors.antennas.expect("posed anchor");
+                let expected = if call < first_segment_calls {
+                    -0.1745 + core::f64::consts::TAU
+                } else {
+                    validated_second += 1;
+                    0.37 + core::f64::consts::TAU
+                };
+                assert!((right - expected).abs() < 1e-12, "call {call}");
+            }
+        }
+        let _ = player;
+        assert_eq!(row.held().antenna_turns_right, 1);
+        assert!(
+            validated_second > 0,
+            "the player crossed into the second posed segment"
+        );
+        let mut player = row.resume(track.view()).expect("the turn is resumable");
+        while player.advance(TICK, [5.4528, 0.0]).is_some() {}
+        let _ = player;
+        assert_eq!(row.held().antenna_turns_right, 0);
+
+        let mut player = row.join(track.view(), 1.0, Duration::ZERO);
+        player.advance(TICK, [0.0, 0.0]);
+        player.advance(TICK, [0.0, 0.0]);
+        let _ = player;
+        assert_eq!(row.held().antenna_turns_right, 0);
+    }
+
+    #[test]
+    fn an_unresolvable_reference_keeps_the_antenna_turn_and_anchor_unlifted() {
+        // The invalid reference is deliberately unreachable to pin the total fallback;
+        // the command path never produces this state.
+        let clip = posed_antenna_clip("fallback", &[0.0; 10], [0.0, 0.0], 100);
+        let track = Track::of(&clip);
+        let mut row = Row::new();
+        let mut player = row.play(track.view(), 1.0);
+        player
+            .advance(TICK, [10_000.0, 10_000.0])
+            .expect("activation edge");
+        let sample = player
+            .advance(TICK, [10_000.0, 10_000.0])
+            .expect("the clip is still live");
+        assert_eq!(row.held().antenna_turns_right, 0);
+        assert_eq!(row.held().antenna_turns_left, 0);
+        let [right, left] = sample.anchors.antennas.expect("posed anchor");
+        assert_eq!([right, left], [0.0, 0.0]);
+        assert!(
+            resolve_antenna(0.0, 0.0).is_some(),
+            "the authored target is representable"
+        );
+        let composed = 10_000.0 * (1.0 - sample.weights.get(Channel::Antennas));
+        assert!(composed > reachy_motion::tick::ANTENNA_GOAL_MAX_RAD);
+    }
+
     /// The other half of that stimulus, and the half the frame track alone does
     /// not carry: the entry blend is a *weight* ramp over the whole delta a
     /// frame holds, so a clip that steps under an entry blend reaches the tick
@@ -1171,7 +1478,7 @@ mod tests {
             };
             (0..4)
                 .map(|_| {
-                    let sample = player.advance(TICK).expect("still playing");
+                    let sample = player.advance(TICK, [0.0, 0.0]).expect("still playing");
                     compose(base, &[sample]).antennas[0]
                 })
                 .collect()
@@ -1200,8 +1507,8 @@ mod tests {
         let track = Track::of(&head_clip("lift", &[0.0, 0.02], 0));
         let mut row_player = Row::new();
         let mut player = row_player.play(track.view(), 0.5);
-        let first = player.advance(TICK).expect("playing");
-        let second = player.advance(TICK).expect("playing");
+        let first = player.advance(TICK, [0.0, 0.0]).expect("playing");
+        let second = player.advance(TICK, [0.0, 0.0]).expect("playing");
         assert!((first.frame.head.expect("head driven").translation.vector.z).abs() < 1e-12);
         assert!(
             (second.frame.head.expect("head driven").translation.vector.z - 0.01).abs() < 1e-12
@@ -1228,9 +1535,13 @@ mod tests {
         let track = Track::of(&antenna_clip("walk", &frames, 0));
         let mut row_player = Row::new();
         let mut player = row_player.play(track.view(), 1.0);
-        let first = player.advance(Duration::from_secs(1)).expect("playing");
+        let first = player
+            .advance(Duration::from_secs(1), [0.0, 0.0])
+            .expect("playing");
         assert_eq!(first.frame.antennas.expect("antennas driven")[0], 0.0);
-        let second = player.advance(Duration::from_secs(1)).expect("playing");
+        let second = player
+            .advance(Duration::from_secs(1), [0.0, 0.0])
+            .expect("playing");
         assert!((second.frame.antennas.expect("antennas driven")[0] - 0.01).abs() < 1e-12);
     }
 
@@ -1243,7 +1554,7 @@ mod tests {
         let weights: Vec<f64> = (0..6)
             .map(|_| {
                 player
-                    .advance(TICK)
+                    .advance(TICK, [0.0, 0.0])
                     .expect("playing")
                     .weights
                     .get(Channel::Antennas)
@@ -1264,12 +1575,12 @@ mod tests {
         let mut slow = row_slow.play(track.view(), 1.0);
         for _ in 0..3 {
             let fast_weight = fast
-                .advance(TICK)
+                .advance(TICK, [0.0, 0.0])
                 .expect("playing")
                 .weights
                 .get(Channel::Antennas);
             let slow_weight = slow
-                .advance(TICK)
+                .advance(TICK, [0.0, 0.0])
                 .expect("playing")
                 .weights
                 .get(Channel::Antennas);
@@ -1295,7 +1606,7 @@ mod tests {
             assert!((weight - expected).abs() < 1e-12, "fade {index}: {weight}");
         }
         assert!(player.is_finished());
-        assert!(player.advance(TICK).is_none());
+        assert!(player.advance(TICK, [0.0, 0.0]).is_none());
     }
 
     #[test]
@@ -1319,10 +1630,10 @@ mod tests {
         let mut player = row_player.join(track.view(), 1.0, Duration::from_millis(200));
         // Ten frames in: the first sample is the eleventh frame's delta, at the
         // zero weight a fresh blend-in starts from rather than stepping onto.
-        let sample = player.advance(TICK).expect("playing");
+        let sample = player.advance(TICK, [0.0, 0.0]).expect("playing");
         assert!((sample.frame.antennas.expect("antennas driven")[0] - 0.10).abs() < 1e-12);
         assert_eq!(sample.weights, ChannelWeights::zero());
-        let next = player.advance(TICK).expect("playing");
+        let next = player.advance(TICK, [0.0, 0.0]).expect("playing");
         assert!((next.frame.antennas.expect("antennas driven")[0] - 0.11).abs() < 1e-12);
         assert!((next.weights.get(Channel::Antennas) - 0.2).abs() < 1e-12);
     }
@@ -1335,9 +1646,9 @@ mod tests {
         let mut player = row_player.join(track.view(), 2.0, Duration::from_millis(200));
         // Two hundred milliseconds at 2× is twenty frames of clip, and each
         // subsequent tick is two more.
-        let sample = player.advance(TICK).expect("playing");
+        let sample = player.advance(TICK, [0.0, 0.0]).expect("playing");
         assert!((sample.frame.antennas.expect("antennas driven")[0] - 0.20).abs() < 1e-12);
-        let next = player.advance(TICK).expect("playing");
+        let next = player.advance(TICK, [0.0, 0.0]).expect("playing");
         assert!((next.frame.antennas.expect("antennas driven")[0] - 0.22).abs() < 1e-12);
     }
 
@@ -1352,8 +1663,16 @@ mod tests {
         let mut row_player = Row::new();
         let mut player = row_player.play(track.view(), 0.5);
 
-        let start = player.advance(TICK).expect("playing").frame.head;
-        let middle = player.advance(TICK).expect("playing").frame.head;
+        let start = player
+            .advance(TICK, [0.0, 0.0])
+            .expect("playing")
+            .frame
+            .head;
+        let middle = player
+            .advance(TICK, [0.0, 0.0])
+            .expect("playing")
+            .frame
+            .head;
         let start = start.expect("head driven");
         let middle = middle.expect("head driven").rotation;
 
@@ -1404,6 +1723,7 @@ mod tests {
             version: 1,
             kind: "clip".to_owned(),
             name: "test/three-channels".to_owned(),
+            base: None,
             description: None,
             channels: vec![Channel::Head, Channel::Antennas, Channel::BodyYaw],
             frame_hz: FLOOR_TICK_HZ,
@@ -1440,7 +1760,7 @@ mod tests {
         let mut present = pinned;
         let mut ticks = 0u32;
         let mut moved = false;
-        while let Some(sample) = player.advance(TICK) {
+        while let Some(sample) = player.advance(TICK, [0.0, 0.0]) {
             let composed = compose(base, &[sample]);
             let mut out = TickOutputs::default();
             motion_tick(
@@ -1508,7 +1828,7 @@ mod tests {
         let track = Track::of(&antenna_clip("walk", &[0.1; 4], 0));
         let mut row_player = Row::new();
         let mut player = row_player.join(track.view(), 1.0, Duration::from_secs(5));
-        assert!(player.advance(TICK).is_none());
+        assert!(player.advance(TICK, [0.0, 0.0]).is_none());
         assert!(player.is_finished());
     }
 
@@ -1540,7 +1860,7 @@ mod tests {
         let mut row = Row::new();
         let mut player = row.play(track.view(), 1.0);
         for _ in 0..7 {
-            player.advance(TICK).expect("playing");
+            player.advance(TICK, [0.0, 0.0]).expect("playing");
         }
         let tail = run(&mut player, 200);
         let _ = player;
@@ -1548,7 +1868,7 @@ mod tests {
         let mut second = Row::new();
         let mut player = second.play(track.view(), 1.0);
         for _ in 0..7 {
-            player.advance(TICK).expect("playing");
+            player.advance(TICK, [0.0, 0.0]).expect("playing");
         }
         let _ = player;
         let mut resumed = second
@@ -1569,7 +1889,7 @@ mod tests {
         let mut row = Row::new();
         let mut player = row.play(mine.view(), 1.0);
         for _ in 0..3 {
-            player.advance(TICK).expect("playing");
+            player.advance(TICK, [0.0, 0.0]).expect("playing");
         }
         let _ = player;
         let fingerprint = row.held().track;
@@ -1627,7 +1947,7 @@ mod tests {
         let mut row = Row::new();
         let mut player = row.play(track.view(), 1.0);
         for _ in 0..9 {
-            player.advance(TICK).expect("playing");
+            player.advance(TICK, [0.0, 0.0]).expect("playing");
         }
         let _ = player;
         {
@@ -1637,9 +1957,115 @@ mod tests {
         (track, row)
     }
 
+    /// A live posed antenna row, with its positive weight and provenance in
+    /// the state the player itself wrote.
+    fn posed_live_row() -> (Track, Row) {
+        let clip = posed_antenna_clip("posed", &[-0.8304; 20], [-0.1745, 0.0], 100);
+        let track = Track::of(&clip);
+        let mut row = Row::new();
+        let mut player = row.play(track.view(), 1.0);
+        player.advance(TICK, [5.4528, 0.0]).expect("first tick");
+        player
+            .advance(TICK, [5.4528, 0.0])
+            .expect("activation tick");
+        let _ = player;
+        (track, row)
+    }
+
     /// What picking `row` up over `track` refuses with.
     fn refusal(track: &Track, row: &Row) -> PlayerStateError {
         ClipPlayer::resumable(&track.view(), row.held()).expect_err("refused")
+    }
+
+    #[test]
+    fn joining_zeros_turns_and_unposed_playback_never_lifts() {
+        let posed = posed_antenna_clip("posed", &[-0.8304; 20], [-0.1745, 0.0], 0);
+        let posed_track = Track::of(&posed);
+        let mut row = Row::new();
+        row.state().antenna_turns_right = 7;
+        row.state().antenna_turns_left = -7;
+        let player = row.join(posed_track.view(), 1.0, Duration::ZERO);
+        let _ = player;
+        assert_eq!(row.held().antenna_turns_right, 0);
+        assert_eq!(row.held().antenna_turns_left, 0);
+
+        let unposed_track = Track::of(&antenna_clip("unposed", &[-0.8304; 20], 0));
+        let mut unposed = Row::new();
+        let mut player = unposed.play(unposed_track.view(), 1.0);
+        let sample = player.advance(TICK, [5.4528, 0.0]).expect("unposed sample");
+        assert!(sample.anchors.antennas.is_none());
+        let _ = player;
+        assert_eq!(unposed.held().antenna_turns_right, 0);
+        assert_eq!(unposed.held().antenna_turns_left, 0);
+    }
+
+    #[test]
+    fn live_posed_turns_resume_at_both_bounds_and_stray_turns_name_their_reason() {
+        for turns in [-ANTENNA_TURNS_MAX, ANTENNA_TURNS_MAX] {
+            let (track, mut row) = posed_live_row();
+            row.state().antenna_turns_right = turns;
+            assert!(ClipPlayer::resumable(&track.view(), row.held()).is_ok());
+            let _ = row.resume(track.view()).expect("bounded turn is resumable");
+        }
+
+        let (track, mut row) = posed_live_row();
+        row.state().weights.antennas = 0.0;
+        row.state().antenna_turns_right = 1;
+        assert_eq!(
+            refusal(&track, &row),
+            PlayerStateError::StrayTurn {
+                antenna: JointRef::AntennaRight,
+                turns: 1,
+            }
+        );
+
+        let unposed_track = Track::of(&antenna_clip("unposed", &[0.1; 20], 100));
+        let mut unposed_row = Row::new();
+        let mut player = unposed_row.play(unposed_track.view(), 1.0);
+        player.advance(TICK, [0.0, 0.0]).expect("unposed tick");
+        player.advance(TICK, [0.0, 0.0]).expect("unposed tick");
+        let _ = player;
+        unposed_row.state().antenna_turns_left = -1;
+        assert_eq!(
+            refusal(&unposed_track, &unposed_row),
+            PlayerStateError::StrayTurn {
+                antenna: JointRef::AntennaLeft,
+                turns: -1,
+            }
+        );
+
+        let no_antenna_track = Track::of(&head_clip("head", &[0.0; 20], 100));
+        let mut no_antenna_row = Row::new();
+        let mut player = no_antenna_row.play(no_antenna_track.view(), 1.0);
+        player.advance(TICK, [0.0, 0.0]).expect("head tick");
+        player.advance(TICK, [0.0, 0.0]).expect("head tick");
+        let _ = player;
+        no_antenna_row.state().antenna_turns_right = 1;
+        assert_eq!(
+            refusal(&no_antenna_track, &no_antenna_row),
+            PlayerStateError::StrayTurn {
+                antenna: JointRef::AntennaRight,
+                turns: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn impossible_posed_turns_are_refused_without_abs_overflow() {
+        for turns in [512, -512, i32::MIN] {
+            let (track, mut row) = posed_live_row();
+            row.state().antenna_turns_right = turns;
+            let error = refusal(&track, &row);
+            assert_eq!(
+                error,
+                PlayerStateError::BadTurn {
+                    antenna: JointRef::AntennaRight,
+                    turns,
+                }
+            );
+            assert!(error.to_string().contains("right antenna"));
+            assert!(error.to_string().contains(&turns.to_string()));
+        }
     }
 
     /// Assert `left` is the refusal `right` names, comparing the two as written
@@ -1741,7 +2167,7 @@ mod tests {
             {
                 let mut player = row.play(track.view(), 1.0);
                 for _ in 0..9 {
-                    player.advance(TICK).expect("playing");
+                    player.advance(TICK, [0.0, 0.0]).expect("playing");
                 }
             }
             set_ramp(&mut row.state().ramps, channel, ms);
@@ -1899,7 +2325,7 @@ mod tests {
             state.motion_id = 3;
         }
         let mut player = used.join(track.view(), 1.5, Duration::from_millis(60));
-        player.advance(TICK);
+        player.advance(TICK, [0.0, 0.0]);
         let _ = player;
 
         let mut fresh = Row::new();
@@ -1909,7 +2335,7 @@ mod tests {
             state.motion_id = 3;
         }
         let mut player = fresh.join(track.view(), 1.5, Duration::from_millis(60));
-        player.advance(TICK);
+        player.advance(TICK, [0.0, 0.0]);
         let _ = player;
 
         assert_eq!(used.bytes(), fresh.bytes());
@@ -2159,5 +2585,33 @@ mod tests {
         );
         assert_eq!(player.mask(), clip.mask());
         assert_eq!(player.speed(), 1.0);
+    }
+
+    #[test]
+    fn player_keeps_channel_provenance_across_segment_fade_and_end() {
+        let posed = posed_head_clip("posed", &[0.0, 0.001], 40);
+        let ordinary = antenna_clip("ordinary", &[0.01, 0.02, 0.03], 40);
+        let track = Track::composed(&[&posed, &ordinary], 0, &[(0, 1.0, 0), (1, 1.0, 0)]);
+        let mut row = Row::new();
+        let mut player = row.play(track.view(), 1.0);
+        let samples = run(&mut player, 40);
+        let expected = posed.anchor().expect("posed anchor").targets();
+        let mut saw_fade = false;
+        for sample in &samples {
+            if sample.weights.get(Channel::Head) > 0.0 {
+                let actual = sample.anchors.head.expect("head anchor while head drives");
+                assert_eq!(actual, expected.head_pose_body);
+                saw_fade |= sample.anchors.antennas.is_none();
+            }
+        }
+        assert!(
+            saw_fade,
+            "the posed head survives the antennas-only segment"
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.weights.get(Channel::Head) == 0.0)
+        );
     }
 }

@@ -27,6 +27,7 @@ use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
 use brenn_reachy__motion__faults_clk_rs::TickFaultWire;
 use dxl_proto::HardwareError;
 use log_read::Logged;
+use reachy_kin::{EnvelopeError, EnvelopeViolations};
 use reachy_motion::arm::{Gains, GroupGains};
 use reachy_motion::joints::{JointGroup, JointRef, Name, ROWS, group_of, row, rows_of};
 use reachy_motion::plant::{
@@ -2318,12 +2319,36 @@ fn goal_steps(class: &ClassCapability, report: &mut Report) {
 /// which harness recorded it would be the same event with two names.
 pub fn no_faults(faults: &[Logged<TickFaultWire>], report: &mut Report) {
     for fault in faults {
-        report.fail(format!(
+        let raw_envelope_checks = fault.message.envelope_checks();
+        if raw_envelope_checks > u32::from(u16::MAX) {
+            report.fail(format!(
+                "the decision tick raised {:?} at {}, envelope_checks {} is invalid for the 16-bit envelope layout",
+                fault.message.kind(),
+                fault.message.time().as_nanos(),
+                raw_envelope_checks,
+            ));
+            continue;
+        }
+        let envelope_checks = u16::try_from(raw_envelope_checks)
+            .expect("the envelope evidence was checked against the 16-bit layout");
+        let count = if envelope_checks == 0 {
+            fault.message.count()
+        } else {
+            envelope_checks.count_ones()
+        };
+        let mut finding = format!(
             "the decision tick raised {:?} at {}, count {}",
             fault.message.kind(),
             fault.message.time().as_nanos(),
-            fault.message.count()
-        ));
+            count
+        );
+        if envelope_checks != 0 {
+            let error = EnvelopeError {
+                violations: EnvelopeViolations::from_bits(envelope_checks),
+            };
+            finding.push_str(&format!(": {error}"));
+        }
+        report.fail(finding);
     }
 }
 
@@ -2637,6 +2662,64 @@ mod tests {
             "{said}"
         );
         assert!(said.contains("count 4"), "{said}");
+    }
+
+    #[test]
+    fn an_envelope_fault_renders_named_window_and_margin_evidence() {
+        let mut fault = TickFaultWire::new();
+        fault.set_kind(FaultKindWire::MOVE_ABORTED_ENVELOPE);
+        fault.set_time(SyncTime::from_nanos(ORIGIN_NS));
+        fault.set_count(99);
+        fault.set_envelope_checks((1 << 6 | 1 << 12) as u32);
+        let faults = vec![Logged {
+            at_ns: ORIGIN_NS,
+            sequence_number: 0,
+            message: fault,
+        }];
+        let mut report = Report::default();
+        no_faults(&faults, &mut report);
+        assert!(report.findings[0].contains("leg 1 outside its travel window"));
+        assert!(report.findings[0].contains("toggle margin below the floor"));
+        assert!(report.findings[0].contains("count 2"));
+    }
+
+    #[test]
+    fn an_envelope_fault_with_upper_bits_is_reported_without_partial_evidence() {
+        for bits in [1_u32 << 16, (1_u32 << 16) | (1_u32 << 6)] {
+            let mut fault = TickFaultWire::new();
+            fault.set_kind(FaultKindWire::MOVE_ABORTED_ENVELOPE);
+            fault.set_time(SyncTime::from_nanos(ORIGIN_NS));
+            fault.set_count(99);
+            fault.set_envelope_checks(bits);
+            let faults = vec![Logged {
+                at_ns: ORIGIN_NS,
+                sequence_number: 0,
+                message: fault,
+            }];
+            let mut report = Report::default();
+            no_faults(&faults, &mut report);
+            assert_eq!(report.findings.len(), 1, "{bits:#x}");
+            assert!(report.findings[0].contains("invalid for the 16-bit envelope layout"));
+            assert!(!report.findings[0].contains("leg 1 outside its travel window"));
+        }
+    }
+
+    #[test]
+    fn an_old_fault_without_envelope_evidence_keeps_its_old_line() {
+        let mut fault = TickFaultWire::new();
+        fault.set_kind(FaultKindWire::HEAD_SERVO_FAULT);
+        fault.set_time(SyncTime::from_nanos(ORIGIN_NS));
+        fault.set_count(4);
+        let faults = vec![Logged {
+            at_ns: ORIGIN_NS,
+            sequence_number: 0,
+            message: fault,
+        }];
+        let mut report = Report::default();
+        no_faults(&faults, &mut report);
+        assert_eq!(report.findings.len(), 1);
+        assert!(!report.findings[0].contains("envelope"));
+        assert!(!report.findings[0].contains("leg 1"));
     }
 
     #[test]

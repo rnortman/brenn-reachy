@@ -1,0 +1,21 @@
+{
+  "type": "motion-script",
+  "pod": "reachy-ask",
+  "seq": 1,
+  "steps": [
+    {"after_ms": 8000, "pose": "peek"},
+    {"after_ms": 10300, "pose": "neutral"},
+    {"after_ms": 12600, "pose": "stow"},
+    {"after_ms": 16100, "pose": "peek_tilt"},
+    {"after_ms": 18600, "pose": "neutral"},
+    {"after_ms": 20900, "pose": "hello"},
+    {"after_ms": 23400, "pose": "peek_tilt"},
+    {"after_ms": 25900, "pose": "stow"},
+    {"after_ms": 29400, "pose": "hello"},
+    {"after_ms": 31900, "pose": "peek"},
+    {"after_ms": 34200, "pose": "stow"},
+    {"after_ms": 37700, "pose": "neutral"},
+    {"after_ms": 40000, "pose": "stow"}
+  ],
+  "timeout_ms": 42000
+}

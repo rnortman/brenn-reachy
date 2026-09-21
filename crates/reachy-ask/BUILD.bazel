@@ -9,11 +9,11 @@
 # A binary and no library: everything it holds is about this one run, and
 # `rust_test(crate = ...)` over a binary is how its own modules are tested.
 #
-# The emitted names sidecar is a compile-time input: the harness stands its edge
-# up without being handed a library, so the numbering its scripts carry is the
-# numbering of the assets it was built beside -- library, sidecar and binary
-# reach a unit as one payload. `$(execpath)` is what `include_str!` needs for a
-# generated file in another package.
+# The emitted names sidecar is the production compile-time input: the harness
+# stands its edge up without being handed a library, so the numbering its
+# scripts carry is the numbering of the assets it was built beside -- library,
+# sidecar and binary reach a unit as one payload. `$(execpath)` is what
+# `include_str!` needs for a generated file in another package.
 #
 # The target name is the binary's name underscored: rules_rust derives the crate
 # name from the target, and `reachy-ask` is not a Rust identifier.
@@ -42,7 +42,8 @@ rust_binary(
     ],
 )
 
-# The gesture's shape and offsets, the tour's plan and budget, the engagement
+# The test-only greeting fixture is compile data for the `#[cfg(test)]` module;
+# the gesture's shape and offsets, the tour's plan and budget, the engagement
 # and the holds they have to cover, and the argument grammar. The compiles run
 # in memory over an injected instant; what does bind a socket binds an ephemeral
 # one -- a loopback listener standing in for the launcher's control API, and the
@@ -58,8 +59,14 @@ rust_test(
     name = "reachy_ask_test",
     size = "small",
     crate = ":reachy_ask",
+    compile_data = [
+        "fixtures/greeting.json",
+        "fixtures/settle-evidence-1.json",
+        "fixtures/settle-evidence-2.json",
+    ],
     deps = [
         "//cogs:scenario",
         "//crates/reachy-motion:reachy_motion",
+        "//crates/reachy-scratch:reachy_scratch",
     ],
 )

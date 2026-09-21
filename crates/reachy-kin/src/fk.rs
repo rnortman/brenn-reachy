@@ -537,10 +537,10 @@ mod tests {
     /// translation and 0.306° of pitch, against records given to two decimals in
     /// both degrees and millimetres. The pitch gap is thirty times the precision
     /// either record states, so it is a real difference between two hand-recorded
-    /// observations and not rounding. It carries into the clearance the baseline
-    /// policy is written around: 0.141 mm from the pose record against 0.182 mm
-    /// from the crank-angle record. The pose record is what every caller uses,
-    /// so it is the authoritative one, and it is the tighter of the two.
+    /// observations and not rounding. It carries into the two recorded
+    /// clearances, 0.141 mm from the pose record against 0.182 mm from the
+    /// crank-angle record; the pose record is the tighter observation, not a
+    /// claim that normal arming leaves a commanded rest below the floor.
     ///
     /// A golden here rather than a band because both numbers move when the
     /// geometry is refitted, and a band wide enough to hold either record would

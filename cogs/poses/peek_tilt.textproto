@@ -1,0 +1,9 @@
+name: "peek_tilt"
+description: "S007 of record-log-20260917T114423Z, lifted 2 mm; body yaw squared to 0.0 and recorded antenna directions retained."
+# Head relative to the neutral head pose: metres, unit quaternion [w, x, y, z].
+dt: [0.01049154187016598, -0.02274613777854499, -0.03565436059901819]
+dq: [0.9633281022256456, -0.26442242963013424, -0.012830615551910443, 0.04376210090247136]
+body_yaw: 0.0
+# Right, then left; radians, a direction.
+antennas: [-0.8303838173726208, -0.5722637603039527]
+duration_ms: 1000

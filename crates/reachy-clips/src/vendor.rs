@@ -312,6 +312,7 @@ pub fn convert(
     // refused; omitted, the default is capped at the clip's own length instead.
     // The written document comes from the loaded clip.
     let asked = ClipDoc {
+        base: None,
         version: FORMAT_VERSION,
         kind: "clip".to_owned(),
         name: name.to_owned(),

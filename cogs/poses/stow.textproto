@@ -1,9 +1,9 @@
 name: "stow"
-description: "recorded 2026-09-16, session record-log-20260916T002036Z S001, a 61 s hold on the de-torqued head. Lower and askew on purpose; one eye is bigger. The fold leans inboard past straight down so gravity loads the gearbox play to one side; six motion-probe runs at the earlier symmetric -3.32/3.32 fold, 8 degrees outboard of this one, read 0-1 counts of excursion (probe-log-20260909T014542Z and five after; the first is fixtures/traces/trace-antenna-fold-still.csv). The antennas are where that hold left them."
+description: "The head comes from the 2026-09-16 de-torqued stow hold; the antenna fold is symmetric at 3.32 rad, 10.2 degrees inboard of straight down. Six motion-probe runs measured 0-1 counts of excursion there."
 # Head relative to the neutral head pose: metres, unit quaternion [w, x, y, z].
 dt: [-0.01819812459878709, 0.004223959727784293, -0.050066980189288124]
 dq: [0.9762970501162584, 0.024578733243214353, 0.21471853903293095, -0.011657821495217885]
 body_yaw: 0.0
 # Right, then left; radians, a direction.
-antennas: [-3.4591337364226646, 3.3596413158342777]
+antennas: [-3.32, 3.32]
 duration_ms: 2000

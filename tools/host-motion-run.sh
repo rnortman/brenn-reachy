@@ -3,6 +3,7 @@
 # Run the online motion system on this workstation, against the simulated plant.
 #
 #   tools/host-motion-run.sh          (or: make motion-host-run)
+#   tools/host-motion-run.sh --script FILE
 #
 # The online system — the control process, the logger process, the process
 # descriptions, the shared-memory namespace, the launcher config and the log
@@ -66,6 +67,21 @@ bazel=${REACHY_BAZEL:-bazel}
 # it.
 cd -- "$repo_root"
 
+script_mode=no
+script_file=
+if [ "$#" -gt 0 ]; then
+	[ "$1" = --script ] || die "usage: ${prog} [--script FILE [--settle-evidence]]"
+	if [ "$#" -ne 2 ] && { [ "$#" -ne 3 ] || [ "$3" != --settle-evidence ]; }; then
+		die "usage: ${prog} [--script FILE [--settle-evidence]]"
+	fi
+	script_file=$2
+	[ -f "$script_file" ] && [ -r "$script_file" ] || die \
+		"script ${script_file} is not a readable regular file."
+	script_mode=yes
+fi
+settle_evidence=no
+[ "${3:-}" = --settle-evidence ] && settle_evidence=yes
+
 # The host configuration, which is the default one: no `--config=device` here,
 # and that is the whole difference between this staging and the payload's. The
 # array exists because lib.sh's cquery helpers take the configuration a build
@@ -85,6 +101,7 @@ launcher_target=@clockwork//jewels/simplelaunch:simplelaunch
 launch_config_target=//cogs:hostcpu.textproto
 prelaunch_target=//cogs:clockwork_prelaunch_sh
 config_target=//cogs:host_config_files
+names_target=//cogs:library.names.json
 
 # The configuration files a run carries home beside its records, at their
 # staging-relative paths. Out of the staging and not out of the tree: what the
@@ -174,10 +191,7 @@ pick_port() {
 }
 
 compile() {
-	"$bazel" build "${build_flags[@]}" -- \
-		"$exe_target" "$ask_target" "$system_target" "$launcher_target" \
-		"$launch_config_target" "$prelaunch_target" "$config_target" \
-		"$report_target"
+	"$bazel" build "${build_flags[@]}" -- "${build_targets[@]}"
 }
 
 # Build the scratch tree: the launcher and its config at the root, the
@@ -204,6 +218,13 @@ stage() {
 	# Not a launcher app: it binds the narration port before the composition
 	# comes up, so this script starts it itself, ahead of the launcher.
 	install -m 0755 -D -- "$ask_out" "${staging}/reachy_ask"
+	if [ "$script_mode" = yes ]; then
+		install -m 0644 -D -- "$script_file" "${staging}/script.json"
+	fi
+	if [ "$script_mode" = yes ]; then
+		names_src=$(bazel_named_in "$built" library.names.json) || exit 1
+		install -m 0644 -D -- "$names_src" "${staging}/cogs/library.names.json"
+	fi
 
 	while IFS= read -r file; do
 		[ -n "$file" ] || continue
@@ -248,11 +269,20 @@ refuse_leftovers() {
 # children, the cog processes stop cleanly on it, and a unit's driver winds its
 # torque down on it.
 run() {
-	local port=$1 pid ask_pid
+	local port=$1 pid ask_pid budget
+	if [ "$script_mode" = yes ]; then
+		budget=$(cd -- "$staging" && ./reachy_ask --script-budget script.json) ||
+			die "could not compute the supplied script's launcher budget."
+	else
+		budget=$run_seconds
+	fi
 	(
 		cd -- "$staging" &&
-			exec ./reachy_ask --resting-timeout "$run_seconds" \
-				--run-window "$run_seconds"
+			if [ "$script_mode" = yes ]; then
+				exec ./reachy_ask --script script.json
+			else
+				exec ./reachy_ask --resting-timeout "$run_seconds" --run-window "$run_seconds"
+			fi
 	) >"${launch_logs}/reachy_ask.log" 2>&1 &
 	ask_pid=$!
 	echo "${prog}: reachy-ask pid ${ask_pid}, console at ${launch_logs}/reachy_ask.log"
@@ -263,12 +293,19 @@ run() {
 	) &
 	pid=$!
 	echo "${prog}: launcher pid ${pid}, console under ${launch_logs}"
-	echo "${prog}: letting the gesture run for ${run_seconds}s"
+	echo "${prog}: letting the run use ${budget}s as its backstop"
 
 	local waited=0
-	while [ "$waited" -lt "$run_seconds" ]; do
+	while [ "$waited" -lt "$budget" ]; do
 		if ! kill -0 "$pid" 2>/dev/null; then
-			wait "$pid" || true
+			wait "$pid" || launcher_rc=$?
+			launcher_rc=${launcher_rc:-0}
+			if [ "$script_mode" = yes ]; then
+				if wait "$ask_pid"; then ask_rc=0; else ask_rc=$?; fi
+				[ "$launcher_rc" -eq 0 ] || die "the launcher exited (exit ${launcher_rc}) before the script ended."
+				[ "$ask_rc" -eq 0 ] || die "reachy-ask failed (exit ${ask_rc}); see ${launch_logs}/reachy_ask.log"
+				return 0
+			fi
 			die "the launcher exited after ${waited}s, before the run was over." \
 				"Its console and the three processes' output are under ${launch_logs}."
 		fi
@@ -279,6 +316,12 @@ run() {
 	echo "${prog}: stopping the run"
 	kill -INT "$pid" 2>/dev/null || true
 	wait "$pid" || true
+	if [ "$script_mode" = yes ]; then
+		kill -INT "$ask_pid" 2>/dev/null || true
+		if wait "$ask_pid"; then ask_rc=0; else ask_rc=$?; fi
+		[ "$ask_rc" -eq 0 ] || die "reachy-ask failed (exit ${ask_rc}); see ${launch_logs}/reachy_ask.log"
+		return 0
+	fi
 	# The intent source is not judged here: the analyzer over the log is the
 	# verdict, and a run where the gesture never reached the session fails there
 	# with the phases it did see. What its exit says is why, so it is printed.
@@ -289,9 +332,20 @@ run() {
 require_bazel "host motion run"
 check_pinion_defaults "$logger_config"
 refuse_leftovers
+build_targets=(
+	"$exe_target" "$ask_target" "$system_target" "$launcher_target"
+	"$launch_config_target" "$prelaunch_target" "$config_target" "$report_target"
+)
+output_targets=(
+	"$exe_target" "$ask_target" "$system_target" "$launcher_target"
+	"$launch_config_target" "$prelaunch_target"
+)
+if [ "$script_mode" = yes ]; then
+	build_targets+=("$script_report_target" "$names_target")
+	output_targets+=("$names_target")
+fi
 compile
-built=$(bazel_files "$(union "$exe_target" "$ask_target" "$system_target" \
-	"$launcher_target" "$launch_config_target" "$prelaunch_target")")
+built=$(bazel_files "$(union "${output_targets[@]}")")
 configs=$(bazel_files "$config_target")
 exe_out=$(bazel_named_in "$built" robot_host_clk_exe)
 ask_out=$(bazel_named_in "$built" reachy_ask)
@@ -316,4 +370,13 @@ for file in "${run_config_files[@]}"; do
 	install -m 0644 -D -- "${staging}/${file}" "${run_dir}/config/${file}"
 done
 
-report_verdict "$run_dir" --grid-jitter-ns "$grid_jitter_ns"
+if [ "$script_mode" = yes ]; then
+	install -m 0644 -D -- "${staging}/cogs/library.names.json" "${run_dir}/config/cogs/library.names.json"
+	if [ "$settle_evidence" = yes ]; then
+		script_verdict "$run_dir" "${run_dir}/config/cogs/library.names.json" --settle-evidence
+	else
+		script_verdict "$run_dir" "${run_dir}/config/cogs/library.names.json"
+	fi
+else
+	report_verdict "$run_dir" --grid-jitter-ns "$grid_jitter_ns"
+fi
