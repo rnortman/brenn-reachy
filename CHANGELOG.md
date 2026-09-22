@@ -307,6 +307,20 @@ Nothing has been released.
 
 ### Fixed
 
+- **`reachy-ask --script` deadline and stale-row handling.** The sender window
+  was anchored before the blocking read, so however long that read blocked —
+  up to a 250 ms poll — was spent before the offer was posted, and every
+  production window was short by that much. The anchor is now taken after the
+  post, matching the gesture loop. Separately, the story a sender reads is
+  cumulative, so a second `--script` run against the same control process
+  could read an earlier run's acceptance and release and return green over a
+  log in which its own script never ran, or read an earlier engagement's
+  refusal or fault and go red naming it. The update the run asked on is now
+  skipped; only rows from later updates are read as its answers, so a refusal
+  or fault the session narrates after the offer still ends the run red.
+  Timeout endings now distinguish "never commissioned", "not accepted", and
+  "accepted but never released".
+
 - **A payload built against a brenn-pod working tree gets built.** The
   provenance line for an overlaid checkout ended in a command substitution whose
   last command was a test for a dirty tree, so on a *clean* one the assignment

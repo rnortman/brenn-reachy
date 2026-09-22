@@ -1372,3 +1372,9 @@ charter rather than a refactor.
 Done = one `stop_flag()` and one `now_ns()`, four and two call sites
 respectively, and the two conventions written down once. Marked at the bench's
 copies in `crates/reachy-bench/src/main.rs`.
+
+## `correctness-replaced-and-held-are-not-acceptance`
+
+Decide what `reachy-ask --script` reads as the session taking its script when the session was not at rest as the offer arrived. Today only `script_accepted` naming the offer's id counts; a `script_replaced` naming it — the session was running another script and swapped to this one — is not read, so such a run waits its whole sender window out and ends red with "did not accept script N" over a log in which the script ran. `script_held` needs no reading of its own: the wake that ends the maneuver answers it with one of the other two.
+
+Deferral context: the bench runs one sender against one control process, which posts on the commissioning row into a session at rest, so the replacement path is reached only by a sender that joins a live engagement — and whether such a sender should ask at all is itself undecided. The reports vocabulary keeps `script_replaced` apart from `script_accepted` so that a reader counting engagements does not count a replacement as one; whether the harness's green — "my script ran and the machine released" — should be earned by a replacement is the same question from the sender's side, and it is a decision about what the verdict means, not a matcher change. Marked at the acceptance match in `script_conduct_inner`, `crates/reachy-ask/src/main.rs`.

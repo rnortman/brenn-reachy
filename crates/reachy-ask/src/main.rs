@@ -689,6 +689,14 @@ fn script_conduct(
     script_conduct_inner(options, plan, ports, stop, surface, None)
 }
 
+/// The one post this run made: what the loop reads later when it decides
+/// what a timeout means and which acceptance row is its own.
+struct Offer {
+    script_id: u32,
+    /// How long the loop waits after the post before giving up.
+    window: Duration,
+}
+
 fn script_conduct_inner(
     options: &Options,
     plan: &ScriptPlan,
@@ -706,20 +714,26 @@ fn script_conduct_inner(
     let mut watch = Watch::new();
     let mut accepted = false;
     let mut deadline = Instant::now() + options.resting_timeout;
-    let mut asked_id = None;
+    let mut offer: Option<Offer> = None;
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ending::Stopped("stopped before the script returned to rest".to_owned());
         }
         let at = Instant::now();
         if at >= deadline {
-            return Ending::Told(Err(if accepted {
-                "the script did not end at rest before its deadline".to_owned()
-            } else {
-                format!(
+            return Ending::Told(Err(match &offer {
+                None => format!(
                     "no commissioning row in {}s",
                     options.resting_timeout.as_secs()
-                )
+                ),
+                Some(_) if accepted => {
+                    "the script did not end at rest before its deadline".to_owned()
+                }
+                Some(offer) => format!(
+                    "the session did not accept script {} in the {} ms window after the offer",
+                    offer.script_id,
+                    offer.window.as_millis()
+                ),
             }));
         }
         let Some(update) = (match heard(ports, &mut host, &mut buffer, surface) {
@@ -741,7 +755,6 @@ fn script_conduct_inner(
                 Err(message) => return Ending::Told(Err(message)),
             };
             accepted = false;
-            asked_id = Some(script_id);
             let sender_window = match deadline_override {
                 Some(window) => window,
                 None => match plan.sender_deadline() {
@@ -749,7 +762,10 @@ fn script_conduct_inner(
                     Err(message) => return Ending::Told(Err(message)),
                 },
             };
-            deadline = at + sender_window;
+            offer = Some(Offer {
+                script_id,
+                window: sender_window,
+            });
             surface.say(
                 serde_json::json!({
                     "stream": "edge", "at_ns": arrival.as_nanos(), "kind": "asked",
@@ -759,14 +775,28 @@ fn script_conduct_inner(
                 })
                 .to_string(),
             );
+            deadline = Instant::now() + sender_window;
+            // The story is cumulative, so the update that carried the commissioning
+            // row carries everything the session had said before this run asked — an
+            // earlier sender's acceptance and release included — and none of it
+            // answers this offer. That goes for a refusal or a fault in the same
+            // update too: they predate this run's ask. Only rows from later updates
+            // are read as answers.
+            continue;
         }
         if !watch.asked() {
             continue;
         }
         for row in &update.rows {
             let kind = row.kind();
+            // Only `SCRIPT_ACCEPTED` reads as the session taking this script.
+            // `SCRIPT_REPLACED` and `SCRIPT_HELD` are deliberately not matched;
+            // whether a replacement counts as this run's green is undecided.
+            // TODO(correctness-replaced-and-held-are-not-acceptance)
             if kind == brenn_reachy__motion__reports_clk_rs::ReportKindWire::SCRIPT_ACCEPTED
-                && Some(row.a()) == asked_id
+                && offer
+                    .as_ref()
+                    .is_some_and(|offer| row.a() == offer.script_id)
             {
                 accepted = true;
             }
@@ -994,6 +1024,7 @@ mod tests {
     use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
     use clockwork_rs::blob_as_bytes;
     use reachy_edge::{Alert, LOOPBACK, Surface};
+    use reachy_scratch::scratch_dir;
 
     use super::{
         Console, Ending, Mode, Options, Ports, ScriptPlan, Tour, conduct, parse, plan,
@@ -1335,12 +1366,16 @@ mod tests {
         entry
     }
 
+    /// `ScriptPlan::read` owns the body, so no caller reads the file
+    /// again — the scratch directory guard may drop.
+    fn written_plan(tag: &str, script: &motion_proto::MotionScript) -> ScriptPlan {
+        let dir = scratch_dir(tag);
+        let path = dir.join("script.json");
+        std::fs::write(&path, script.encode()).expect("script file");
+        ScriptPlan::read(path).expect("decoded script")
+    }
+
     fn script_plan(timeout_ms: u64) -> ScriptPlan {
-        let path = std::env::temp_dir().join(format!(
-            "reachy-ask-socket-{}-{}.json",
-            std::process::id(),
-            timeout_ms
-        ));
         let script = motion_proto::MotionScript::new(
             super::ASK_POD,
             1,
@@ -1351,16 +1386,10 @@ mod tests {
             timeout_ms,
         )
         .expect("a valid embedded-asset script");
-        std::fs::write(&path, script.encode()).expect("script file");
-        ScriptPlan::read(path).expect("decoded script")
+        written_plan("reachy-ask-socket", &script)
     }
 
     fn pose_only_plan(timeout_ms: u64, pose: &str) -> ScriptPlan {
-        let path = std::env::temp_dir().join(format!(
-            "reachy-ask-pose-only-{}-{}.json",
-            std::process::id(),
-            timeout_ms
-        ));
         let script = motion_proto::MotionScript::new(
             super::ASK_POD,
             1,
@@ -1368,13 +1397,10 @@ mod tests {
             timeout_ms,
         )
         .expect("a valid pose-only script");
-        std::fs::write(&path, script.encode()).expect("script file");
-        ScriptPlan::read(path).expect("decoded script")
+        written_plan("reachy-ask-pose-only", &script)
     }
 
     fn invalid_motion_plan() -> ScriptPlan {
-        let path =
-            std::env::temp_dir().join(format!("reachy-ask-invalid-{}.json", std::process::id()));
         let script = motion_proto::MotionScript::new(
             super::ASK_POD,
             1,
@@ -1385,8 +1411,7 @@ mod tests {
             600_000,
         )
         .expect("wire-valid unknown motion");
-        std::fs::write(&path, script.encode()).expect("script file");
-        ScriptPlan::read(path).expect("decoded script")
+        written_plan("reachy-ask-invalid", &script)
     }
 
     /// The session having commissioned.
@@ -1398,6 +1423,36 @@ mod tests {
     fn released() -> TimelineEntryWire {
         phase(SessionPhaseWire::RESTING, SessionPhaseWire::STOPPING)
     }
+
+    /// The red ending a case expects, and the phrase its message must carry.
+    fn expect_red_containing(ending: Ending, needle: &str, context: &str) {
+        match ending {
+            Ending::Told(Err(message)) => {
+                assert!(message.contains(needle), "{context}: {message}");
+            }
+            Ending::Told(Ok(())) => panic!("{context}: expected red, got green"),
+            Ending::Stopped(message) => {
+                panic!("{context}: expected red, got stopped: {message}")
+            }
+        }
+    }
+
+    /// The green ending a case expects.
+    fn expect_green(ending: Ending, context: &str) {
+        match ending {
+            Ending::Told(Ok(())) => {}
+            Ending::Told(Err(message)) => {
+                panic!("{context}: expected green, got red: {message}")
+            }
+            Ending::Stopped(message) => {
+                panic!("{context}: expected green, got stopped: {message}")
+            }
+        }
+    }
+
+    /// The bounded wait the deadline cases give the narrator between the offer
+    /// and the row it answers with.
+    const SCRIPT_WINDOW: Duration = Duration::from_secs(2);
 
     #[test]
     fn a_script_offer_is_once_and_acceptance_plus_release_is_green() {
@@ -1440,6 +1495,18 @@ mod tests {
             &mut recorded,
         );
         assert!(matches!(ending, Ending::Told(Ok(()))));
+        // The one `asked` line carries the plan's own window: 600 000 ms plus the
+        // 4 000 ms release allowance and the 5 000 ms end margin.
+        let asked: Vec<serde_json::Value> = recorded
+            .lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| line["kind"] == "asked")
+            .collect();
+        assert_eq!(asked.len(), 1, "one asked line: {asked:?}");
+        assert_eq!(asked[0]["script_id"], 1_u64);
+        assert_eq!(asked[0]["timeout_ms"], 600_000_u64);
+        assert_eq!(asked[0]["deadline_ms"], 609_000_u64);
         told.join().expect("session side");
     }
 
@@ -1471,12 +1538,102 @@ mod tests {
                 &ports,
                 &AtomicBool::new(false),
                 &mut Recorded::default(),
-                Some(Duration::from_millis(20)),
+                Some(SCRIPT_WINDOW),
             );
-            assert_eq!(
-                matches!(ending, Ending::Told(Ok(()))),
-                green,
-                "id {reported_id}"
+            if green {
+                expect_green(ending, &format!("reported_id={reported_id}"));
+            } else {
+                expect_red_containing(
+                    ending,
+                    "did not accept script 1 in the 2000 ms window",
+                    &format!("reported_id={reported_id}"),
+                );
+            }
+            told.join().expect("session side");
+        }
+    }
+
+    #[test]
+    fn rows_that_predate_the_offer_are_not_its_answer() {
+        for fresh_answer in [false, true] {
+            let plan = pose_only_plan(600_000, "neutral");
+            let (ports, control, narrator, reports) = wiring();
+            let told = thread::spawn(move || {
+                narrator
+                    .send_to(
+                        &story(&[
+                            commissioned(),
+                            report(ReportKindWire::SCRIPT_ACCEPTED, 1, 2),
+                            released(),
+                        ]),
+                        reports,
+                    )
+                    .expect("stale story");
+                let mut buffer = vec![0u8; super::DATAGRAM_CAP];
+                control.recv_from(&mut buffer).expect("one offer");
+                if fresh_answer {
+                    narrator
+                        .send_to(
+                            &story(&[
+                                commissioned(),
+                                report(ReportKindWire::SCRIPT_ACCEPTED, 1, 2),
+                                released(),
+                                report(ReportKindWire::SCRIPT_ACCEPTED, 1, 2),
+                                released(),
+                            ]),
+                            reports,
+                        )
+                        .expect("fresh answer");
+                }
+            });
+            let ending = script_conduct_inner(
+                &Options::default(),
+                &plan,
+                &ports,
+                &AtomicBool::new(false),
+                &mut Recorded::default(),
+                Some(SCRIPT_WINDOW),
+            );
+            if fresh_answer {
+                expect_green(ending, &format!("fresh_answer={fresh_answer}"));
+            } else {
+                expect_red_containing(
+                    ending,
+                    "did not accept script 1 in the 2000 ms window",
+                    &format!("fresh_answer={fresh_answer}"),
+                );
+            }
+            told.join().expect("session side");
+        }
+    }
+
+    #[test]
+    fn a_stale_refusal_or_fault_is_not_this_runs_verdict() {
+        for kind in [
+            ReportKindWire::SCRIPT_REFUSED,
+            ReportKindWire::FAULT_RECORDED,
+        ] {
+            let plan = pose_only_plan(600_000, "neutral");
+            let (ports, control, narrator, reports) = wiring();
+            let told = thread::spawn(move || {
+                narrator
+                    .send_to(&story(&[commissioned(), report(kind, 1, 7)]), reports)
+                    .expect("stale story");
+                let mut buffer = vec![0u8; super::DATAGRAM_CAP];
+                control.recv_from(&mut buffer).expect("one offer");
+            });
+            let ending = script_conduct_inner(
+                &Options::default(),
+                &plan,
+                &ports,
+                &AtomicBool::new(false),
+                &mut Recorded::default(),
+                Some(SCRIPT_WINDOW),
+            );
+            expect_red_containing(
+                ending,
+                "did not accept script 1 in the 2000 ms window",
+                &format!("stale {kind:?}"),
             );
             told.join().expect("session side");
         }
@@ -1507,7 +1664,11 @@ mod tests {
                 &AtomicBool::new(false),
                 &mut Recorded::default(),
             );
-            assert!(matches!(ending, Ending::Told(Err(_))));
+            expect_red_containing(
+                ending,
+                &format!("session narrated {kind:?} with a=1 b=7"),
+                &format!("narrated {kind:?}"),
+            );
             told.join().expect("session side");
         }
     }
@@ -1573,16 +1734,29 @@ mod tests {
             &ports,
             &AtomicBool::new(false),
             &mut Recorded::default(),
-            Some(Duration::from_millis(1)),
+            Some(SCRIPT_WINDOW),
         );
-        match ending {
-            Ending::Told(Err(message)) => {
-                assert!(message.contains("did not end at rest"), "{message}");
-            }
-            Ending::Told(Ok(())) => panic!("deadline unexpectedly green"),
-            Ending::Stopped(message) => panic!("unexpected stop: {message}"),
-        }
+        expect_red_containing(ending, "did not end at rest", "script deadline");
         told.join().expect("session side");
+    }
+
+    #[test]
+    fn a_script_commissioning_timeout_is_red_and_names_the_row() {
+        let plan = pose_only_plan(600_000, "neutral");
+        let options = Options {
+            resting_timeout: Duration::from_millis(1),
+            mode: Mode::Script(PathBuf::from("a.json")),
+            ..Options::default()
+        };
+        let ports = Ports::on(0, 0).expect("an ephemeral narration port");
+        let ending = script_conduct(
+            &options,
+            &plan,
+            &ports,
+            &AtomicBool::new(false),
+            &mut Recorded::default(),
+        );
+        expect_red_containing(ending, "no commissioning row in 0s", "script commissioning");
     }
 
     #[test]
