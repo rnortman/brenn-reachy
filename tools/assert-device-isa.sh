@@ -48,9 +48,11 @@
 #
 # Knobs, environment only:
 #
-#   REACHY_BAZEL     the bazel to run (default bazel)
-#   REACHY_OBJDUMP   the disassembler (default: an llvm-objdump on PATH, else
-#                    the pinned drop's own)
+#   REACHY_BAZEL     the bazel override for direct diagnostic runs (default
+#                    bazel); make check-device clears it
+#   REACHY_OBJDUMP   the disassembler override for direct diagnostic runs;
+#                    make check-device clears it and uses the pinned drop's
+#                    own llvm-objdump
 #
 # Exits 0 with a per-binary count and the host's loader contract, or non-zero
 # naming the binary and what is wrong with it.
@@ -137,34 +139,28 @@ check_loader_contract() {
 # on an operand or a symbol name that happens to read like one.
 lse_mnemonics='^(cas|casp|swp|(ld|st)(add|clr|eor|set|smax|smin|umax|umin))(a|l|al)?(b|h)?$'
 
-# The disassembler. An llvm-objdump knows every target LLVM does, which is what
-# makes the drop's own copy the reliable fallback: a distribution binutils
-# objdump is routinely built for the host architecture only, and would refuse an
-# aarch64 file with a message about the file rather than about itself.
+# The disassembler. An llvm-objdump knows every target LLVM does, and the copy
+# in the fetched drop is the only implicit choice so a host tool cannot answer
+# for an aarch64 file.
 resolve_objdump() {
-	local candidate found
+	local found
 	if [ -n "${REACHY_OBJDUMP:-}" ]; then
 		command -v -- "$REACHY_OBJDUMP" >/dev/null 2>&1 ||
 			die "REACHY_OBJDUMP names ${REACHY_OBJDUMP}, which is not executable."
 		echo "$REACHY_OBJDUMP"
 		return
 	fi
-	for candidate in llvm-objdump llvm-objdump-21 llvm-objdump-20 llvm-objdump-19; do
-		command -v -- "$candidate" >/dev/null 2>&1 || continue
-		echo "$candidate"
-		return
-	done
 	local base
 	base=$("$bazel" info output_base 2>/dev/null) ||
-		die "no llvm-objdump on PATH and bazel cannot say where the drop's clang is." \
-			"Set REACHY_OBJDUMP to a disassembler that knows aarch64."
+		die "bazel cannot say where the drop's clang is." \
+			"make check-device fetches the pinned drop toolchain; for a direct diagnostic override, set REACHY_OBJDUMP and invoke tools/assert-device-isa.sh directly."
 	for found in "${base}/external/clang+/usr/bin/"llvm-objdump*; do
 		[ -x "$found" ] || continue
 		echo "$found"
 		return
 	done
-	die "no llvm-objdump on PATH and none in the drop's clang at ${base}/external/clang+." \
-		"Set REACHY_OBJDUMP to a disassembler that knows aarch64."
+	die "no executable llvm-objdump exists in the drop's clang at ${base}/external/clang+." \
+		"make check-device fetches the pinned drop toolchain; for a direct diagnostic override, set REACHY_OBJDUMP and invoke tools/assert-device-isa.sh directly."
 }
 
 # Every LSE instruction in one binary that is not behind the outline-atomics

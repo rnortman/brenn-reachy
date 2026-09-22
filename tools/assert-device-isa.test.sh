@@ -364,9 +364,8 @@ assert_contains "naming the value" "$(output_of "$result")" "no-such-objdump"
 #
 # The PATH for these is assembled rather than prepended to, because a
 # workstation with a real llvm-objdump installed would otherwise answer the
-# cases that are about there being none: it carries the stub bazel, this stub
-# disassembler under the names the subject looks for, and symlinks to the
-# handful of programs the subject and lib.sh run.
+# cases that are about there being none. It carries the stub bazel and symlinks
+# to the handful of programs the subject and lib.sh run.
 sanitized="${work}/sanitized-bin"
 mkdir -p -- "$sanitized"
 for tool in bash env cat basename dirname awk sed tail head wc tr grep; do
@@ -379,14 +378,33 @@ drop="${FIXTURES}/output_base/external/clang+/usr/bin"
 mkdir -p -- "$drop"
 cp -- "${stubs}/stub-objdump" "${drop}/llvm-objdump"
 
-# An llvm-objdump on PATH is what runs. The drop's copy is moved out of the way
-# for this one: both stubs disassemble identically, so with the fallback in
-# place a broken candidate list would still pass here on the drop's answer.
+# An llvm-objdump on PATH must be ignored when the pinned drop copy exists. The
+# sentinel fails and leaves evidence if the resolver consults it.
 green
+rm -f -- "${FIXTURES}/path-sentinel-hit"
 saved_path=$PATH
 on_path="${work}/on-path-bin"
 mkdir -p -- "$on_path"
-cp -- "${stubs}/stub-objdump" "${on_path}/llvm-objdump"
+cat >"${on_path}/llvm-objdump" <<'STUB'
+#!/usr/bin/env bash
+printf 'PATH sentinel was executed\n' >"${FIXTURES}/path-sentinel-hit"
+exit 1
+STUB
+chmod 0755 -- "${on_path}/llvm-objdump"
+PATH="${on_path}:${sanitized}"
+unset REACHY_OBJDUMP
+result=$(run)
+PATH=$saved_path
+export REACHY_OBJDUMP=stub-objdump
+assert_status "the pinned drop disassembler wins over PATH" 0 "$(status_of "$result")"
+assert_contains "and it disassembled both binaries" "$(output_of "$result")" \
+	"robot_clk_exe: no unguarded ARMv8.1 atomics."
+assert_lacks "the PATH sentinel was untouched" "$(cat "${FIXTURES}/path-sentinel-hit" 2>/dev/null || true)" \
+	"PATH sentinel was executed"
+
+# With the drop copy absent, a PATH candidate is not a fallback.
+green
+rm -f -- "${FIXTURES}/path-sentinel-hit"
 mv -- "${drop}/llvm-objdump" "${FIXTURES}/objdump.moved"
 PATH="${on_path}:${sanitized}"
 unset REACHY_OBJDUMP
@@ -394,37 +412,25 @@ result=$(run)
 PATH=$saved_path
 export REACHY_OBJDUMP=stub-objdump
 mv -- "${FIXTURES}/objdump.moved" "${drop}/llvm-objdump"
-assert_status "an llvm-objdump on PATH is found with no knob set" 0 "$(status_of "$result")"
-assert_contains "and it disassembled both binaries" "$(output_of "$result")" \
-	"robot_clk_exe: no unguarded ARMv8.1 atomics."
+assert_status "a missing pinned drop disassembler is refused" 1 "$(status_of "$result")"
+assert_contains "and the refusal names the drop toolchain" "$(output_of "$result")" \
+	"make check-device fetches the pinned drop toolchain"
+assert_contains "and the direct diagnostic instruction is executable" "$(output_of "$result")" \
+	"set REACHY_OBJDUMP and invoke tools/assert-device-isa.sh directly"
+assert_lacks "the missing-drop case still ignores PATH" "$(cat "${FIXTURES}/path-sentinel-hit" 2>/dev/null || true)" \
+	"PATH sentinel was executed"
 
-# Nothing on PATH: the drop's own copy is the fallback, which is the point of
-# preferring an llvm-objdump at all -- a distribution objdump is routinely built
-# for the host architecture only.
+# A failed output-base query is distinct from a missing executable in the drop.
 green
-PATH=$sanitized
 unset REACHY_OBJDUMP
+export INFO_STATUS=1
 result=$(run)
+unset INFO_STATUS
 PATH=$saved_path
 export REACHY_OBJDUMP=stub-objdump
-assert_status "the pinned drop's own disassembler is the fallback" 0 "$(status_of "$result")"
-assert_contains "and it disassembled both binaries" "$(output_of "$result")" \
-	"simplelaunch: no unguarded ARMv8.1 atomics."
-
-# No disassembler anywhere is a refusal that names the way out. A guard that
-# cannot disassemble must not read as a clean tree, and this is the branch a
-# machine whose drop layout moved lands on.
-green
-mv -- "${drop}/llvm-objdump" "${FIXTURES}/objdump.moved"
-PATH=$sanitized
-unset REACHY_OBJDUMP
-result=$(run)
-PATH=$saved_path
-export REACHY_OBJDUMP=stub-objdump
-mv -- "${FIXTURES}/objdump.moved" "${drop}/llvm-objdump"
-assert_status "no disassembler anywhere is refused" 1 "$(status_of "$result")"
-assert_contains "and the refusal names the knob that answers it" "$(output_of "$result")" \
-	"Set REACHY_OBJDUMP"
+assert_status "an output-base query failure is refused" 1 "$(status_of "$result")"
+assert_contains "and the refusal names the failed query" "$(output_of "$result")" \
+	"bazel cannot say where the drop's clang is"
 
 # ---------------------------------------------------------------------------
 # The refusals, continued

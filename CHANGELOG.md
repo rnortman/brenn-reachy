@@ -11,6 +11,11 @@ Nothing has been released.
 
 ### Changed
 
+- **Gate tooling is hermetic.** The module graph pins and fetches ShellCheck so
+  hooks and CI share a ruleset; the ISA sweep uses the pinned toolchain's
+  `llvm-objdump` instead of PATH; host ShellCheck is no longer a prerequisite;
+  and the ambient Linux shell, tar and Python boundary remains.
+
 - **The command clearance floor is derived at 0.56 mm** from the largest
   end-of-move leg residual measured over the committed pose library. Two
   dedicated settle-evidence scripts walk every directed transition; the report

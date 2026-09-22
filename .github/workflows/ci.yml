@@ -74,14 +74,6 @@ jobs:
             ${{ env.BAZEL_LAUNCHER_CACHE }}
           key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelrc', '.bazelversion', '.github/workflows/ci.yml') }}
 
-      # The gate's first step needs it. Installed explicitly rather than
-      # inherited from whatever the runner image happens to ship, so a step that
-      # names the dependency fails instead of the gate failing obscurely. The
-      # update first: the image's package lists go stale against the mirrors,
-      # and an install off a stale list 404s on a tree that is fine.
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
       # The runner image ships no Bazel, and .bazelversion is only honoured by a
       # launcher that reads it. Pinned by version and checksum for the reason
       # the gitleaks download in the scrub job is: a release asset is mutable,
@@ -107,9 +99,10 @@ jobs:
           echo "BAZELISK_HOME=$(expand_home "$BAZEL_LAUNCHER_CACHE")" >> "$GITHUB_ENV"
 
       # The gate's contents live in the root `check` target, not here, so the
-      # whole thing is reproducible locally on a fresh clone. shellcheck above is
-      # the only apt prerequisite: the Rust toolchain, the C++ sysroot and every
-      # third-party crate come out of the Bazel module graph.
+      # whole thing is reproducible locally on a fresh clone. Nothing is
+      # installed here: Rust, the C++ sysroot, crates and ShellCheck come from
+      # Bazel; the runner supplies ordinary shell userland plus tar and Python
+      # for the script self-checks.
       #
       # Of the added flags, --lockfile_mode=error is the gate's whole reason for
       # existing here: it refuses a MODULE.bazel.lock that module resolution

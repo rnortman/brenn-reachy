@@ -136,20 +136,17 @@ help:
 # naming nothing, and one starting with a dash would be read as a flag. `--`
 # ends the options on both invocations for the same reason.
 #
-# Hard-required, never skipped when the tool is absent: a gate that passes on a
-# machine missing shellcheck and fails on CI inverts the local-gate-first rule.
+# The command is a recursive assignment so the selected release comes from the
+# module graph on every workstation and in CI. A command-line assignment is a
+# deliberate seam for this recipe's self-check; using it manually runs a
+# different gate.
+SHELLCHECK = bazel run $(BAZEL_FLAGS) //bazel/third_party/shellcheck --
+
 .PHONY: check-scripts
-check-scripts:
-	@command -v shellcheck >/dev/null 2>&1 || { \
-	    echo "shellcheck not found on PATH — the script half of the gate cannot run." >&2; \
-	    echo "Install it from your distribution (Fedora: dnf install ShellCheck;" >&2; \
-	    echo "Debian and Ubuntu: apt install shellcheck), or from" >&2; \
-	    echo "https://github.com/koalaman/shellcheck#installing." >&2; \
-	    exit 1; \
-	}
-	git ls-files -z --cached --others --exclude-standard '*.sh' | \
-	    xargs -0 --no-run-if-empty shellcheck -x -P SCRIPTDIR --
-	shellcheck -x -P SCRIPTDIR -- .githooks/pre-commit .githooks/pre-push
+check-scripts: require-bazel
+	{ git ls-files -z --cached --others --exclude-standard '*.sh'; \
+	    printf '%s\0' .githooks/pre-commit .githooks/pre-push; } | \
+	    xargs -0 $(SHELLCHECK) -x -P SCRIPTDIR --
 
 # The scripts' own self-checks: a `*.test.sh` beside the script it exercises,
 # run as a plain program, exit status is the verdict. They stub the commands
@@ -209,7 +206,7 @@ test-scripts:
 # target in the tree — the eight Rust crates with their tests, the `.clk` schema
 # compiles, the generated cog wrappers, and the deterministic-runner scenarios.
 #
-# The scripts go first: they are seconds of work, and a broken deploy script is
+# The scripts go first: on a warm Bazel server they are seconds of work, and a broken deploy script is
 # not something to discover after a full test run. Sequential sub-makes rather
 # than prerequisites, because prerequisites are unordered and `make -j check`
 # would interleave the three — and the bazel refusal would land after the work it
@@ -331,7 +328,7 @@ check-device: require-bazel
 	    //bazel/platform:device_deployables \
 	    //bazel/third_party/onnxruntime:identity_check \
 	    //crates/reachy-host:host_closure_test
-	tools/assert-device-isa.sh
+	env -u REACHY_OBJDUMP -u REACHY_BAZEL tools/assert-device-isa.sh
 
 # Auto-fix, which means formatting: rules_rust's rustfmt runner formats every
 # Rust target in the tree with the pinned toolchain's rustfmt, which is the same

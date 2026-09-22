@@ -1,0 +1,5 @@
+# Apache-2.0. The pinned ShellCheck executable used by the check-scripts gate.
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["shellcheck"])

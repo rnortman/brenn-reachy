@@ -1,0 +1,71 @@
+# Apache-2.0. The Linux-only ShellCheck wrapper and its release identity check.
+
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+SHELLCHECK_VERSION = "0.11.0"
+
+# CPU selects the matching Linux archive; no default deliberately refuses unsupported CPUs.
+alias(
+    name = "binary",
+    actual = select({
+        "@platforms//cpu:aarch64": "@shellcheck_linux_aarch64//:shellcheck",
+        "@platforms//cpu:x86_64": "@shellcheck_linux_x86_64//:shellcheck",
+    }),
+    visibility = ["//visibility:public"],
+)
+
+# The OS constraint prevents a CPU-matching non-Linux host from executing a Linux ELF.
+sh_binary(
+    name = "shellcheck",
+    srcs = ["run.sh"],
+    data = [":binary"],
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+    env = {"SHELLCHECK_BINARY": "$(rlocationpath :binary)"},
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "identity_test_source",
+    outs = ["identity_test.sh"],
+    cmd = """cat >$@ <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "$${{RUNFILES_DIR:-}}" ]]; then
+  if [[ -f "$$0.runfiles/MANIFEST" ]]; then
+    export RUNFILES_MANIFEST_FILE="$$0.runfiles/MANIFEST"
+  elif [[ -d "$$0.runfiles" ]]; then
+    export RUNFILES_DIR="$$0.runfiles"
+  fi
+fi
+# shellcheck disable=SC1090
+source "$${{RUNFILES_DIR:-$$0.runfiles}}/bazel_tools/tools/bash/runfiles/runfiles.bash"
+
+binary=$$(rlocation "$$SHELLCHECK_BINARY")
+# Self-linting keeps this generated gate program under the same ruleset as checked-in scripts.
+"$$binary" -x -e SC1091 "$$0"
+version_output=$$("$$binary" --version)
+observed=$$(awk '/^version:/ {{ print $$2 }}' <<<"$$version_output")
+count=$$(awk '/^version:/ {{ count++ }} END {{ print count + 0 }}' <<<"$$version_output")
+expected="{version}"
+if [[ "$$count" != 1 || "$$observed" != "$$expected" ]]; then
+  printf 'ShellCheck identity: observed version=%s (version lines=%s), expected=%s\\n' \
+    "$$observed" "$$count" "$$expected" >&2
+  exit 1
+fi
+EOF
+chmod +x $@""".format(version = SHELLCHECK_VERSION),
+)
+
+# Proves only the archive selected on the current host; the other CPU's archive has its own digest in MODULE.bazel.
+sh_test(
+    name = "identity_test",
+    srcs = [":identity_test_source"],
+    data = [":binary"],
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+    env = {"SHELLCHECK_BINARY": "$(rlocationpath :binary)"},
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+)

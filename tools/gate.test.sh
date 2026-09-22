@@ -79,9 +79,10 @@ assert_refused() {
 # recipe's `</dev/null` per script indistinguishable from doing nothing.
 stdin_poison="poison-for-a-script-that-reads-stdin"
 lane() {
-	local out status=0
+	local target=$1 out status=0
+	shift
 	out=$(printf '%s\n' "$stdin_poison" |
-		make -C "$repo" --no-print-directory "$1" 2>&1) || status=$?
+		make -C "$repo" --no-print-directory "$target" "$@" 2>&1) || status=$?
 	printf '%s\n---status %s\n' "$out" "$status"
 }
 
@@ -181,25 +182,64 @@ git -C "$repo" rm --quiet --cached tools/gone.test.sh
 # check-scripts: the lint lane reads the same widened set
 # ---------------------------------------------------------------------------
 
-if command -v shellcheck >/dev/null 2>&1; then
-	result=$(lane check-scripts)
-	assert_status "a tree of clean scripts lints green" 0 "$(status_of "$result")"
+stub_log="${work}/shellcheck-argv"
+shellcheck_stub="${work}/shellcheck"
+cat >"$shellcheck_stub" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" >"$STUB_LOG"
+exit "${STUB_STATUS:-0}"
+STUB
+chmod 0755 -- "$shellcheck_stub"
+export STUB_LOG=$stub_log STUB_STATUS=0
 
-	# Untracked, and a finding shellcheck cannot miss: a `cd` whose failure
-	# nothing catches, in a `.sh` nobody staged.
-	printf '#!/usr/bin/env bash\ncd /tmp\necho there\n' >"${repo}/tools/sloppy.sh"
-	result=$(lane check-scripts)
-	assert_refused "an untracked script with a finding fails the lint lane" "$(status_of "$result")"
-	assert_contains "and the finding names the file" "$(output_of "$result")" \
-		"tools/sloppy.sh"
-	rm -f -- "${repo}/tools/sloppy.sh"
-else
-	# The lane is hard-required to refuse rather than skip, so a machine without
-	# the tool is a case rather than a gap.
-	result=$(lane check-scripts)
-	assert_refused "the lint lane refuses without shellcheck" "$(status_of "$result")"
-	assert_contains "and says what is missing" "$(output_of "$result")" \
-		"shellcheck not found on PATH"
-fi
+: >"$STUB_LOG"
+result=$(lane check-scripts "SHELLCHECK=$shellcheck_stub")
+assert_status "a tree of clean scripts lints green" 0 "$(status_of "$result")"
+if [ -s "$STUB_LOG" ]; then pass "the clean lint call leaves evidence"; else fail "the clean lint call leaves evidence" "the stub log is empty"; fi
+assert_eq "the recipe passes the linter flags in order" $'-x\n-P\nSCRIPTDIR\n--' \
+	"$(sed -n '1,4p' "$stub_log")"
+assert_contains "the lint set includes the first hook" "$(cat "$stub_log")" ".githooks/pre-commit"
+assert_contains "the lint set includes the second hook" "$(cat "$stub_log")" ".githooks/pre-push"
+
+# An untracked shell file is in the set, while ignored files are not.
+printf '#!/usr/bin/env bash\nexit 0\n' >"${repo}/tools/sloppy.sh"
+printf 'must-not-be-linted.sh\nignored-dir/\n' >>"${repo}/.gitignore"
+mkdir -p -- "${repo}/ignored-dir/nested"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${repo}/must-not-be-linted.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${repo}/ignored-dir/nested/nested-must-not-be-linted.sh"
+: >"$STUB_LOG"
+result=$(lane check-scripts "SHELLCHECK=$shellcheck_stub")
+assert_status "the widened lint set still succeeds" 0 "$(status_of "$result")"
+if [ -s "$STUB_LOG" ]; then pass "the widened lint call leaves evidence"; else fail "the widened lint call leaves evidence" "the stub log is empty"; fi
+assert_contains "the set includes a new untracked script" "$(cat "$stub_log")" "tools/sloppy.sh"
+assert_lacks "an ignored shell file is absent" "$(cat "$stub_log")" "must-not-be-linted.sh"
+assert_lacks "a nested ignored shell file is absent" "$(cat "$stub_log")" "nested-must-not-be-linted.sh"
+
+export STUB_STATUS=1
+: >"$STUB_LOG"
+result=$(lane check-scripts "SHELLCHECK=$shellcheck_stub")
+assert_refused "a linter failure fails the lane" "$(status_of "$result")"
+export STUB_STATUS=0
+
+result=$(env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS -u BAZEL_FLAGS \
+	SHELLCHECK=/definitely/not/a/shellcheck \
+	make -C "$repo" --no-print-directory -n check-scripts 2>&1)
+assert_contains "an environment override leaves the Bazel default" "$result" \
+	"//bazel/third_party/shellcheck -- -x -P SCRIPTDIR --"
+assert_lacks "the environment override is not rendered" "$result" \
+	"/definitely/not/a/shellcheck"
+
+export REACHY_OBJDUMP=/diagnostic/override REACHY_BAZEL=/diagnostic/bazel
+result=$(make -C "$repo" --no-print-directory -n check-device 2>&1)
+unset REACHY_OBJDUMP REACHY_BAZEL
+assert_contains "the device gate clears its disassembler environment overrides" "$result" \
+	"env -u REACHY_OBJDUMP -u REACHY_BAZEL tools/assert-device-isa.sh"
+assert_contains "the device gate names its ISA sweep" "$result" \
+	"tools/assert-device-isa.sh"
+assert_lacks "the disassembler override is not rendered" "$result" \
+	"/diagnostic/override"
+assert_lacks "the bazel override is not rendered" "$result" \
+	"/diagnostic/bazel"
 
 tally

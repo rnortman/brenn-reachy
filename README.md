@@ -17,7 +17,8 @@ Bazel, and only Bazel. `make check` is the whole gate — the shell scripts' own
 self-checks, then `bazel test --config=lint //...` over every crate, every cog
 and every lint aspect. Nothing here uses `cargo` or `rustup`: the compiler, the
 third-party crates and the C++ sysroot all come out of the module graph, so a
-fresh clone needs bazelisk and shellcheck and nothing else. One Cargo manifest
+fresh clone needs bazelisk plus an ordinary Linux userland — bash, git, make,
+GNU coreutils, and tar/Python for the script self-checks — and nothing else. One Cargo manifest
 exists, `crates/motion-proto/Cargo.toml`, and it builds nothing here: it is the
 export surface for a Cargo workspace elsewhere that pins that crate by revision,
 held to the crate's `BUILD.bazel` by a gate test. The device binary is a
