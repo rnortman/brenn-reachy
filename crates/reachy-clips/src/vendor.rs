@@ -8,12 +8,19 @@
 //! is written to six decimal places, and nothing in that format is versioned or
 //! validated.
 //!
-//! What comes out the other side is one of our clips: per-channel **deltas**
-//! against the neutral reference, uniformly sampled at the tick rate, masked to
-//! the channels the recording actually moves. The conversion is where the two
-//! frame conventions are reconciled — the vendor's head pose is world-frame and
-//! yaw-independent while ours rides on the yawing body — and where a file that
-//! is not what it claims to be is refused rather than silently played.
+//! What comes out the other side is one of our clips: per-channel **deltas**,
+//! uniformly sampled at the tick rate, masked to the channels the recording
+//! actually moves. The conversion is where the two frame conventions are
+//! reconciled. The vendor's `head` is a world-frame pose and its `body_yaw` a
+//! separate absolute input; the stored head delta is body-frame, converted once
+//! here at each frame's own yaw. The head and antennas are **posed over the
+//! vendor's zero** — a numeric base of `neutral_head_pose()` and `[0, 0]` — so
+//! the recording plays as recorded from wherever they stand. Body yaw is
+//! **relative** to whatever the body holds, so the head keeps its recorded
+//! relationship to the body at any standing yaw, and a yaw that never moves is
+//! dropped without loss to that relationship; what is lost is the head's
+//! world-frame heading, which no clip has a claim to. A file that is not what
+//! it claims to be is refused rather than silently played.
 //!
 //! Everything here is pure: text in, document out. The reading, the writing and
 //! the directory walk belong to the importer binary.
@@ -33,7 +40,8 @@ use crate::envelope::ClipLimits;
 use reachy_motion::asset_name::check_asset_name;
 
 use crate::format::{
-    Channel, ChannelMask, Clip, ClipDoc, ClipError, DeltaFrame, FORMAT_VERSION, FrameDoc,
+    BaseDoc, Channel, ChannelMask, Clip, ClipDoc, ClipError, DeltaFrame, FORMAT_VERSION, FrameDoc,
+    HeadBaseDoc, NumericBaseDoc,
 };
 
 /// How far a recorded rotation block may sit from orthonormal and still be
@@ -211,7 +219,7 @@ pub enum ImportError {
     },
 
     /// The converted clip does not load — it leaves the envelope over the
-    /// neutral base it was recorded against, or its frames admit no speed.
+    /// vendor zero it is posed at, or its frames admit no speed.
     #[error("the converted clip does not load: {source}")]
     Unloadable {
         /// The loader's own refusal.
@@ -277,7 +285,8 @@ struct Sample {
 /// The loader is the validator: it is the same code the daemon runs, so a file
 /// this accepts is a file that loads, and import-time and load-time validation
 /// cannot drift. A recording is refused for a frame the envelope refuses over
-/// the neutral base or an antenna angle no goal register holds, and for nothing
+/// the vendor zero its head and antennas are posed at, or an antenna angle no
+/// goal register holds, and for nothing
 /// about its speed — how fast a recording moves is a property of the recording,
 /// not a claim this machine judges.
 pub fn convert(
@@ -310,9 +319,8 @@ pub fn convert(
     // The ramps are left unsaid rather than set to the default, because a
     // recording states no blend intent and a stated ramp longer than the clip is
     // refused; omitted, the default is capped at the clip's own length instead.
-    // The written document comes from the loaded clip.
     let asked = ClipDoc {
-        base: None,
+        base: vendor_zero_base(mask),
         version: FORMAT_VERSION,
         kind: "clip".to_owned(),
         name: name.to_owned(),
@@ -592,14 +600,16 @@ fn resample(times: &[f64], samples: &[Sample]) -> Vec<Sample> {
     out
 }
 
-/// One resampled frame as a masked delta against the neutral reference.
+/// One resampled frame as a masked delta against the vendor zero, which is the
+/// neutral head pose.
 ///
 /// The head takes two steps and both are forced. The vendor's pose is
 /// world-frame and independent of the body's yaw, while ours rides on the
 /// yawing body, so the pose is first re-expressed in the body frame at that
 /// frame's own yaw — skip that and every recorded turn drags the head around
 /// with it, which is not what the recording did. What is left is the delta
-/// against neutral, so a recording that does nothing stores zeros.
+/// against the vendor zero, which is the neutral head pose, so a recording
+/// that does nothing stores zeros.
 fn delta(sample: &Sample, mask: ChannelMask) -> DeltaFrame {
     let head = mask.contains(Channel::Head).then(|| {
         let body = world_to_body(&sample.head_world, sample.body_yaw);
@@ -610,6 +620,36 @@ fn delta(sample: &Sample, mask: ChannelMask) -> DeltaFrame {
         antennas: mask.contains(Channel::Antennas).then_some(sample.antennas),
         body_yaw: mask.contains(Channel::BodyYaw).then_some(sample.body_yaw),
     }
+}
+
+/// The one-line statement of [`vendor_zero_base`]'s rule, for a report header:
+/// which channels an import poses, over what, and which it leaves relative.
+pub const POSED_OVER: &str = "posed: head and antennas over the vendor zero; body yaw relative";
+
+/// The base an imported clip is posed over: the vendor's own zero — head at
+/// the neutral head pose, antennas at zero — for whichever of those two
+/// channels the mask drives, and never body yaw.
+///
+/// The vendor's frames are absolute over that zero (identity is the standing
+/// head, an antenna angle is the angle), so posing there plays the recording
+/// as recorded from wherever the head and antennas stand. Yaw stays relative:
+/// the head delta is already body-frame at each frame's own yaw, so the
+/// head/body relationship is the recording's at any standing yaw, and posing
+/// yaw would snap the body to the vendor's heading on every cue. A mask with
+/// neither channel — yaw alone — gets no base: an overlay is spelled by its
+/// absence, and an empty numeric base is a refusal.
+fn vendor_zero_base(mask: ChannelMask) -> Option<BaseDoc> {
+    let posed =
+        mask.intersection(ChannelMask::of(Channel::Head).union(ChannelMask::of(Channel::Antennas)));
+    (!posed.is_empty()).then(|| {
+        BaseDoc::Numeric(NumericBaseDoc {
+            head: posed
+                .contains(Channel::Head)
+                .then_some(HeadBaseDoc::NEUTRAL),
+            body_yaw: None,
+            antennas: posed.contains(Channel::Antennas).then_some([0.0, 0.0]),
+        })
+    })
 }
 
 /// [`DeltaFrame`]'s own document form is private to the format module, and
@@ -660,6 +700,7 @@ fn unknown_keys(doc: &VendorMove) -> Vec<String> {
 mod tests {
     use super::*;
 
+    use crate::format::BaseLabel;
     use nalgebra::Vector3;
     use serde_json::json;
 
@@ -942,7 +983,9 @@ mod tests {
         );
     }
 
-    /// Antenna angles pass through as deltas, since the neutral pair is zero.
+    /// Antenna angles pass through unchanged: the antennas are posed over the
+    /// vendor's zero, so the stored delta is the vendor's absolute angle and the
+    /// loaded clip's antenna target equals it.
     #[test]
     fn antenna_angles_pass_through_as_deltas_right_then_left() {
         let json = recording(
@@ -969,6 +1012,122 @@ mod tests {
             vec![Channel::Head],
             "the head never moved and the antennas did",
         );
+        assert!(import.clip.posed_channels().contains(Channel::Antennas));
+        assert_eq!(
+            import.clip.base().expect("posed").targets().antennas,
+            [0.0, 0.0]
+        );
+    }
+
+    /// A recording that moves head and antennas is posed on both, over the
+    /// neutral head pose and antennas at zero, and the written base carries
+    /// exactly those two keys.
+    #[test]
+    fn a_recording_that_moves_head_and_antennas_is_posed_on_both_over_the_vendor_zero() {
+        let json = recording(
+            0.1,
+            vec![
+                frame(identity(), [0.0, 0.0], Some(0.0)),
+                frame(lifted(0.01), [0.3, -0.2], Some(0.0)),
+            ],
+        );
+        let import = convert(
+            &json,
+            "pollen/test/both",
+            &ClipLimits::default(),
+            &ImportOptions::default(),
+        )
+        .expect("a centimetre of lift and a small antenna swing load");
+
+        assert_eq!(
+            import.doc().channels,
+            vec![Channel::Head, Channel::Antennas]
+        );
+        let mut both = ChannelMask::of(Channel::Head);
+        both.insert(Channel::Antennas);
+        assert_eq!(import.clip.posed_channels(), both);
+        let base = import.clip.base().expect("posed");
+        assert_eq!(base.label(), BaseLabel::Numeric);
+        assert_eq!(base.targets().head_pose_body, neutral_head_pose());
+        assert_eq!(base.targets().antennas, [0.0, 0.0]);
+        assert_eq!(
+            import.doc().base,
+            Some(BaseDoc::Numeric(NumericBaseDoc {
+                head: Some(HeadBaseDoc::NEUTRAL),
+                body_yaw: None,
+                antennas: Some([0.0, 0.0]),
+            })),
+        );
+    }
+
+    /// A recording that moves head and yaw is posed on the head alone: yaw
+    /// stays relative, and its frames still carry the recorded yaw.
+    #[test]
+    fn a_recording_that_moves_head_and_yaw_poses_the_head_only() {
+        let json = recording(
+            0.5,
+            vec![
+                frame(identity(), [0.0, 0.0], Some(0.0)),
+                frame(identity(), [0.0, 0.0], Some(0.2)),
+            ],
+        );
+        let import = convert(
+            &json,
+            "pollen/test/turn_posed",
+            &ClipLimits::default(),
+            &ImportOptions::default(),
+        )
+        .expect("a fifth of a radian is well inside the yaw limits");
+
+        assert_eq!(import.doc().channels, vec![Channel::Head, Channel::BodyYaw]);
+        assert_eq!(import.clip.posed_channels(), ChannelMask::of(Channel::Head));
+        assert_eq!(
+            import.doc().base,
+            Some(BaseDoc::Numeric(NumericBaseDoc {
+                head: Some(HeadBaseDoc::NEUTRAL),
+                body_yaw: None,
+                antennas: None,
+            })),
+        );
+        let last = import.clip.frames().last().expect("frames");
+        assert_eq!(last.body_yaw, Some(0.2), "yaw is in the clip, relative");
+    }
+
+    /// A recording whose only moving channel is body yaw imports as an
+    /// overlay: there is no head or antenna channel to pose, and an empty
+    /// numeric base is not an overlay's spelling.
+    ///
+    /// The head turns with the body, so in the body frame it stands still and
+    /// the default mask is yaw alone.
+    #[test]
+    fn a_recording_that_moves_only_yaw_imports_as_an_overlay() {
+        let turn: f64 = 0.2;
+        let (sin, cos) = turn.sin_cos();
+        let turned = vec![
+            vec![cos, -sin, 0.0, 0.0],
+            vec![sin, cos, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        let json = recording(
+            0.5,
+            vec![
+                frame(identity(), [0.0, 0.0], Some(0.0)),
+                frame(turned, [0.0, 0.0], Some(turn)),
+            ],
+        );
+        let import = convert(
+            &json,
+            "pollen/test/sway",
+            &ClipLimits::default(),
+            &ImportOptions::default(),
+        )
+        .expect("a fifth of a radian is well inside the yaw limits");
+
+        assert_eq!(import.doc().channels, vec![Channel::BodyYaw]);
+        assert!(import.clip.base().is_none());
+        assert!(import.clip.posed_channels().is_empty());
+        assert_eq!(import.doc().base, None);
     }
 
     /// Non-uniform timestamps are resampled onto the tick grid, and what the
@@ -1474,7 +1633,7 @@ mod tests {
         assert!(import.clip.notes().is_empty(), "{:?}", import.clip.notes());
     }
 
-    /// A frame outside the envelope over the neutral base refuses the file,
+    /// A frame outside the envelope over the vendor zero refuses the file,
     /// naming the frame and what it failed.
     #[test]
     fn a_frame_outside_the_envelope_refuses_the_file() {

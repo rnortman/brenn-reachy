@@ -30,7 +30,9 @@ use anyhow::{Context as _, bail};
 use reachy_clips::envelope::ClipLimits;
 use reachy_clips::files::{DOCUMENT_EXT, Descend, document_paths};
 use reachy_clips::format::ChannelMask;
-use reachy_clips::vendor::{Import, ImportError, ImportOptions, ROTATION_DRIFT_NOTED, convert};
+use reachy_clips::vendor::{
+    Import, ImportError, ImportOptions, POSED_OVER, ROTATION_DRIFT_NOTED, convert,
+};
 
 /// The sound files the vendor ships beside a recording, in the order their own
 /// reader prefers them.
@@ -59,9 +61,10 @@ fn usage() -> String {
      \x20 --report FILE    write the report here as well as saying it\n\
      \x20 --source TEXT    what the recordings are, for the report header\n\
      \n\
-     The report's header carries the prefix, the mask override and the source,\n\
-     and no path: it is committed to a public tree, so no line of it names a\n\
-     place on this machine. A recording it names is named relative to --input.\n\
+     The report's header carries the prefix, the frame the clips are posed in,\n\
+     the mask override and the source, and no path: it is committed to a public\n\
+     tree, so no line of it names a place on this machine. A recording it names\n\
+     is named relative to --input.\n\
      \n\
      Each clip is named <prefix>/<file stem>. A sound file sharing a recording's\n\
      stem is copied verbatim beside the clip for a future audio surface; nothing\n\
@@ -72,6 +75,13 @@ fn usage() -> String {
      playback. The override names the channels to drive instead: any the\n\
      recording states, still or moving, and never one it moves and the mask\n\
      would drop.\n\
+     \n\
+     The vendor's head pose is world-frame; the clip stores it body-frame at each\n\
+     frame's recorded yaw. The head and antennas are posed over the vendor's own\n\
+     zero (neutral head, antennas at 0), so they play as recorded from wherever\n\
+     they stand; body yaw is left relative to whatever the body holds, and a yaw\n\
+     that never moves is dropped without changing the head's relationship to the\n\
+     body.\n\
      \n\
      A refused recording is a recorded outcome, not a process failure: the\n\
      summary line and the report say which and why. The exit status is 1 only\n\
@@ -130,7 +140,8 @@ fn mask(list: &str) -> anyhow::Result<ChannelMask> {
 
 /// The report header: what this run was, so the file beside the clips answers
 /// "where did these come from" without a scrollback. It carries the prefix, the
-/// mask override when there was one, and the source — and no path.
+/// frame the clips are posed in, the mask override when there was one, and the
+/// source — and no path.
 ///
 /// `--source` is free text because the provenance of a directory on a disk is
 /// not derivable from the directory: the operator fetched it and knows the
@@ -141,6 +152,7 @@ fn header(args: &Args) -> Vec<String> {
     let mut lines = vec![
         "reachy-clip-import".to_owned(),
         format!("--prefix {}", args.prefix),
+        POSED_OVER.to_owned(),
     ];
     if let Some(channels) = args.channels {
         let named: Vec<&str> = channels.iter().map(|channel| channel.as_str()).collect();
@@ -653,6 +665,7 @@ mod tests {
             );
         }
         let (head, body) = text.split_once("\n\n").expect("a header and a body");
+        assert!(head.contains(POSED_OVER), "{head}");
         assert!(
             !head.contains("--input") && !head.contains("--output"),
             "{head}"

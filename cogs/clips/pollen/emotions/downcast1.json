@@ -2,6 +2,25 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/emotions/downcast1",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "antennas": [
+      0.0,
+      0.0
+    ]
+  },
   "description": "A longer movement that shows discouragement or sadness. You can also use it as a sad no",
   "channels": [
     "head",

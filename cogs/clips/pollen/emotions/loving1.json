@@ -2,6 +2,25 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/emotions/loving1",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "antennas": [
+      0.0,
+      0.0
+    ]
+  },
   "description": "A gesture used when someone compliments you, or you want to show you really like what’s being offered. Also usable when someone says goodbye or it was nice talking to you.",
   "channels": [
     "head",

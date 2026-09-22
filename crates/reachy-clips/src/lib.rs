@@ -6,7 +6,10 @@
 //! not where the robot *is*, which is the whole difference from the vendor
 //! model this replaces: a nod is a pitch excursion that can ride whatever the
 //! robot is already doing, and an antennas-only wiggle says nothing at all
-//! about the head.
+//! about the head. A clip may also carry a **base** — a pose name, or numeric
+//! per-channel targets — and the channels the base covers are *posed*:
+//! composed toward the base plus the delta rather than added to whatever
+//! stands.
 //!
 //! That makes playback a composition rather than a takeover. Something else
 //! produces the base target each tick — today a posture timeline, later a

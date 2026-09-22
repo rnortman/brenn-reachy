@@ -2,6 +2,25 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/emotions/no_excited1",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "antennas": [
+      0.0,
+      0.0
+    ]
+  },
   "description": "An animated negative response, for example, when you don’t want to do something but want to explain it playfully.",
   "channels": [
     "head",

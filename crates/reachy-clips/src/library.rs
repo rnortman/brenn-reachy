@@ -761,7 +761,7 @@ fn flatten(
             if !clip.mask().contains(channel) {
                 continue;
             }
-            let is_posed = clip.anchor().is_some();
+            let is_posed = clip.posed_channels().contains(channel);
             if is_posed {
                 posed.get_or_insert(segment.clip.as_str());
             } else {
@@ -1030,6 +1030,64 @@ mod tests {
                 }
                 other => panic!("unexpected skip: {other:?}"),
             }
+        }
+    }
+
+    /// Provenance is per channel: a clip posing its head and leaving its yaw
+    /// relative sequences with a yaw overlay, and conflicts only with a clip
+    /// that poses the yaw.
+    #[test]
+    fn partially_posed_clips_flatten_with_relative_clips_on_their_relative_channels() {
+        let head_posed = format!(
+            r#"{{"version": 1, "kind": "clip", "name": "pod/head-posed",
+                 "base": {{"head": {{"dt": [0.0, 0.0, 0.0], "dq": [1.0, 0.0, 0.0, 0.0]}}}},
+                 "channels": ["head", "body_yaw"], "frame_hz": {FLOOR_TICK_HZ},
+                 "frames": [{{"dt": [0.0, 0.0, 0.001], "dq": [1.0, 0.0, 0.0, 0.0], "body_yaw": 0.0}}]}}"#
+        );
+        let yaw = |name: &str, base: &str| {
+            format!(
+                r#"{{"version": 1, "kind": "clip", "name": "{name}",{base}
+                     "channels": ["body_yaw"], "frame_hz": {FLOOR_TICK_HZ},
+                     "frames": [{{"body_yaw": 0.1}}]}}"#
+            )
+        };
+        let docs = [
+            ("a.json", head_posed),
+            ("b.json", yaw("pod/yaw-relative", "")),
+            ("c.json", yaw("pod/yaw-posed", r#" "base": "neutral","#)),
+            (
+                "relative.json",
+                sequence_json(
+                    "pod/with-relative",
+                    r#"{"ref":"pod/head-posed"},{"ref":"pod/yaw-relative"}"#,
+                ),
+            ),
+            (
+                "posed.json",
+                sequence_json(
+                    "pod/with-posed",
+                    r#"{"ref":"pod/head-posed"},{"ref":"pod/yaw-posed"}"#,
+                ),
+            ),
+        ];
+        let (library, skips) =
+            Library::load_resolved(docs, &limits(), |_| Some(JointTargets::default()));
+        assert!(library.motion("pod/with-relative").is_some());
+        assert_eq!(skips.len(), 1, "exactly the yaw-posed sequence: {skips:?}");
+        let skip = &skips[0];
+        assert_eq!(skip.name.as_deref(), Some("pod/with-posed"));
+        match &skip.error {
+            LoadError::Resolve(ResolveError::MixedProvenance {
+                channel,
+                posed,
+                unposed,
+                ..
+            }) => {
+                assert_eq!(*channel, Channel::BodyYaw);
+                assert_eq!(posed, "pod/yaw-posed");
+                assert_eq!(unposed, "pod/head-posed");
+            }
+            other => panic!("unexpected skip: {other:?}"),
         }
     }
 

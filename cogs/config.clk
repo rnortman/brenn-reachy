@@ -415,29 +415,42 @@ schema ClipConfig
         // The frame track, in time order. Never empty.
         #4 frames: VarArray<ClipFrame, 1024>;
 
-        // Whether the clip was authored over a named pose. When false, the
-        // remaining fields are deterministic placeholders; when true, they
-        // are the complete absolute anchor targets.
-        #5 has_anchor: Bool;
-        // Absolute anchor head translation x, metres.
+        // The channels whose anchor fields below are authored, in the same
+        // joint-set-bit encoding as `mask`; a subset of `mask`. Zero for an
+        // overlay, which is composed relative to whatever stands. A channel
+        // with its bits here is posed: composition folds it toward the
+        // anchor plus the frame delta rather than adding the delta to the
+        // standing base.
+        #5 posed_mask: UInt16;
+        // Anchor head translation x, metres; read only when the head is in
+        // posed_mask, a deterministic placeholder otherwise.
         #6 anchor_head_dx: Float64;
-        // Absolute anchor head translation y, metres.
+        // Anchor head translation y, metres; read only when the head is in
+        // posed_mask, a deterministic placeholder otherwise.
         #7 anchor_head_dy: Float64;
-        // Absolute anchor head translation z, metres.
+        // Anchor head translation z, metres; read only when the head is in
+        // posed_mask, a deterministic placeholder otherwise.
         #8 anchor_head_dz: Float64;
-        // Absolute anchor head quaternion w.
+        // Anchor head quaternion w; read only when the head is in
+        // posed_mask, a deterministic placeholder otherwise.
         #9 anchor_head_qw: Float64;
-        // Absolute anchor head quaternion x.
+        // Anchor head quaternion x; read only when the head is in
+        // posed_mask, a deterministic placeholder otherwise.
         #10 anchor_head_qx: Float64;
-        // Absolute anchor head quaternion y.
+        // Anchor head quaternion y; read only when the head is in
+        // posed_mask, a deterministic placeholder otherwise.
         #11 anchor_head_qy: Float64;
-        // Absolute anchor head quaternion z.
+        // Anchor head quaternion z; read only when the head is in
+        // posed_mask, a deterministic placeholder otherwise.
         #12 anchor_head_qz: Float64;
-        // Absolute anchor body yaw, radians.
+        // Anchor body yaw, radians; read only when body yaw is in
+        // posed_mask, a deterministic placeholder otherwise.
         #13 anchor_body_yaw: Float64;
-        // Absolute right antenna angle, radians.
+        // Anchor right antenna angle, radians; read only when the antennas
+        // are in posed_mask, a deterministic placeholder otherwise.
         #14 anchor_antenna_right: Float64;
-        // Absolute left antenna angle, radians.
+        // Anchor left antenna angle, radians; read only when the antennas
+        // are in posed_mask, a deterministic placeholder otherwise.
         #15 anchor_antenna_left: Float64;
     }
 }

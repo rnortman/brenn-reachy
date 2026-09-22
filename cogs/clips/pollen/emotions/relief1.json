@@ -2,6 +2,25 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/emotions/relief1",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "antennas": [
+      0.0,
+      0.0
+    ]
+  },
   "description": "When a stressful or difficult situation is finally resolved.",
   "channels": [
     "head",

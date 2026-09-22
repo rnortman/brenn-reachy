@@ -2,6 +2,25 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/emotions/disgusted1",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "antennas": [
+      0.0,
+      0.0
+    ]
+  },
   "description": "A movement you use when you feel disgusted. It could be because someone offers you food or worse, a drink.",
   "channels": [
     "head",

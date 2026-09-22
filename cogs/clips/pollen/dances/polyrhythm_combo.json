@@ -2,6 +2,25 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/dances/polyrhythm_combo",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "antennas": [
+      0.0,
+      0.0
+    ]
+  },
   "description": "A 3-beat sway and a 2-beat nod create a polyrhythmic feel.",
   "channels": [
     "head",

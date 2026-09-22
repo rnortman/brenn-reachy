@@ -537,7 +537,9 @@ mod tests {
     use reachy_clips::compose::{ChannelWeights, OverlayAnchors, OverlaySample};
     use reachy_clips::config::write_clip;
     use reachy_clips::envelope::ClipLimits;
-    use reachy_clips::format::{Channel, ChannelMask, Clip, ClipDoc, DeltaFrame, FrameDoc};
+    use reachy_clips::format::{
+        BaseDoc, Channel, ChannelMask, Clip, ClipDoc, DeltaFrame, FrameDoc,
+    };
     use reachy_motion::joints::JointTargets;
 
     use reachy_motion::joints::JointRef;
@@ -567,7 +569,7 @@ mod tests {
         };
         let posed = Clip::from_doc_resolved(
             ClipDoc {
-                base: Some("posed".to_owned()),
+                base: Some(BaseDoc::Named("posed".to_owned())),
                 version: 1,
                 kind: "clip".to_owned(),
                 name: "posed-head".to_owned(),
@@ -693,7 +695,7 @@ mod tests {
         };
         let clip = Clip::from_doc_resolved(
             ClipDoc {
-                base: Some("posed".to_owned()),
+                base: Some(BaseDoc::Named("posed".to_owned())),
                 version: 1,
                 kind: "clip".to_owned(),
                 name: "posed-antennas".to_owned(),

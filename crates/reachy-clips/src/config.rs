@@ -44,7 +44,6 @@ use brenn_reachy__cogs__config_clk_rs::{
 use brenn_reachy__motion__joints_clk_rs::{JointFlags, JointFlagsWire};
 use nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 use reachy_motion::FLOOR_TICK_HZ;
-use reachy_motion::joints::JointTargets;
 use reachy_motion::joints::{JointGroup, flags};
 use thiserror::Error;
 
@@ -87,6 +86,22 @@ pub enum ClipViewError {
     UnknownMaskBits {
         /// What the field held.
         bits: u16,
+    },
+
+    /// `posed_mask` names bits that are not a union of whole channel groups.
+    #[error("posed_mask bits {bits:#x} are not a union of whole channel groups")]
+    UnknownPosedMaskBits {
+        /// What the field held.
+        bits: u16,
+    },
+
+    /// `posed_mask` poses a channel the mask does not drive.
+    #[error("posed_mask {posed:#x} poses channels outside mask {mask:#x}")]
+    PosedOutsideMask {
+        /// What `posed_mask` held.
+        posed: u16,
+        /// What `mask` held.
+        mask: u16,
     },
 
     /// The mask is empty: a clip that drives nothing.
@@ -270,6 +285,15 @@ pub fn mask_from_bits(bits: u16) -> Result<ChannelMask, ClipViewError> {
     Ok(mask)
 }
 
+/// A `posed_mask` field back to the posed channels: zero is an overlay, and
+/// anything else must be a union of whole channel groups.
+pub fn posed_mask_from_bits(bits: u16) -> Result<ChannelMask, ClipViewError> {
+    if bits == 0 {
+        return Ok(ChannelMask::empty());
+    }
+    mask_from_bits(bits).map_err(|_| ClipViewError::UnknownPosedMaskBits { bits })
+}
+
 /// Write `clip` into `out`, replacing whatever it held.
 ///
 /// The emitter's half of the mapping. Fallible only on the one thing a loaded
@@ -286,11 +310,8 @@ pub fn write_clip(clip: &Clip, out: &mut ClipConfig) -> Result<(), LibraryWriteE
     out.frame_rate_hz = FLOOR_TICK_HZ;
     out.blend_in_ms = clip.blend_in_ms();
     out.blend_out_ms = clip.blend_out_ms();
-    let anchor = clip
-        .anchor()
-        .map(|anchor| anchor.targets())
-        .unwrap_or_default();
-    out.has_anchor = clip.anchor().is_some().into();
+    let anchor = clip.base().map(|base| base.targets()).unwrap_or_default();
+    out.posed_mask = joint_mask_bits(clip.posed_channels());
     let q = anchor.head_pose_body.rotation.quaternion();
     out.anchor_head_dx = anchor.head_pose_body.translation.vector.x;
     out.anchor_head_dy = anchor.head_pose_body.translation.vector.y;
@@ -956,7 +977,7 @@ impl<'a> MotionView<'a> {
             }
             for channel in Channel::ALL {
                 if clip.mask().contains(channel) {
-                    let posed = clip.anchor().is_some();
+                    let posed = clip.posed_channels().contains(channel);
                     if let Some((first_segment, first_provenance)) = provenance[channel.index()]
                         && first_provenance != posed
                     {
@@ -1080,6 +1101,8 @@ pub struct ClipView<'a> {
     clip: &'a ClipConfig,
     /// What it drives, decoded once.
     mask: ChannelMask,
+    /// Which of those it poses, decoded once.
+    posed: ChannelMask,
 }
 
 impl<'a> ClipView<'a> {
@@ -1119,12 +1142,21 @@ impl<'a> ClipView<'a> {
     /// refused, which no handle it hands back answers with.
     fn established(clip: &'a ClipConfig) -> Self {
         let mask = mask_from_bits(clip.mask).expect("a mask the library walk decoded");
-        Self { clip, mask }
+        let posed =
+            posed_mask_from_bits(clip.posed_mask).expect("a posed mask the library walk decoded");
+        Self { clip, mask, posed }
     }
 
     /// The clip-level checks, which cost one read each.
     fn opened(clip: &'a ClipConfig) -> Result<Self, ClipViewError> {
         let mask = mask_from_bits(clip.mask)?;
+        let posed = posed_mask_from_bits(clip.posed_mask)?;
+        if !posed.is_subset_of(mask) {
+            return Err(ClipViewError::PosedOutsideMask {
+                posed: clip.posed_mask,
+                mask: clip.mask,
+            });
+        }
         if clip.frame_rate_hz != FLOOR_TICK_HZ {
             return Err(ClipViewError::FrameRate {
                 frame_rate_hz: clip.frame_rate_hz,
@@ -1133,7 +1165,7 @@ impl<'a> ClipView<'a> {
         if clip.frames.is_empty() {
             return Err(ClipViewError::NoFrames);
         }
-        if bool::from(clip.has_anchor) {
+        if posed.contains(Channel::Head) {
             let values = [
                 ("anchor_head_dx", clip.anchor_head_dx),
                 ("anchor_head_dy", clip.anchor_head_dy),
@@ -1142,15 +1174,8 @@ impl<'a> ClipView<'a> {
                 ("anchor_head_qx", clip.anchor_head_qx),
                 ("anchor_head_qy", clip.anchor_head_qy),
                 ("anchor_head_qz", clip.anchor_head_qz),
-                ("anchor_body_yaw", clip.anchor_body_yaw),
-                ("anchor_antenna_right", clip.anchor_antenna_right),
-                ("anchor_antenna_left", clip.anchor_antenna_left),
             ];
-            for (key, value) in values {
-                if !value.is_finite() {
-                    return Err(ClipViewError::AnchorNonFinite { key, value });
-                }
-            }
+            anchor_finite(&values)?;
             let norm = (clip.anchor_head_qw * clip.anchor_head_qw
                 + clip.anchor_head_qx * clip.anchor_head_qx
                 + clip.anchor_head_qy * clip.anchor_head_qy
@@ -1160,13 +1185,29 @@ impl<'a> ClipView<'a> {
                 return Err(ClipViewError::AnchorQuaternion { norm });
             }
         }
-        Ok(Self { clip, mask })
+        if posed.contains(Channel::BodyYaw) {
+            anchor_finite(&[("anchor_body_yaw", clip.anchor_body_yaw)])?;
+        }
+        if posed.contains(Channel::Antennas) {
+            anchor_finite(&[
+                ("anchor_antenna_right", clip.anchor_antenna_right),
+                ("anchor_antenna_left", clip.anchor_antenna_left),
+            ])?;
+        }
+        Ok(Self { clip, mask, posed })
     }
 
     /// The channels this clip drives.
     #[must_use]
     pub fn mask(&self) -> ChannelMask {
         self.mask
+    }
+
+    /// The channels this clip poses: composed toward its anchor rather than
+    /// added to whatever stands. Empty for an overlay.
+    #[must_use]
+    pub fn posed_channels(&self) -> ChannelMask {
+        self.posed
     }
 
     /// How many frames it has. Never zero.
@@ -1193,10 +1234,10 @@ impl<'a> ClipView<'a> {
         self.clip.blend_out_ms
     }
 
-    /// The authored head pose, if this clip carries one.
+    /// The authored head pose, if this clip poses the head.
     #[must_use]
     pub fn anchor_head(&self) -> Option<Isometry3<f64>> {
-        bool::from(self.clip.has_anchor).then(|| {
+        self.posed.contains(Channel::Head).then(|| {
             Isometry3::from_parts(
                 Translation3::new(
                     self.clip.anchor_head_dx,
@@ -1213,44 +1254,21 @@ impl<'a> ClipView<'a> {
         })
     }
 
-    /// The authored body yaw, if this clip carries one.
+    /// The authored body yaw, if this clip poses body yaw.
     #[must_use]
     pub fn anchor_body_yaw(&self) -> Option<f64> {
-        bool::from(self.clip.has_anchor).then_some(self.clip.anchor_body_yaw)
+        self.posed
+            .contains(Channel::BodyYaw)
+            .then_some(self.clip.anchor_body_yaw)
     }
 
-    /// The authored antenna angles, if this clip carries one.
+    /// The authored antenna angles, if this clip poses the antennas.
     #[must_use]
     pub fn anchor_antennas(&self) -> Option<[f64; 2]> {
-        bool::from(self.clip.has_anchor).then_some([
+        self.posed.contains(Channel::Antennas).then_some([
             self.clip.anchor_antenna_right,
             self.clip.anchor_antenna_left,
         ])
-    }
-
-    /// The absolute pose this clip was authored over, if present.
-    #[must_use]
-    pub fn anchor(&self) -> Option<JointTargets> {
-        bool::from(self.clip.has_anchor).then(|| JointTargets {
-            head_pose_body: Isometry3::from_parts(
-                Translation3::new(
-                    self.clip.anchor_head_dx,
-                    self.clip.anchor_head_dy,
-                    self.clip.anchor_head_dz,
-                ),
-                UnitQuaternion::from_quaternion(Quaternion::new(
-                    self.clip.anchor_head_qw,
-                    self.clip.anchor_head_qx,
-                    self.clip.anchor_head_qy,
-                    self.clip.anchor_head_qz,
-                )),
-            ),
-            body_yaw: self.clip.anchor_body_yaw,
-            antennas: [
-                self.clip.anchor_antenna_right,
-                self.clip.anchor_antenna_left,
-            ],
-        })
     }
 
     /// Frame `frame` of the clip.
@@ -1301,7 +1319,7 @@ pub fn track_fingerprint(view: &ClipView<'_>) -> u64 {
     hash.eat(&[mask_bits(view.mask())]);
     hash.eat(&view.blend_in_ms().to_le_bytes());
     hash.eat(&view.blend_out_ms().to_le_bytes());
-    hash.eat(&[bool::from(view.clip.has_anchor) as u8]);
+    hash.eat(&view.clip.posed_mask.to_le_bytes());
     for value in [
         view.clip.anchor_head_dx,
         view.clip.anchor_head_dy,
@@ -1387,6 +1405,14 @@ fn mask_bits(mask: ChannelMask) -> u8 {
     bits
 }
 
+/// Refuse the first anchor field that is not a finite number.
+fn anchor_finite(values: &[(&'static str, f64)]) -> Result<(), ClipViewError> {
+    match values.iter().find(|(_, value)| !value.is_finite()) {
+        Some(&(key, value)) => Err(ClipViewError::AnchorNonFinite { key, value }),
+        None => Ok(()),
+    }
+}
+
 /// Every value of one frame, against the mask that says which of them mean
 /// anything: finite where the mask names the channel, zero where it does not.
 fn check_frame(index: usize, frame: &ClipFrame, mask: ChannelMask) -> Result<(), ClipViewError> {
@@ -1433,7 +1459,7 @@ mod tests {
     use brenn_reachy__cogs__config_clk_rs::{ClipConfigWire, ClipLibraryConfigWire};
 
     use crate::envelope::ClipLimits;
-    use crate::format::{ClipDoc, FrameDoc};
+    use crate::format::{BaseDoc, ClipDoc, FrameDoc, HeadBaseDoc, NumericBaseDoc};
 
     /// The machine's own bounds: what is under test here is the crossing.
     fn limits() -> ClipLimits {
@@ -1575,27 +1601,14 @@ mod tests {
             antennas: [0.31, -0.42],
         };
         let doc = ClipDoc {
-            base: Some("neutral".to_owned()),
+            base: Some(BaseDoc::Named("neutral".to_owned())),
             ..all_channels_doc("posed", 1)
         };
         let clip =
             Clip::from_doc_resolved(doc, &limits(), |_| Some(source)).expect("posed clip loads");
         let message = configured(&clip);
         let view = ClipView::new(valid(&message)).expect("configured anchor validates");
-        let anchor = view.anchor().expect("anchor");
-        assert_eq!(
-            anchor.head_pose_body.translation.vector,
-            source.head_pose_body.translation.vector
-        );
-        assert!(
-            anchor
-                .head_pose_body
-                .rotation
-                .angle_to(&source.head_pose_body.rotation)
-                < 1e-12
-        );
-        assert_eq!(anchor.body_yaw, source.body_yaw);
-        assert_eq!(anchor.antennas, source.antennas);
+        assert_eq!(view.posed_channels(), ChannelMask::all());
         let head = view.anchor_head().expect("head anchor accessor");
         assert_eq!(
             head.translation.vector,
@@ -1608,6 +1621,13 @@ mod tests {
         changed.set_anchor_body_yaw(0.2);
         let changed_view = ClipView::new(valid(&changed)).expect("changed anchor validates");
         assert_ne!(track_fingerprint(&view), track_fingerprint(&changed_view));
+        let mut overlay = message.clone();
+        overlay.set_posed_mask(0);
+        let overlay_view = ClipView::new(valid(&overlay)).expect("an unposed clip validates");
+        assert_ne!(track_fingerprint(&view), track_fingerprint(&overlay_view));
+        assert_eq!(overlay_view.anchor_head(), None);
+        assert_eq!(overlay_view.anchor_body_yaw(), None);
+        assert_eq!(overlay_view.anchor_antennas(), None);
         let mut invalid = message.clone();
         invalid.set_anchor_head_dx(f64::NAN);
         assert!(matches!(
@@ -1619,6 +1639,77 @@ mod tests {
         assert!(matches!(
             ClipView::new(valid(&non_unit)),
             Err(ClipViewError::AnchorQuaternion { .. })
+        ));
+    }
+
+    #[test]
+    fn posed_mask_decodes_and_is_refused_when_partial_or_outside_the_mask() {
+        assert_eq!(posed_mask_from_bits(0), Ok(ChannelMask::empty()));
+        let one_leg = flags::iter(JointGroup::Legs.joints())
+            .next()
+            .expect("legs are joints");
+        let mut set = JointFlags::NONE;
+        flags::insert(&mut set, one_leg);
+        let bits = JointFlagsWire::from(set).0;
+        assert_eq!(
+            posed_mask_from_bits(bits),
+            Err(ClipViewError::UnknownPosedMaskBits { bits })
+        );
+        let mut partial = configured(&load(all_channels_doc("partial", 2)));
+        partial.set_posed_mask(bits);
+        assert_eq!(
+            refused(ClipView::new(valid(&partial))),
+            Err(ClipViewError::UnknownPosedMaskBits { bits })
+        );
+
+        let mut message = configured(&load(antenna_doc("antennas", 2)));
+        let head = joint_mask_bits(ChannelMask::of(Channel::Head));
+        message.set_posed_mask(head);
+        assert_eq!(
+            refused(ClipView::new(valid(&message))),
+            Err(ClipViewError::PosedOutsideMask {
+                posed: head,
+                mask: joint_mask_bits(ChannelMask::of(Channel::Antennas)),
+            })
+        );
+    }
+
+    #[test]
+    fn anchor_accessors_answer_exactly_for_the_posed_channels() {
+        let doc = ClipDoc {
+            base: Some(BaseDoc::Numeric(NumericBaseDoc {
+                head: Some(HeadBaseDoc {
+                    dt: [0.0, 0.0, 0.005],
+                    dq: [1.0, 0.0, 0.0, 0.0],
+                }),
+                ..NumericBaseDoc::default()
+            })),
+            ..all_channels_doc("head-posed", 2)
+        };
+        let message = configured(&load(doc));
+        let view = ClipView::new(valid(&message)).expect("a head-posed clip validates");
+        assert_eq!(view.posed_channels(), ChannelMask::of(Channel::Head));
+        let head = view.anchor_head().expect("head anchor accessor");
+        let want = reachy_kin::neutral_head_pose().translation.vector
+            + nalgebra::Vector3::new(0.0, 0.0, 0.005);
+        assert!((head.translation.vector - want).norm() < 1e-12, "{head:?}");
+        assert!(
+            head.rotation
+                .angle_to(&reachy_kin::neutral_head_pose().rotation)
+                < 1e-12
+        );
+        assert_eq!(view.anchor_body_yaw(), None);
+        assert_eq!(view.anchor_antennas(), None);
+
+        let mut placeholder = message.clone();
+        placeholder.set_anchor_antenna_right(f64::NAN);
+        ClipView::new(valid(&placeholder)).expect("an unposed placeholder is not read");
+
+        let mut posed = message;
+        posed.set_anchor_head_dx(f64::NAN);
+        assert!(matches!(
+            ClipView::new(valid(&posed)),
+            Err(ClipViewError::AnchorNonFinite { key, .. }) if key == "anchor_head_dx"
         ));
     }
 
@@ -2494,7 +2585,7 @@ mod tests {
             .validate_mut()
             .expect("the written library validates");
         let clip = checked.clips.get_mut(1).expect("the second clip");
-        clip.has_anchor = true.into();
+        clip.posed_mask = clip.mask;
         clip.anchor_head_qw = 1.0;
         let library = valid_library(&message);
         let refusal = ValidatedLibrary::of(library).expect_err("mixed provenance is refused");

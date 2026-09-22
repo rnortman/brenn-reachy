@@ -35,6 +35,15 @@ antenna centre is the concrete case for a future motion-system frame model. The
 existing world/body yaw seam remains behaviorally unchanged until that design
 cycle decides the frame vocabulary and transforms.
 
+A second concrete case: a clip head authored in the world frame and held
+against a moving body, the vendor's own convention. It cannot be baked at
+emit for head content played over whatever yaw the body holds — the standing
+yaw is only known at the tick — so it needs a compositor frame branch, a load
+screen that no longer checks the head at one yaw, and a hand-back story when
+the body moved during the window. The working 55° relative-yaw cap bounds how
+far such a gaze hold can follow a body turn; `collision-envelope` is the work
+that could widen it.
+
 ## play-mirrored
 
 Add a mirrored play invocation whose spatial map is head translation y -> -y,

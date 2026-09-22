@@ -2,6 +2,25 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/dances/chin_lead",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "antennas": [
+      0.0,
+      0.0
+    ]
+  },
   "description": "A forward motion led by the chin, combining translation and pitch.",
   "channels": [
     "head",

@@ -2,6 +2,21 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/emotions/helpful1",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
   "description": "You use it when you're happy to help or contribute.",
   "channels": [
     "head",

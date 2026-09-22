@@ -2,6 +2,25 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/dances/chicken_peck",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "antennas": [
+      0.0,
+      0.0
+    ]
+  },
   "description": "A sharp, forward, chicken-like pecking motion.",
   "channels": [
     "head",

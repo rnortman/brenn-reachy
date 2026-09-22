@@ -2,6 +2,21 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/emotions/thoughtful1",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
   "description": "You look up as if searching for a new idea, especially in complex or uncertain situations.",
   "channels": [
     "head"

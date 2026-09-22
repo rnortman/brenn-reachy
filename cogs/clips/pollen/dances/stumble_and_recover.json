@@ -2,6 +2,25 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/dances/stumble_and_recover",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "antennas": [
+      0.0,
+      0.0
+    ]
+  },
   "description": "A simulated stumble and recovery with multiple axis movements. Good vibes",
   "channels": [
     "head",

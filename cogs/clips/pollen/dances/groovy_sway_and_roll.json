@@ -2,6 +2,25 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/dances/groovy_sway_and_roll",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "antennas": [
+      0.0,
+      0.0
+    ]
+  },
   "description": "A side-to-side sway combined with a corresponding roll for a groovy effect.",
   "channels": [
     "head",

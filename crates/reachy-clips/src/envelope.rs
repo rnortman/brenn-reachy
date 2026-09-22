@@ -1,9 +1,10 @@
 //! The import-time envelope walk: what a clip's frames have to satisfy before
 //! the clip loads at all.
 //!
-//! One pass over the frame track. Unposed frames are screened over a **static
-//! neutral base**; posed frames use their declared base only for the channels
-//! they drive. Two questions per frame, both geometric:
+//! One pass over the frame track. The reference is chosen per channel from the
+//! base's posed mask: a posed channel is screened over the base's own target,
+//! and a channel the base does not pose — every channel of an overlay — over a
+//! **static neutral base**. Two questions per frame, both geometric:
 //!
 //! - does a frame that drives head or body yaw pass the coupled head envelope
 //!   check — reachable, every crank inside its travel window, clear of the
@@ -37,7 +38,7 @@ use reachy_motion::{ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD, MotionConfig};
 use thiserror::Error;
 
 use crate::compose::interpolate_pose;
-use crate::format::DeltaFrame;
+use crate::format::{BaseLabel, Channel, ClipBase, DeltaFrame};
 
 /// The bounds a clip is checked against.
 ///
@@ -77,7 +78,8 @@ impl ClipLimits {
 /// and no playback makes it reachable.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum FrameError {
-    /// A frame's deltas, applied to the neutral base, leave the envelope.
+    /// A frame's deltas, screened over neutral — an overlay's frame, or a
+    /// channel the base does not pose — leave the envelope.
     #[error("frame {frame} leaves the envelope over the neutral base: {violations}")]
     Envelope {
         /// Which frame.
@@ -86,13 +88,15 @@ pub enum FrameError {
         violations: EnvelopeViolations,
     },
     /// A posed frame leaves the envelope over its authored base.
-    #[error("frame {frame} leaves the envelope over base {base:?}: {violations}")]
+    #[error("frame {frame} leaves the envelope over base {base}: {violations}")]
     AnchoredEnvelope {
         frame: usize,
-        base: String,
+        base: BaseLabel,
         violations: EnvelopeViolations,
     },
-    /// A frame asks an antenna for an angle no goal register represents.
+    /// A frame asks an antenna for an angle no goal register represents,
+    /// screened over neutral — an overlay's frame, or a channel the base does
+    /// not pose.
     #[error("frame {frame} commands antenna {side} to {angle} rad, which has no goal count")]
     AntennaGoal {
         /// Which frame.
@@ -104,11 +108,11 @@ pub enum FrameError {
     },
     /// A posed frame asks an antenna for an unrepresentable absolute angle.
     #[error(
-        "frame {frame} over base {base:?} commands antenna {side} to {angle} rad, which has no goal count"
+        "frame {frame} over base {base} commands antenna {side} to {angle} rad, which has no goal count"
     )]
     AnchoredAntennaGoal {
         frame: usize,
-        base: String,
+        base: BaseLabel,
         side: usize,
         angle: f64,
     },
@@ -125,13 +129,13 @@ pub enum FrameError {
 /// If `frames` is empty.
 pub fn check_frames(
     frames: &[DeltaFrame],
-    anchor: Option<&crate::format::ResolvedAnchor>,
+    base: Option<&ClipBase>,
     limits: &ClipLimits,
 ) -> Result<(), FrameError> {
     assert!(!frames.is_empty(), "a clip has frames");
 
     for (index, frame) in frames.iter().enumerate() {
-        check_frame(index, frame, anchor, limits)?;
+        check_frame(index, frame, base, limits)?;
     }
     Ok(())
 }
@@ -140,23 +144,48 @@ pub fn check_frames(
 fn check_frame(
     index: usize,
     frame: &DeltaFrame,
-    anchor: Option<&crate::format::ResolvedAnchor>,
+    base: Option<&ClipBase>,
     limits: &ClipLimits,
 ) -> Result<(), FrameError> {
-    let (base_name, base_head, base_yaw, base_antennas) = match anchor {
-        Some(anchor) => (
-            Some(anchor.name().to_owned()),
-            anchor.targets().head_pose_body,
-            anchor.targets().body_yaw,
-            anchor.targets().antennas,
-        ),
-        None => (None, neutral_head_pose(), 0.0, [0.0, 0.0]),
+    // The refusal names the base only for a channel the base poses; a channel
+    // screened over neutral is refused in the overlay's own words.
+    let antenna_label = base
+        .filter(|base| base.channels.contains(Channel::Antennas))
+        .map(ClipBase::label);
+    let pose_label = base
+        .filter(|base| {
+            base.channels.contains(Channel::Head) || base.channels.contains(Channel::BodyYaw)
+        })
+        .map(ClipBase::label);
+    let (base_head, base_yaw, base_antennas) = match base {
+        Some(base) => {
+            let posed = base.channels;
+            let targets = base.targets;
+            (
+                if posed.contains(Channel::Head) {
+                    targets.head_pose_body
+                } else {
+                    neutral_head_pose()
+                },
+                if posed.contains(Channel::BodyYaw) {
+                    targets.body_yaw
+                } else {
+                    0.0
+                },
+                if posed.contains(Channel::Antennas) {
+                    targets.antennas
+                } else {
+                    [0.0, 0.0]
+                },
+            )
+        }
+        None => (neutral_head_pose(), 0.0, [0.0, 0.0]),
     };
     if let Some(antennas) = frame.antennas {
         for (side, delta) in antennas.iter().enumerate() {
             let angle = base_antennas[side] + delta;
             if !(ANTENNA_GOAL_MIN_RAD..=ANTENNA_GOAL_MAX_RAD).contains(&angle) {
-                return Err(match base_name {
+                return Err(match antenna_label {
                     Some(base) => FrameError::AnchoredAntennaGoal {
                         frame: index,
                         base,
@@ -190,7 +219,7 @@ fn check_frame(
         &mut report,
     ) {
         Ok(()) => Ok(()),
-        Err(error) => Err(match base_name {
+        Err(error) => Err(match pose_label {
             Some(base) => FrameError::AnchoredEnvelope {
                 frame: index,
                 base,
@@ -207,6 +236,7 @@ fn check_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::{BaseSource, ChannelMask, HeadBaseDoc, NumericBaseDoc};
     use nalgebra::{Translation3, UnitQuaternion, Vector3};
 
     /// An antennas-only frame.
@@ -328,46 +358,173 @@ mod tests {
         ));
     }
 
+    /// A base over `channels` carrying `targets`, labelled `name`.
+    fn named_base(
+        name: &str,
+        channels: ChannelMask,
+        targets: reachy_motion::JointTargets,
+    ) -> ClipBase {
+        ClipBase {
+            source: BaseSource::Named(name.to_owned()),
+            channels,
+            targets,
+        }
+    }
+
     #[test]
     fn posed_screening_checks_only_driven_channels_and_their_coupled_base() {
         let invalid_head = reachy_kin::geometry::rest_head_pose();
-        let antenna_anchor = crate::format::ResolvedAnchor {
-            name: "antennas-only".to_owned(),
-            targets: reachy_motion::JointTargets {
+        let antenna_base = named_base(
+            "antennas-only",
+            ChannelMask::of(Channel::Antennas),
+            reachy_motion::JointTargets {
                 head_pose_body: invalid_head,
                 antennas: [0.0, 0.0],
                 ..Default::default()
             },
-        };
+        );
         check_frames(
             &[antennas(0.0, 0.0)],
-            Some(&antenna_anchor),
+            Some(&antenna_base),
             &ClipLimits::default(),
         )
-        .expect("an antennas-only frame does not screen the anchor head");
+        .expect("an antennas-only frame does not screen the base head");
 
-        let head_anchor = crate::format::ResolvedAnchor {
-            name: "head-only".to_owned(),
-            targets: reachy_motion::JointTargets {
+        let head_base = named_base(
+            "head-only",
+            ChannelMask::of(Channel::Head),
+            reachy_motion::JointTargets {
                 antennas: [ANTENNA_GOAL_MAX_RAD, ANTENNA_GOAL_MIN_RAD],
                 ..Default::default()
             },
-        };
-        check_frames(&[lift(0.0)], Some(&head_anchor), &ClipLimits::default())
-            .expect("a head-only frame does not screen anchor antennas");
+        );
+        check_frames(&[lift(0.0)], Some(&head_base), &ClipLimits::default())
+            .expect("a head-only frame does not screen base antennas");
 
-        let yaw_anchor = crate::format::ResolvedAnchor {
-            name: "yaw-only".to_owned(),
-            targets: reachy_motion::JointTargets {
+        let yaw_base = named_base(
+            "yaw-only",
+            ChannelMask::of(Channel::Head).union(ChannelMask::of(Channel::BodyYaw)),
+            reachy_motion::JointTargets {
                 head_pose_body: invalid_head,
                 ..Default::default()
             },
-        };
-        let error = check_frames(&[yaw(0.0)], Some(&yaw_anchor), &ClipLimits::default())
-            .expect_err("yaw drives the coupled head check using its anchor head");
+        );
+        let error = check_frames(&[yaw(0.0)], Some(&yaw_base), &ClipLimits::default())
+            .expect_err("yaw drives the coupled head check using its posed base head");
         assert!(matches!(
             error,
-            FrameError::AnchoredEnvelope { frame: 0, base, .. } if base == "yaw-only"
+            FrameError::AnchoredEnvelope { frame: 0, base, .. }
+                if base == BaseLabel::Named("yaw-only".to_owned())
+        ));
+    }
+
+    /// A channel the base does not pose is screened over neutral, exactly as an
+    /// overlay's is, whatever placeholder the base carries for it.
+    #[test]
+    fn a_channel_the_base_does_not_pose_is_screened_over_neutral() {
+        let targets = reachy_motion::JointTargets {
+            head_pose_body: reachy_kin::geometry::rest_head_pose(),
+            ..Default::default()
+        };
+        let yaw_posed = named_base("yaw", ChannelMask::of(Channel::BodyYaw), targets);
+        check_frames(&[yaw(0.0)], Some(&yaw_posed), &ClipLimits::default())
+            .expect("the unposed head is screened at neutral");
+
+        let head_and_yaw_posed = named_base(
+            "yaw",
+            ChannelMask::of(Channel::Head).union(ChannelMask::of(Channel::BodyYaw)),
+            targets,
+        );
+        let error = check_frames(
+            &[yaw(0.0)],
+            Some(&head_and_yaw_posed),
+            &ClipLimits::default(),
+        )
+        .expect_err("the posed head is screened at the base head");
+        assert!(matches!(
+            error,
+            FrameError::AnchoredEnvelope { frame: 0, .. }
+        ));
+
+        let antennas_posed = named_base(
+            "antennas",
+            ChannelMask::of(Channel::Antennas),
+            reachy_motion::JointTargets::default(),
+        );
+        let error = check_frames(
+            &[pitch(80.0)],
+            Some(&antennas_posed),
+            &ClipLimits::default(),
+        )
+        .expect_err("the unposed head is screened at neutral and leaves the cone");
+        assert!(matches!(
+            error,
+            FrameError::Envelope { frame: 0, violations } if violations.cone
+        ));
+    }
+
+    /// Relative antennas are screened over zero beside a posed head, and a
+    /// base's refusal names the base only on the channels it poses.
+    #[test]
+    fn an_antenna_relative_frame_is_screened_over_zero_beside_a_posed_head() {
+        let head_posed = named_base(
+            "head",
+            ChannelMask::of(Channel::Head),
+            reachy_motion::JointTargets {
+                antennas: [ANTENNA_GOAL_MAX_RAD, 0.0],
+                ..Default::default()
+            },
+        );
+        let frame = DeltaFrame {
+            head: Some(Isometry3::identity()),
+            antennas: Some([0.1, 0.0]),
+            body_yaw: None,
+        };
+        check_frames(&[frame], Some(&head_posed), &ClipLimits::default())
+            .expect("the relative antennas are screened over zero");
+        let past = DeltaFrame {
+            head: Some(Isometry3::identity()),
+            antennas: Some([ANTENNA_GOAL_MAX_RAD + 0.1, 0.0]),
+            body_yaw: None,
+        };
+        let error = check_frames(&[past], Some(&head_posed), &ClipLimits::default())
+            .expect_err("the relative antenna is past its goal range over zero");
+        assert!(matches!(
+            error,
+            FrameError::AntennaGoal { frame: 0, side: 0, angle }
+                if (angle - (ANTENNA_GOAL_MAX_RAD + 0.1)).abs() < 1e-12
+        ));
+
+        let rest = reachy_kin::geometry::rest_head_pose();
+        let relative = neutral_head_pose().inverse() * rest;
+        let q = relative.rotation.quaternion();
+        let numeric = ClipBase {
+            source: BaseSource::Numeric(NumericBaseDoc {
+                head: Some(HeadBaseDoc {
+                    dt: [
+                        relative.translation.vector.x,
+                        relative.translation.vector.y,
+                        relative.translation.vector.z,
+                    ],
+                    dq: [q.w, q.i, q.j, q.k],
+                }),
+                ..Default::default()
+            }),
+            channels: ChannelMask::of(Channel::Head),
+            targets: reachy_motion::JointTargets {
+                head_pose_body: rest,
+                ..Default::default()
+            },
+        };
+        let error = check_frames(&[lift(0.0)], Some(&numeric), &ClipLimits::default())
+            .expect_err("the numeric base head is outside the envelope");
+        assert!(matches!(
+            error,
+            FrameError::AnchoredEnvelope {
+                frame: 0,
+                base: BaseLabel::Numeric,
+                ..
+            }
         ));
     }
 

@@ -750,7 +750,7 @@ fn print_library(library: &ClipLibraryConfig, clips: &Numbering, motions: &Numbe
         let _ = writeln!(out, "  frame_rate_hz: {}", number(clip.frame_rate_hz));
         let _ = writeln!(out, "  blend_in_ms: {}", clip.blend_in_ms);
         let _ = writeln!(out, "  blend_out_ms: {}", clip.blend_out_ms);
-        let _ = writeln!(out, "  has_anchor: {}", clip.has_anchor);
+        let _ = writeln!(out, "  posed_mask: {}", clip.posed_mask);
         let _ = writeln!(out, "  anchor_head_dx: {}", number(clip.anchor_head_dx));
         let _ = writeln!(out, "  anchor_head_dy: {}", number(clip.anchor_head_dy));
         let _ = writeln!(out, "  anchor_head_dz: {}", number(clip.anchor_head_dz));
@@ -866,8 +866,11 @@ mod tests {
     use std::sync::OnceLock;
 
     use brenn_reachy__cogs__config_clk_rs::ClipFrameWire;
-    use reachy_clips::config::{MAX_MOTIONS, MAX_SEGMENTS};
-    use reachy_clips::format::{Channel, ClipDoc, document_kind};
+    use reachy_clips::config::{MAX_MOTIONS, MAX_SEGMENTS, joint_mask_bits};
+    use reachy_clips::format::{
+        BaseDoc, BaseLabel, Channel, ChannelMask, ClipDoc, HeadBaseDoc, document_kind,
+    };
+    use reachy_kin::neutral_head_pose;
     use reachy_scratch::scratch_dir;
 
     use super::probe_clips::Pose;
@@ -994,6 +997,17 @@ mod tests {
             .collect()
     }
 
+    /// The printed block of the clip filed under `name`, from its `# name`
+    /// comment to its closing brace.
+    fn emitted_clip_block<'t>(textproto: &'t str, name: &str) -> &'t str {
+        let opening = format!("\n# {name}\nclips {{\n");
+        let start = textproto
+            .find(&opening)
+            .unwrap_or_else(|| panic!("{name} is emitted"));
+        let block = &textproto[start + opening.len()..];
+        &block[..block.find("\n}").expect("the block closes")]
+    }
+
     /// The committed clip documents, keyed by the names scripts invoke.
     fn documents_by_name() -> &'static BTreeMap<String, ClipDoc> {
         static DOCUMENTS: OnceLock<BTreeMap<String, ClipDoc>> = OnceLock::new();
@@ -1097,7 +1111,7 @@ mod tests {
         let limits = ClipLimits::default();
         let left = Clip::from_doc(left_doc, &limits).expect("wave_left loads");
         let right = Clip::from_doc(right_doc, &limits).expect("wave_right loads");
-        assert!(left.anchor().is_none() && right.anchor().is_none());
+        assert!(left.base().is_none() && right.base().is_none());
         assert!(left.mask().contains(Channel::Antennas));
         assert!(right.mask().contains(Channel::Antennas));
         for (index, (left_frame, right_frame)) in
@@ -1164,7 +1178,7 @@ mod tests {
         let doc = document("hello_wave");
         assert_eq!(doc.version, 1);
         assert_eq!(doc.name, "hello_wave");
-        assert_eq!(doc.base.as_deref(), Some("neutral"));
+        assert_eq!(doc.base, Some(BaseDoc::Named("neutral".to_owned())));
         assert_eq!(doc.channels, vec![Channel::Head, Channel::Antennas]);
         assert_eq!(doc.frame_hz, 50.0);
         assert_eq!(doc.blend_in_ms, Some(200));
@@ -1189,12 +1203,18 @@ mod tests {
         })
         .expect("hello_wave resolves and passes the envelope screen");
         assert_eq!(
-            clip.anchor().expect("posed clip has an anchor").name(),
-            "neutral"
+            clip.base().expect("posed clip has a base").label(),
+            BaseLabel::Named("neutral".to_owned())
         );
         assert_eq!(
-            clip.anchor().expect("posed clip has an anchor").targets(),
+            clip.base().expect("posed clip has a base").targets(),
             neutral
+        );
+        assert_eq!(clip.posed_channels(), clip.mask());
+        assert!(
+            emitted_clip_block(&baseline().textproto, "hello_wave")
+                .contains(&format!("  posed_mask: {}\n", joint_mask_bits(clip.mask()))),
+            "hello_wave is emitted posed on its whole mask"
         );
 
         let expected_dt = [
@@ -1269,7 +1289,7 @@ mod tests {
         assert_eq!(doc.version, 1);
         assert_eq!(doc.kind, "clip");
         assert_eq!(doc.name, "dance");
-        assert_eq!(doc.base.as_deref(), Some("neutral"));
+        assert_eq!(doc.base, Some(BaseDoc::Named("neutral".to_owned())));
         assert!(
             doc.description
                 .as_deref()
@@ -1335,12 +1355,18 @@ mod tests {
         })
         .expect("dance resolves and passes the envelope screen");
         assert_eq!(
-            clip.anchor().expect("posed clip has an anchor").name(),
-            "neutral"
+            clip.base().expect("posed clip has a base").label(),
+            BaseLabel::Named("neutral".to_owned())
         );
         assert_eq!(
-            clip.anchor().expect("posed clip has an anchor").targets(),
+            clip.base().expect("posed clip has a base").targets(),
             neutral
+        );
+        assert_eq!(clip.posed_channels(), clip.mask());
+        assert!(
+            emitted_clip_block(&baseline().textproto, "dance")
+                .contains(&format!("  posed_mask: {}\n", joint_mask_bits(clip.mask()))),
+            "dance is emitted posed on its whole mask"
         );
         let yaws: Vec<f64> = clip
             .frames()
@@ -1385,6 +1411,58 @@ mod tests {
         }));
     }
 
+    /// Every imported vendor clip is posed over the vendor zero on the head and
+    /// antenna channels it drives — and only those — and never on yaw.
+    #[test]
+    fn every_vendor_clip_is_posed_on_head_and_antennas_over_the_vendor_zero() {
+        let emitted = baseline();
+        let mut seen = 0usize;
+        for (name, doc) in documents_by_name() {
+            if !name.starts_with("pollen/") {
+                continue;
+            }
+            seen += 1;
+            let clip = Clip::from_doc(doc.clone(), &ClipLimits::default()).expect("loads");
+            let expected = clip.mask().intersection(
+                ChannelMask::of(Channel::Head).union(ChannelMask::of(Channel::Antennas)),
+            );
+            assert!(
+                !expected.is_empty(),
+                "{name} drives neither head nor antennas"
+            );
+            assert_eq!(clip.posed_channels(), expected, "{name}");
+            let base = clip.base().expect("posed");
+            assert_eq!(base.label(), BaseLabel::Numeric, "{name}");
+            let targets = base.targets();
+            assert_eq!(targets.head_pose_body, neutral_head_pose(), "{name}");
+            assert_eq!(targets.antennas, [0.0, 0.0], "{name}");
+            match &doc.base {
+                Some(BaseDoc::Numeric(numeric)) => {
+                    assert_eq!(
+                        numeric.head,
+                        expected
+                            .contains(Channel::Head)
+                            .then_some(HeadBaseDoc::NEUTRAL),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        numeric.antennas.is_some(),
+                        expected.contains(Channel::Antennas),
+                        "{name}"
+                    );
+                    assert_eq!(numeric.body_yaw, None, "{name} poses yaw");
+                }
+                other => panic!("{name}: base is {other:?}, not numeric"),
+            }
+            let block = emitted_clip_block(&emitted.textproto, name);
+            assert!(
+                block.contains(&format!("  posed_mask: {}\n", joint_mask_bits(expected))),
+                "{name}: {block}"
+            );
+        }
+        assert_eq!(seen, 68, "the committed vendor library");
+    }
+
     #[test]
     fn emit_bakes_a_supplied_pose_and_refuses_an_absent_one() {
         let pose = &poses()[0];
@@ -1400,7 +1478,13 @@ mod tests {
         .unwrap();
         let emitted = emit(&[("synthetic.json".to_owned(), document)], poses())
             .expect("supplied pose resolves");
-        assert!(emitted.textproto.contains("has_anchor: true"));
+        let posed_mask = joint_mask_bits(ChannelMask::of(Channel::Antennas));
+        assert_ne!(posed_mask, 0);
+        assert!(
+            emitted
+                .textproto
+                .contains(&format!("posed_mask: {posed_mask}"))
+        );
         let expected = pose.targets();
         for (key, value) in [
             (

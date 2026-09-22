@@ -2837,10 +2837,11 @@ fn assert_committed_antenna_stream(
     max_frame_excursion: Option<f64>,
 ) {
     let (clip, library) = committed_motion(name);
-    let anchor = clip
-        .anchor()
-        .expect("the committed clip is posed")
-        .targets();
+    assert!(
+        clip.posed_channels().contains(ClipChannel::Antennas),
+        "the committed clip poses its antennas"
+    );
+    let anchor = clip.base().expect("the committed clip is posed").targets();
     let authored: [Vec<f64>; 2] = core::array::from_fn(|side| {
         clip.frames()
             .iter()

@@ -1059,7 +1059,9 @@ mod tests {
         ClipLimits::default()
     }
 
-    use crate::format::{ClipDoc, DEFAULT_BLEND_MS, FrameDoc};
+    use crate::format::{
+        BaseDoc, ClipDoc, DEFAULT_BLEND_MS, FrameDoc, HeadBaseDoc, NumericBaseDoc,
+    };
 
     const TICK: Duration = Duration::from_millis(20);
 
@@ -1097,7 +1099,7 @@ mod tests {
             version: 1,
             kind: "clip".to_owned(),
             name: name.to_owned(),
-            base: Some("neutral".to_owned()),
+            base: Some(BaseDoc::Named("neutral".to_owned())),
             description: None,
             channels: vec![Channel::Antennas],
             frame_hz: FLOOR_TICK_HZ,
@@ -1163,7 +1165,7 @@ mod tests {
                     })
                     .collect(),
             };
-            doc.base = Some("neutral".to_owned());
+            doc.base = Some(BaseDoc::Named("neutral".to_owned()));
             doc
         };
         let anchor = JointTargets {
@@ -2595,7 +2597,7 @@ mod tests {
         let mut row = Row::new();
         let mut player = row.play(track.view(), 1.0);
         let samples = run(&mut player, 40);
-        let expected = posed.anchor().expect("posed anchor").targets();
+        let expected = posed.base().expect("posed base").targets();
         let mut saw_fade = false;
         for sample in &samples {
             if sample.weights.get(Channel::Head) > 0.0 {
@@ -2613,5 +2615,46 @@ mod tests {
                 .iter()
                 .any(|sample| sample.weights.get(Channel::Head) == 0.0)
         );
+    }
+
+    #[test]
+    fn driving_anchors_anchor_only_the_posed_channels() {
+        let doc = ClipDoc {
+            version: 1,
+            kind: "clip".to_owned(),
+            name: "head-posed".to_owned(),
+            base: Some(BaseDoc::Numeric(NumericBaseDoc {
+                head: Some(HeadBaseDoc::NEUTRAL),
+                ..NumericBaseDoc::default()
+            })),
+            description: None,
+            channels: vec![Channel::Head, Channel::BodyYaw],
+            frame_hz: FLOOR_TICK_HZ,
+            blend_in_ms: Some(0),
+            blend_out_ms: Some(0),
+            frames: [0.0, 0.001]
+                .iter()
+                .map(|value| FrameDoc {
+                    dt: Some([0.0, 0.0, *value]),
+                    dq: Some([1.0, 0.0, 0.0, 0.0]),
+                    body_yaw: Some(*value),
+                    ..FrameDoc::default()
+                })
+                .collect(),
+        };
+        let clip = Clip::from_doc(doc, &limits()).expect("head-posed clip is valid");
+        let track = Track::of(&clip);
+        let mut row = Row::new();
+        let mut player = row.play(track.view(), 1.0);
+        let samples = run(&mut player, 10);
+        let mut saw_head = false;
+        for sample in &samples {
+            if sample.weights.get(Channel::Head) > 0.0 {
+                saw_head = true;
+                assert_eq!(sample.anchors.head, Some(reachy_kin::neutral_head_pose()));
+                assert_eq!(sample.anchors.body_yaw, None);
+            }
+        }
+        assert!(saw_head, "the clip drove its head");
     }
 }

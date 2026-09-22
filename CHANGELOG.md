@@ -11,6 +11,32 @@ Nothing has been released.
 
 ### Changed
 
+- **The imported vendor library is posed over the vendor's zero.** Every
+  `pollen/*` clip now carries a numeric base: head at the neutral head pose
+  and antennas at zero, for whichever of those two channels it drives; body
+  yaw stays relative to whatever the body holds. The head plays as the vendor
+  recorded it from wherever the head stands — a clip cued from a non-neutral
+  presence pose no longer plays the vendor's dip from there — and the
+  antennas play the vendor's angles as recorded, 10° inboard of what they
+  played as overlays over `neutral`'s lean; that difference on the library
+  tour is the correction, not a regression. Frames are unchanged; only the
+  `base` key was added.
+
+- **Clip bases are per channel and may be numeric.** A clip's `base` — the
+  pose its frames are authored over — is now either a pose name (every masked
+  channel posed, as before) or an object with `head`, `body_yaw` and
+  `antennas` keys whose presence declares the posed channels; masked channels
+  the base omits stay relative. The runtime asset carries a `posed_mask`
+  bit-field in place of the former `has_anchor` boolean.
+
+- **The imported vendor library is current with the envelope.** The clearance
+  floor was re-derived twice since the library was last imported and nobody
+  re-ran the import. Four more vendor recordings now convert —
+  `boredom2`, `dance3`, `uncertain1` and `uncomfortable1` — and about forty
+  refusals name the violation the current envelope finds rather than the
+  margin the older floor did. The 64 previously committed clips are
+  byte-identical. None of the four has been played on hardware yet.
+
 - **Gate tooling is hermetic.** The module graph pins and fetches ShellCheck so
   hooks and CI share a ruleset; the ISA sweep uses the pinned toolchain's
   `llvm-objdump` instead of PATH; host ShellCheck is no longer a prerequisite;

@@ -9,6 +9,10 @@
 //!   agree exactly, every number is finite, every rotation is a unit
 //!   quaternion, and the frame rate is the tick rate.
 //!
+//! A clip's base is a pose name or a per-channel numeric object; the keys a
+//! numeric base carries are the clip's posed channels, and a name poses every
+//! masked channel.
+//!
 //! Nothing constructs a [`Clip`] except [`Clip::from_doc`] and its JSON
 //! wrapper, so a `Clip` in hand is an asset that has already been refused the
 //! chance to be malformed. Playback never re-checks a frame's shape; it indexes
@@ -22,9 +26,10 @@
 use std::fmt;
 
 use nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
+use reachy_kin::neutral_head_pose;
 use reachy_motion::FLOOR_TICK_HZ;
 use reachy_motion::asset_name::{AssetNameError, check_asset_name};
 use reachy_motion::joints::JointTargets;
@@ -228,6 +233,24 @@ impl ChannelMask {
         out
     }
 
+    /// The mask driving only the channels both of these do.
+    #[must_use]
+    pub fn intersection(self, other: Self) -> Self {
+        let mut out = Self::empty();
+        for channel in Channel::ALL {
+            if self.contains(channel) && other.contains(channel) {
+                out.insert(channel);
+            }
+        }
+        out
+    }
+
+    /// Whether every channel this mask drives, `other` drives too.
+    #[must_use]
+    pub fn is_subset_of(self, other: Self) -> bool {
+        self.iter().all(|channel| other.contains(channel))
+    }
+
     /// Whether no channel at all is driven.
     #[must_use]
     pub fn is_empty(self) -> bool {
@@ -334,12 +357,28 @@ pub enum ClipError {
         source: AssetNameError,
     },
 
+    /// A numeric base poses a channel the clip does not drive.
+    #[error("clip base poses {channel}, which is not in the mask")]
+    BaseChannelUnmasked { channel: Channel },
+
     /// The authored base name is not a usable asset name.
     #[error("clip base name {name:?} is unusable: {source}")]
     BaseName {
         name: String,
         source: AssetNameError,
     },
+
+    /// A numeric base with no keys: an overlay is spelled by omitting `base`.
+    #[error("clip base poses no channel; omit `base` for an overlay")]
+    BaseNoChannels,
+
+    /// A base figure that is not a finite number.
+    #[error("clip base key {key:?} is not finite")]
+    BaseNonFinite { key: &'static str },
+
+    /// A base head rotation too far from unit length to be one.
+    #[error("clip base head rotation has norm {norm}, further than {QUAT_NORM_TOL} from unit")]
+    BaseQuaternion { norm: f64 },
 
     /// The authored base is not among the poses supplied to the loader.
     #[error("clip base {name:?} is not a named pose")]
@@ -474,6 +513,123 @@ pub struct FrameDoc {
     pub body_yaw: Option<f64>,
 }
 
+/// What a clip's deltas are authored over: a pose name, or the numbers themselves.
+///
+/// Serialised untagged: the name as a bare string, the numbers as an object.
+/// Deserialised by hand rather than untagged, so a malformed object reports
+/// its own error — the misspelt key, the short array — instead of serde's
+/// "did not match any variant".
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum BaseDoc {
+    /// A named pose, posing every channel the clip masks.
+    Named(String),
+    /// Numeric targets, posing exactly the channels they carry.
+    Numeric(NumericBaseDoc),
+}
+
+impl<'de> Deserialize<'de> for BaseDoc {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(BaseDocVisitor)
+    }
+}
+
+/// A string is a pose name; a map is a numeric base; anything else is refused.
+struct BaseDocVisitor;
+
+impl<'de> serde::de::Visitor<'de> for BaseDocVisitor {
+    type Value = BaseDoc;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a pose name or a per-channel base object")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<BaseDoc, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(BaseDoc::Named(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<BaseDoc, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(BaseDoc::Named(value))
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<BaseDoc, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        NumericBaseDoc::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            .map(BaseDoc::Numeric)
+    }
+}
+
+/// The numeric base: one key per posed channel, in the pose document's
+/// vocabulary. A key set to `null` is refused at parse: a channel is left
+/// relative by omitting its key.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NumericBaseDoc {
+    /// The head, relative to the neutral head pose.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub head: Option<HeadBaseDoc>,
+    /// Body yaw, radians, absolute.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub body_yaw: Option<f64>,
+    /// Antenna angles, right then left, radians, absolute.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub antennas: Option<[f64; 2]>,
+}
+
+/// Read a base key that is present. `null` is refused rather than read as
+/// absent: a key that is there poses its channel, and a null one poses
+/// nothing an author could mean — omitting the key is how a channel is
+/// left relative.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// The head half of a numeric base, relative to the neutral head pose.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeadBaseDoc {
+    /// Translation, metres, in the neutral head's frame.
+    pub dt: [f64; 3],
+    /// Rotation as a unit quaternion, `[w, x, y, z]`.
+    pub dq: [f64; 4],
+}
+
+impl HeadBaseDoc {
+    /// The head standing at the neutral head pose: no translation, identity
+    /// rotation. In the base's own convention that is the vendor zero.
+    pub const NEUTRAL: Self = Self {
+        dt: [0.0, 0.0, 0.0],
+        dq: [1.0, 0.0, 0.0, 0.0],
+    };
+}
+
 /// A clip as written on disk.
 ///
 /// Unknown keys are refused. The format is ours end to end — every writer of it
@@ -490,9 +646,11 @@ pub struct ClipDoc {
     pub kind: String,
     /// The library name this asset is invoked by.
     pub name: String,
-    /// The named pose this clip was authored over, if it is a posed clip.
+    /// What the frames are authored over, if this is a posed clip: a pose
+    /// name, posing every masked channel, or a numeric object whose keys are
+    /// the posed channels. Absent for an overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base: Option<String>,
+    pub base: Option<BaseDoc>,
     /// Free text, carried from the recording or written by the author.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -627,25 +785,67 @@ pub struct Clip {
     blend_in_ms: u32,
     blend_out_ms: u32,
     frames: Vec<DeltaFrame>,
-    anchor: Option<ResolvedAnchor>,
+    base: Option<ClipBase>,
     notes: Vec<ClipNote>,
 }
 
-/// The validated pose a clip's deltas were authored over.
+/// How a base was written, for messages that name what a frame was checked
+/// over.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BaseLabel {
+    /// A named pose.
+    Named(String),
+    /// A numeric base carried in the clip itself.
+    Numeric,
+}
+
+impl fmt::Display for BaseLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Named(name) => f.write_str(name),
+            Self::Numeric => f.write_str("numeric"),
+        }
+    }
+}
+
+/// What a base was written as: the name it resolves through, or the
+/// validated numeric document itself. `Clip::to_doc` writes this back
+/// unchanged; `ClipBase::targets` is what it resolves to.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ResolvedAnchor {
-    pub(crate) name: String,
+pub(crate) enum BaseSource {
+    Named(String),
+    Numeric(NumericBaseDoc),
+}
+
+/// The validated base a clip's posed channels are composed toward.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClipBase {
+    pub(crate) source: BaseSource,
+    /// The posed channels: non-empty, and within the clip's mask.
+    pub(crate) channels: ChannelMask,
+    /// Absolute targets, meaningful on `channels`; `JointTargets::default()`
+    /// placeholders on every other channel.
     pub(crate) targets: JointTargets,
 }
 
-impl ResolvedAnchor {
-    /// The authored pose name.
+impl ClipBase {
+    /// How the base was written, for messages.
     #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn label(&self) -> BaseLabel {
+        match &self.source {
+            BaseSource::Named(name) => BaseLabel::Named(name.clone()),
+            BaseSource::Numeric(_) => BaseLabel::Numeric,
+        }
     }
 
-    /// The absolute pose baked into the runtime asset.
+    /// The channels this base poses.
+    #[must_use]
+    pub fn channels(&self) -> ChannelMask {
+        self.channels
+    }
+
+    /// The absolute targets baked into the runtime asset; read only on
+    /// [`Self::channels`].
     #[must_use]
     pub fn targets(&self) -> JointTargets {
         self.targets
@@ -754,27 +954,29 @@ impl Clip {
             return Err(ClipError::NoFrames);
         }
 
-        let anchor = match doc.base.as_deref() {
+        let base = match doc.base {
             None => None,
-            Some(name) => {
-                check_asset_name(name).map_err(|source| ClipError::BaseName {
-                    name: name.to_owned(),
+            Some(BaseDoc::Named(name)) => {
+                check_asset_name(&name).map_err(|source| ClipError::BaseName {
+                    name: name.clone(),
                     source,
                 })?;
-                Some(ResolvedAnchor {
-                    name: name.to_owned(),
-                    targets: resolve(name).ok_or_else(|| ClipError::UnknownBase {
-                        name: name.to_owned(),
-                    })?,
+                let targets =
+                    resolve(&name).ok_or_else(|| ClipError::UnknownBase { name: name.clone() })?;
+                Some(ClipBase {
+                    source: BaseSource::Named(name),
+                    channels: mask,
+                    targets,
                 })
             }
+            Some(BaseDoc::Numeric(numeric)) => Some(numeric_base(&numeric, mask)?),
         };
         let mut frames = Vec::with_capacity(doc.frames.len());
         for (index, frame) in doc.frames.iter().enumerate() {
             frames.push(delta_frame(index, frame, mask)?);
         }
 
-        check_frames(&frames, anchor.as_ref(), limits)?;
+        check_frames(&frames, base.as_ref(), limits)?;
 
         let clip_ms = clip_duration_ms(frames.len());
         let blend_in_ms = authored_blend(doc.blend_in_ms, BlendEnd::In, clip_ms)?;
@@ -787,7 +989,7 @@ impl Clip {
             blend_in_ms,
             blend_out_ms,
             frames,
-            anchor,
+            base,
             notes: Vec::new(),
         })
     }
@@ -810,10 +1012,19 @@ impl Clip {
         self.mask
     }
 
-    /// The resolved authored base, if this is a posed clip.
+    /// The validated base, if this clip poses any channel.
     #[must_use]
-    pub fn anchor(&self) -> Option<&ResolvedAnchor> {
-        self.anchor.as_ref()
+    pub fn base(&self) -> Option<&ClipBase> {
+        self.base.as_ref()
+    }
+
+    /// The channels composed toward the base rather than added to whatever
+    /// stands; empty for an overlay.
+    #[must_use]
+    pub fn posed_channels(&self) -> ChannelMask {
+        self.base
+            .as_ref()
+            .map_or(ChannelMask::empty(), |base| base.channels)
     }
 
     /// What the load changed about this clip, in the order it changed it.
@@ -883,7 +1094,10 @@ impl Clip {
             version: FORMAT_VERSION,
             kind: CLIP_KIND.to_owned(),
             name: self.name.clone(),
-            base: self.anchor.as_ref().map(|anchor| anchor.name.clone()),
+            base: self.base.as_ref().map(|base| match &base.source {
+                BaseSource::Named(name) => BaseDoc::Named(name.clone()),
+                BaseSource::Numeric(doc) => BaseDoc::Numeric(doc.clone()),
+            }),
             description: self.description.clone(),
             channels: self.mask.iter().collect(),
             frame_hz: FLOOR_TICK_HZ,
@@ -1009,28 +1223,131 @@ fn keyed<T>(
     }
 }
 
-/// Convert one frame's head keys into a rigid delta.
+/// Which head key a rigid-delta refusal is about.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeadKey {
+    Dt,
+    Dq,
+}
+
+impl HeadKey {
+    /// The key as a frame writes it.
+    fn frame_key(self) -> &'static str {
+        match self {
+            Self::Dt => "dt",
+            Self::Dq => "dq",
+        }
+    }
+
+    /// The key as a numeric base writes it.
+    fn base_key(self) -> &'static str {
+        match self {
+            Self::Dt => "head.dt",
+            Self::Dq => "head.dq",
+        }
+    }
+}
+
+/// Why `dt`/`dq` did not make a rigid delta; the caller names the frame or the base.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RigidError {
+    NonFinite { key: HeadKey, value: f64 },
+    Quaternion { norm: f64 },
+}
+
+/// Convert `dt`/`dq` — metres and `[w, x, y, z]` — into a rigid delta.
 ///
 /// The quaternion is checked against unit length and then normalised: JSON's
 /// decimal round-trip leaves a rotation a few ulps off unit, which is a
 /// renormalisation, while anything past the tolerance is a number that was
 /// never a rotation.
-fn head_delta(index: usize, dt: [f64; 3], dq: [f64; 4]) -> Result<Isometry3<f64>, ClipError> {
-    for value in dt {
-        finite(index, "dt", value)?;
+fn rigid(dt: [f64; 3], dq: [f64; 4]) -> Result<Isometry3<f64>, RigidError> {
+    if let Some(value) = dt.into_iter().find(|value| !value.is_finite()) {
+        return Err(RigidError::NonFinite {
+            key: HeadKey::Dt,
+            value,
+        });
     }
-    for value in dq {
-        finite(index, "dq", value)?;
+    if let Some(value) = dq.into_iter().find(|value| !value.is_finite()) {
+        return Err(RigidError::NonFinite {
+            key: HeadKey::Dq,
+            value,
+        });
     }
     let quaternion = Quaternion::new(dq[0], dq[1], dq[2], dq[3]);
     let norm = quaternion.norm();
     if (norm - 1.0).abs() > QUAT_NORM_TOL {
-        return Err(ClipError::Quaternion { frame: index, norm });
+        return Err(RigidError::Quaternion { norm });
     }
     Ok(Isometry3::from_parts(
         Translation3::new(dt[0], dt[1], dt[2]),
         UnitQuaternion::from_quaternion(quaternion),
     ))
+}
+
+/// One frame's head keys as a rigid delta.
+fn head_delta(index: usize, dt: [f64; 3], dq: [f64; 4]) -> Result<Isometry3<f64>, ClipError> {
+    rigid(dt, dq).map_err(|error| match error {
+        RigidError::NonFinite { key, value } => ClipError::NonFinite {
+            frame: index,
+            key: key.frame_key(),
+            value,
+        },
+        RigidError::Quaternion { norm } => ClipError::Quaternion { frame: index, norm },
+    })
+}
+
+/// Validate a numeric base against the clip's mask and build its targets.
+///
+/// The keys present are the posed channels. The head is the pose document's
+/// convention — relative to the neutral head pose — composed onto that pose;
+/// its quaternion gets the frame rule: refused past [`QUAT_NORM_TOL`] from
+/// unit, normalised within it.
+fn numeric_base(doc: &NumericBaseDoc, mask: ChannelMask) -> Result<ClipBase, ClipError> {
+    let mut channels = ChannelMask::empty();
+    if doc.head.is_some() {
+        channels.insert(Channel::Head);
+    }
+    if doc.body_yaw.is_some() {
+        channels.insert(Channel::BodyYaw);
+    }
+    if doc.antennas.is_some() {
+        channels.insert(Channel::Antennas);
+    }
+    if channels.is_empty() {
+        return Err(ClipError::BaseNoChannels);
+    }
+    if let Some(channel) = channels.iter().find(|channel| !mask.contains(*channel)) {
+        return Err(ClipError::BaseChannelUnmasked { channel });
+    }
+
+    let mut targets = JointTargets::default();
+    if let Some(head) = &doc.head {
+        let relative = rigid(head.dt, head.dq).map_err(|error| match error {
+            RigidError::NonFinite { key, .. } => ClipError::BaseNonFinite {
+                key: key.base_key(),
+            },
+            RigidError::Quaternion { norm } => ClipError::BaseQuaternion { norm },
+        })?;
+        targets.head_pose_body = neutral_head_pose() * relative;
+    }
+    if let Some(body_yaw) = doc.body_yaw {
+        if !body_yaw.is_finite() {
+            return Err(ClipError::BaseNonFinite { key: "body_yaw" });
+        }
+        targets.body_yaw = body_yaw;
+    }
+    if let Some(antennas) = doc.antennas {
+        if !antennas.iter().all(|value| value.is_finite()) {
+            return Err(ClipError::BaseNonFinite { key: "antennas" });
+        }
+        targets.antennas = antennas;
+    }
+    Ok(ClipBase {
+        source: BaseSource::Numeric(doc.clone()),
+        channels,
+        targets,
+    })
 }
 
 /// Refuse a frame value that is not a finite number.
@@ -1156,24 +1473,27 @@ mod tests {
     #[test]
     fn posed_document_round_trips_and_refuses_bad_base_names() {
         let mut doc = full_doc();
-        doc.base = Some("neutral".to_owned());
+        doc.base = Some(BaseDoc::Named("neutral".to_owned()));
         let anchor = JointTargets::default();
         let clip = Clip::from_doc_resolved(doc.clone(), &limits(), |_| Some(anchor))
             .expect("posed document loads");
         let json = serde_json::to_string(&clip.to_doc()).expect("clip serializes");
+        assert!(json.contains(r#""base":"neutral""#), "{json}");
         let round_trip = Clip::from_json_resolved(&json, &limits(), |_| Some(anchor))
             .expect("posed JSON round-trips");
-        assert_eq!(round_trip.anchor().expect("anchor").name(), "neutral");
+        let base = round_trip.base().expect("base");
+        assert_eq!(base.label(), BaseLabel::Named("neutral".to_owned()));
+        assert_eq!(round_trip.posed_channels(), round_trip.mask());
         assert_eq!(round_trip.frames(), clip.frames());
 
         let mut unknown = doc.clone();
-        unknown.base = Some("missing".to_owned());
+        unknown.base = Some(BaseDoc::Named("missing".to_owned()));
         assert!(matches!(
             Clip::from_doc_resolved(unknown, &limits(), |_| None),
             Err(ClipError::UnknownBase { name }) if name == "missing"
         ));
         let mut malformed = doc;
-        malformed.base = Some("bad name".to_owned());
+        malformed.base = Some(BaseDoc::Named("bad name".to_owned()));
         assert!(matches!(
             Clip::from_doc_resolved(malformed, &limits(), |_| Some(anchor)),
             Err(ClipError::BaseName { name, .. }) if name == "bad name"
@@ -1186,7 +1506,8 @@ mod tests {
         let again = Clip::from_json(&serde_json::to_string(&clip.to_doc()).unwrap(), &limits())
             .expect("JSON round-trips");
         assert_eq!(clip, again);
-        assert_eq!(clip.anchor(), None);
+        assert_eq!(clip.base(), None);
+        assert_eq!(clip.posed_channels(), ChannelMask::empty());
     }
 
     #[test]
@@ -1202,7 +1523,7 @@ mod tests {
         assert!(Clip::from_doc(yaw_doc.clone(), &limits()).is_ok());
         let error = Clip::from_doc_resolved(
             ClipDoc {
-                base: Some("wide".to_owned()),
+                base: Some(BaseDoc::Named("wide".to_owned())),
                 ..yaw_doc
             },
             &limits(),
@@ -1224,7 +1545,7 @@ mod tests {
                     },
             } => {
                 assert_eq!(frame, 0);
-                assert_eq!(base, "wide");
+                assert_eq!(base, BaseLabel::Named("wide".to_owned()));
                 assert!(violations.body_yaw);
                 assert!(!violations.cone);
             }
@@ -1241,7 +1562,7 @@ mod tests {
         };
         let error = Clip::from_doc_resolved(
             ClipDoc {
-                base: Some("antenna-base".to_owned()),
+                base: Some(BaseDoc::Named("antenna-base".to_owned())),
                 ..antenna_doc
             },
             &limits(),
@@ -1257,11 +1578,11 @@ mod tests {
             error,
             ClipError::Frames {
                 source: FrameError::AnchoredAntennaGoal { frame: 0, base, side: 0, .. }
-            } if base == "antenna-base"
+            } if base == BaseLabel::Named("antenna-base".to_owned())
         ));
 
         let head_doc = ClipDoc {
-            base: Some("near-edge".to_owned()),
+            base: Some(BaseDoc::Named("near-edge".to_owned())),
             channels: vec![Channel::Head],
             frames: vec![FrameDoc {
                 dt: Some([0.0, 0.0, 0.2]),
@@ -1281,7 +1602,227 @@ mod tests {
             error,
             ClipError::Frames {
                 source: FrameError::AnchoredEnvelope { frame: 0, base, violations }
-            } if base == "near-edge" && violations.any()
+            } if base == BaseLabel::Named("near-edge".to_owned()) && violations.any()
+        ));
+    }
+
+    /// A numeric head base at neutral lifted by `dz` metres.
+    fn lifted_head_base(dz: f64) -> HeadBaseDoc {
+        HeadBaseDoc {
+            dt: [0.0, 0.0, dz],
+            dq: [1.0, 0.0, 0.0, 0.0],
+        }
+    }
+
+    #[test]
+    fn numeric_base_round_trips_with_exactly_its_posed_channels() {
+        let base = BaseDoc::Numeric(NumericBaseDoc {
+            head: Some(lifted_head_base(0.01)),
+            body_yaw: None,
+            antennas: Some([0.1, -0.1]),
+        });
+        let doc = ClipDoc {
+            base: Some(base),
+            ..full_doc()
+        };
+        let clip = Clip::from_doc(doc, &limits()).expect("numeric base loads");
+        let mut posed = ChannelMask::of(Channel::Head);
+        posed.insert(Channel::Antennas);
+        assert_eq!(clip.posed_channels(), posed);
+        let loaded = clip.base().expect("posed");
+        assert_eq!(loaded.label(), BaseLabel::Numeric);
+        assert!(
+            (loaded.targets().head_pose_body.translation.vector.z
+                - (neutral_head_pose().translation.vector.z + 0.01))
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(loaded.targets().antennas, [0.1, -0.1]);
+
+        let written = clip.to_doc();
+        assert_eq!(
+            written.base,
+            Some(BaseDoc::Numeric(NumericBaseDoc {
+                head: Some(lifted_head_base(0.01)),
+                body_yaw: None,
+                antennas: Some([0.1, -0.1]),
+            }))
+        );
+        let json = serde_json::to_string(&written).expect("clip serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("JSON parses");
+        let mut keys: Vec<&str> = value["base"]
+            .as_object()
+            .expect("a numeric base is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["antennas", "head"], "{json}");
+        assert_eq!(
+            Clip::from_json(&json, &limits()).expect("JSON round-trips"),
+            clip
+        );
+    }
+
+    #[test]
+    fn numeric_base_refusals() {
+        let numeric = |base: NumericBaseDoc, doc: ClipDoc| {
+            Clip::from_doc(
+                ClipDoc {
+                    base: Some(BaseDoc::Numeric(base)),
+                    ..doc
+                },
+                &limits(),
+            )
+        };
+        assert_eq!(
+            numeric(
+                NumericBaseDoc {
+                    head: Some(HeadBaseDoc::NEUTRAL),
+                    ..NumericBaseDoc::default()
+                },
+                antennas_doc()
+            ),
+            Err(ClipError::BaseChannelUnmasked {
+                channel: Channel::Head
+            })
+        );
+        assert_eq!(
+            numeric(NumericBaseDoc::default(), full_doc()),
+            Err(ClipError::BaseNoChannels)
+        );
+        assert_eq!(
+            numeric(
+                NumericBaseDoc {
+                    body_yaw: Some(f64::NAN),
+                    ..NumericBaseDoc::default()
+                },
+                full_doc()
+            ),
+            Err(ClipError::BaseNonFinite { key: "body_yaw" })
+        );
+        match numeric(
+            NumericBaseDoc {
+                head: Some(HeadBaseDoc {
+                    dt: [0.0, 0.0, 0.0],
+                    dq: [1.1, 0.0, 0.0, 0.0],
+                }),
+                ..NumericBaseDoc::default()
+            },
+            full_doc(),
+        ) {
+            Err(ClipError::BaseQuaternion { norm }) => assert!((norm - 1.1).abs() < 1e-12),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(
+            numeric(
+                NumericBaseDoc {
+                    head: Some(HeadBaseDoc {
+                        dt: [0.0, f64::INFINITY, 0.0],
+                        dq: [1.0, 0.0, 0.0, 0.0],
+                    }),
+                    ..NumericBaseDoc::default()
+                },
+                full_doc()
+            ),
+            Err(ClipError::BaseNonFinite { key: "head.dt" })
+        );
+        assert_eq!(
+            numeric(
+                NumericBaseDoc {
+                    antennas: Some([0.0, f64::NAN]),
+                    ..NumericBaseDoc::default()
+                },
+                full_doc()
+            ),
+            Err(ClipError::BaseNonFinite { key: "antennas" })
+        );
+        // Finiteness is checked before the norm, so a NaN component is named
+        // as non-finite rather than as a bad quaternion.
+        assert_eq!(
+            numeric(
+                NumericBaseDoc {
+                    head: Some(HeadBaseDoc {
+                        dt: [0.0; 3],
+                        dq: [f64::NAN, 0.0, 0.0, 0.0],
+                    }),
+                    ..NumericBaseDoc::default()
+                },
+                full_doc()
+            ),
+            Err(ClipError::BaseNonFinite { key: "head.dq" })
+        );
+    }
+
+    #[test]
+    fn a_null_base_key_is_refused_not_read_as_absent() {
+        let mut value = serde_json::to_value(full_doc()).expect("document serializes");
+        value["channels"] = serde_json::json!(["head", "antennas"]);
+        value["frames"] = serde_json::json!([
+            {"dt": [0.0, 0.0, 0.01], "dq": [1.0, 0.0, 0.0, 0.0], "antennas": [0.1, -0.1]}
+        ]);
+        for base in [
+            serde_json::json!({"head": null, "antennas": [0.0, 0.0]}),
+            serde_json::json!({"body_yaw": null}),
+        ] {
+            value["base"] = base.clone();
+            match Clip::from_json(&value.to_string(), &limits()) {
+                Err(ClipError::Malformed { detail }) => {
+                    assert!(detail.contains("null"), "{base}: {detail}");
+                }
+                other => panic!("{base}: unexpected: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_numeric_base_object_reports_its_own_parse_error() {
+        let document = |base: &str| {
+            format!(
+                r#"{{"version": 1, "kind": "clip", "name": "misspelt", "base": {base},
+                     "channels": ["antennas"], "frame_hz": {FLOOR_TICK_HZ},
+                     "frames": [{{"antennas": [0.0, 0.0]}}]}}"#
+            )
+        };
+        match Clip::from_json(&document(r#"{"antenas": [0.0, 0.0]}"#), &limits()) {
+            Err(ClipError::Malformed { detail }) => {
+                assert!(detail.contains("antenas"), "{detail}");
+                assert!(!detail.contains("untagged"), "{detail}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match Clip::from_json(&document("3"), &limits()) {
+            Err(ClipError::Malformed { detail }) => {
+                assert!(detail.contains("pose name"), "{detail}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_numeric_base_head_is_screened_by_the_frame_walk() {
+        let doc = ClipDoc {
+            base: Some(BaseDoc::Numeric(NumericBaseDoc {
+                head: Some(lifted_head_base(0.2)),
+                ..NumericBaseDoc::default()
+            })),
+            channels: vec![Channel::Head],
+            frames: vec![FrameDoc {
+                dt: Some([0.0, 0.0, 0.0]),
+                dq: Some([1.0, 0.0, 0.0, 0.0]),
+                ..FrameDoc::default()
+            }],
+            ..full_doc()
+        };
+        assert!(matches!(
+            Clip::from_doc(doc, &limits()),
+            Err(ClipError::Frames {
+                source: FrameError::AnchoredEnvelope {
+                    frame: 0,
+                    base: BaseLabel::Numeric,
+                    ..
+                }
+            })
         ));
     }
 
@@ -1385,6 +1926,69 @@ mod tests {
         let head = clip.frames()[0].head.expect("head is masked");
         assert!((head.translation.vector.z - 0.01).abs() < 1e-15);
         assert_eq!(head.rotation, UnitQuaternion::identity());
+    }
+
+    #[test]
+    fn a_base_head_and_a_frame_head_share_the_quaternion_rule() {
+        let with_base_dq = |dq: [f64; 4]| ClipDoc {
+            base: Some(BaseDoc::Numeric(NumericBaseDoc {
+                head: Some(HeadBaseDoc {
+                    dt: [0.0, 0.0, 0.0],
+                    dq,
+                }),
+                ..NumericBaseDoc::default()
+            })),
+            ..full_doc()
+        };
+        let with_frame_dq = |dq: [f64; 4]| {
+            let mut doc = full_doc();
+            doc.frames[0].dq = Some(dq);
+            doc
+        };
+
+        let refused = [1.0 + 2.0 * QUAT_NORM_TOL, 0.0, 0.0, 0.0];
+        assert!(matches!(
+            Clip::from_doc(with_base_dq(refused), &limits()),
+            Err(ClipError::BaseQuaternion { .. })
+        ));
+        assert!(matches!(
+            Clip::from_doc(with_frame_dq(refused), &limits()),
+            Err(ClipError::Quaternion { frame: 0, .. })
+        ));
+
+        let renormalised = [1.0 + QUAT_NORM_TOL / 2.0, 0.0, 0.0, 0.0];
+        let base_clip =
+            Clip::from_doc(with_base_dq(renormalised), &limits()).expect("base within tolerance");
+        let base_rotation = base_clip
+            .base()
+            .expect("posed")
+            .targets()
+            .head_pose_body
+            .rotation;
+        assert!((base_rotation.quaternion().norm() - 1.0).abs() < 1e-15);
+        let frame_clip =
+            Clip::from_doc(with_frame_dq(renormalised), &limits()).expect("frame within tolerance");
+        let frame_rotation = frame_clip.frames()[0]
+            .head
+            .expect("head is masked")
+            .rotation;
+        assert!((frame_rotation.quaternion().norm() - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn the_neutral_head_base_loads_to_the_neutral_head_pose() {
+        let doc = ClipDoc {
+            base: Some(BaseDoc::Numeric(NumericBaseDoc {
+                head: Some(HeadBaseDoc::NEUTRAL),
+                ..NumericBaseDoc::default()
+            })),
+            ..full_doc()
+        };
+        let clip = Clip::from_doc(doc, &limits()).expect("neutral base loads");
+        assert_eq!(
+            clip.base().expect("posed").targets().head_pose_body,
+            neutral_head_pose()
+        );
     }
 
     #[test]
@@ -1659,6 +2263,22 @@ mod tests {
         );
         assert!(!union.contains(Channel::BodyYaw));
         assert!(ChannelMask::empty().is_empty());
+    }
+
+    #[test]
+    fn mask_intersection_and_subset() {
+        let left = ChannelMask::of(Channel::Head).union(ChannelMask::of(Channel::Antennas));
+        let right = ChannelMask::of(Channel::Antennas).union(ChannelMask::of(Channel::BodyYaw));
+        assert_eq!(left.intersection(right), ChannelMask::of(Channel::Antennas));
+        assert_eq!(
+            left.intersection(ChannelMask::empty()),
+            ChannelMask::empty()
+        );
+        assert_eq!(left.intersection(ChannelMask::all()), left);
+        assert!(ChannelMask::of(Channel::Antennas).is_subset_of(left));
+        assert!(left.is_subset_of(left));
+        assert!(ChannelMask::empty().is_subset_of(ChannelMask::empty()));
+        assert!(!left.is_subset_of(right));
     }
 
     #[test]

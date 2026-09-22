@@ -2,6 +2,21 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/emotions/displeased1",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
   "description": "You react like this when you are not satisfied with what someone says or does.",
   "channels": [
     "head"

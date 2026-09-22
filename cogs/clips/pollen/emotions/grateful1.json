@@ -2,6 +2,21 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/emotions/grateful1",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
   "description": "You express gratitude when someone gives you something like a compliment or help. Can also be used to say the pleasure is mine.",
   "channels": [
     "head",

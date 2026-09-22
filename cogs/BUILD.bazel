@@ -486,7 +486,12 @@ rust_test(
         "CLIP_DOCUMENTS": "cogs/clips",
         "POSE_DOCUMENTS": "cogs/poses",
     },
-    deps = ["//crates/reachy-scratch:reachy_scratch"],
+    deps = [
+        # The imported vendor clips' base is asserted against the neutral head
+        # pose itself.
+        "//crates/reachy-kin:reachy_kin",
+        "//crates/reachy-scratch:reachy_scratch",
+    ],
 )
 
 # The configuration the host composition's three processes read by path at setup,

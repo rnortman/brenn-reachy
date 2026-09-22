@@ -2,6 +2,21 @@
   "version": 1,
   "kind": "clip",
   "name": "pollen/emotions/impatient2",
+  "base": {
+    "head": {
+      "dt": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "dq": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
   "description": "Another impatient movement. Can also be used when you disagree or feel someone is stalling.",
   "channels": [
     "head",
