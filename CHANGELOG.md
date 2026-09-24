@@ -78,6 +78,26 @@ Nothing has been released.
 
 ### Added
 
+- **The motion payload can be published and fetched over the air.** A new
+  `run` entry point at the payload root lets brenn-os's fetch mechanism start
+  the application as `app` on boot — empties the scratch log roots, copies
+  provenance and run configuration beside the records, tours the library once
+  and exits cleanly. Three new make targets drive the workflow:
+  `make motion-pack` builds a deterministic archive; `make motion-publish`
+  copies it to the payload server (the one mode that takes no host);
+  `make motion-resync` has the unit re-fetch and restart. `make motion-release`
+  sequences all three as one goal — do not type them on one `make` line, which
+  runs them in parallel under `-j`.
+
+- **Log roots moved under the payload's scratch space.** Both log directories
+  now live at `/run/brenn-app/scratch/logs/{motion,launch}` instead of
+  `/run/brenn-app/logs/`. The paths in `robot_logger.textproto`, the deploy
+  script and the runbook are updated. A root run and a fetched `app` run
+  cannot share one boot's log roots — reboot between them.
+
+- **Speech configuration knobs accept `none`.** Setting
+  `REACHY_SPEECH_CONFIG=none` or `REACHY_RECORD_SPEECH_CONFIG=none` builds a
+  payload with no speech members regardless of what the tree holds.
 - **Declared clip bases.** A clip document may name the pose its frames are
   authored over (a "posed" clip). Composition at full blend weight targets the
   declared pose independently of whatever base the head happens to stand on,

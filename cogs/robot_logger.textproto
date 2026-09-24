@@ -6,18 +6,22 @@
 # the dial hands the writer cogs.
 
 # The run's `.olog` files, under a directory the writer names for the instant it
-# opened. On tmpfs, because nothing this repo pushes to a unit touches its
-# flash: a run's log is pulled off with the run and the machine keeps no state.
+# opened. The root is the payload's scratch space -- the directory
+# `brenn-app.service` hands the payload as `TMPDIR`, the one place the `app`
+# account may write -- plus `/logs/motion`. On tmpfs, because nothing this repo
+# pushes to a unit touches its flash: a run's log is pulled off with the run and
+# the machine keeps no state.
 #
 # This directory has to exist before the logger starts -- the writer creates the
 # run's own subdirectory under it, not the root -- so whatever starts these
-# processes makes it, and reads the path from this file rather than retyping it.
+# processes (`run`, or `deploy-motion.sh` for a root run) makes it, and reads
+# the path from this file rather than retyping it.
 #
 # The filesystem must accept direct I/O: the writer opens every file with
 # `O_DIRECT | O_DSYNC` unconditionally. tmpfs does on a current kernel; a
 # kernel that refuses it fails at the first open, which costs the run its
 # records and nothing else.
-log_root_dir: "/run/brenn-app/logs/motion"
+log_root_dir: "/run/brenn-app/scratch/logs/motion"
 
 # Where the control process's channel buffers are, and the namespace the logger
 # finds them under. Both have to match what the control process runs with, and a

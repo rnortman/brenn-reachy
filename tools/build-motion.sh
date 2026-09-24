@@ -12,6 +12,7 @@
 # expect:
 #
 #   target/motion-arm64/release/
+#     run                                               the payload's entry point under brenn-app.service (tools/payload-run.sh)
 #     simplelaunch                                      the launcher, started by hand
 #     robotcpu.textproto                                the five apps it starts
 #     robotcpu_harness.textproto                        the same without host or pod
@@ -418,6 +419,7 @@ resolve_models() {
 # because an unlabelled argument list is where two cross-built binaries get
 # transposed.
 payload_fixed_members=(
+	run
 	reachy_motord
 	reachy_host
 	reachy_pod
@@ -619,6 +621,7 @@ stage() {
 	install -m 0755 -D -- "$onnx_out" "${staging}/libonnxruntime.so.1"
 	install -m 0755 -D -- "$exe_out" "${staging}/cogs/robot_clk_exe"
 	install -m 0755 -D -- "$launcher_out" "${staging}/simplelaunch"
+	install -m 0755 -D -- "${repo_root}/tools/payload-run.sh" "${staging}/run"
 	install -m 0644 -D -- "$launch_config_out" "${staging}/robotcpu.textproto"
 	install -m 0644 -D -- "$harness_config_out" "${staging}/robotcpu_harness.textproto"
 	install -m 0644 -D -- "$record_config_out" "${staging}/robotcpu_record.textproto"
@@ -699,9 +702,12 @@ report() {
 	echo "${prog}: brenn-pod  $(pod_provenance)"
 	# Said either way, and without a digest: the contents are a site's own, and
 	# what a person needs to know at the bench is whether this payload's host
-	# will listen or only narrate.
+	# will listen or only narrate. An empty path is the `none` spelling, resolved
+	# in lib.sh; nothing here reads the knob itself.
 	if [ -f "${payload}/${speech_config_path}" ]; then
 		echo "${prog}: ${speech_config_path}  staged from ${speech_config}"
+	elif [ -z "$speech_config" ]; then
+		echo "${prog}: ${speech_config_path}  absent (REACHY_SPEECH_CONFIG=none); the voice host will run its edge half alone"
 	else
 		echo "${prog}: ${speech_config_path}  absent; the voice host will run its edge half alone"
 	fi
@@ -710,6 +716,8 @@ report() {
 	# the bench is whether this payload can record a session at all.
 	if [ -f "${payload}/${record_speech_config_path}" ]; then
 		echo "${prog}: ${record_speech_config_path}  staged from ${record_speech_config}"
+	elif [ -z "$record_speech_config" ]; then
+		echo "${prog}: ${record_speech_config_path}  absent (REACHY_RECORD_SPEECH_CONFIG=none); this payload cannot record a session"
 	else
 		echo "${prog}: ${record_speech_config_path}  absent; this payload cannot record a session"
 	fi

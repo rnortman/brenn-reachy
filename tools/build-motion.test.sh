@@ -46,7 +46,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 repo="${work}/repo"
 mkdir -p -- "${repo}/tools" "${repo}/cogs" "${repo}/driver" "${repo}/host"
-cp -- "${script_dir}/build-motion.sh" "${script_dir}/lib.sh" "${repo}/tools/"
+cp -- "${script_dir}/build-motion.sh" "${script_dir}/lib.sh" "${script_dir}/payload-run.sh" "${repo}/tools/"
 
 subject="${repo}/tools/build-motion.sh"
 payload="${repo}/target/motion-arm64/release"
@@ -86,7 +86,7 @@ logger_config="${repo}/cogs/robot_logger.textproto"
 stage_logger_config() {
 	cat >"$logger_config" <<'CONFIG'
 # a decoy in a comment: pinion_namespace: "motion"
-log_root_dir: "/run/brenn-app/logs/motion"
+log_root_dir: "/run/brenn-app/scratch/logs/motion"
   pinion_shm_root: "/dev/shm"
 pinion_namespace: ""
 CONFIG
@@ -637,6 +637,19 @@ calls() { cat -- "$CALLS"; }
 
 result=$(build)
 assert_status "a clean build succeeds" 0 "$(status_of "$result")"
+
+# The payload's entry point under the service: at the root, executable, and
+# the only member of that name, since the service runs exactly `<root>/run`.
+assert_file "run is at the payload root" "${payload}/run"
+assert_eq "and executable by every account, the service's among them" 755 \
+	"$(stat -c %a -- "${payload}/run")"
+assert_eq "and nothing else in the payload is called run" 1 \
+	"$(find "$payload" -name run | wc -l)"
+if cmp -s -- "${repo}/tools/payload-run.sh" "${payload}/run"; then
+	pass "and it is tools/payload-run.sh"
+else
+	fail "and it is tools/payload-run.sh" "${payload}/run differs from it"
+fi
 
 assert_file "the driver is in the payload" "${payload}/reachy_motord"
 assert_file "the voice host is beside it" "${payload}/reachy_host"
@@ -1357,6 +1370,31 @@ result=$(build)
 assert_status "and with the knob unset the default is back" 0 "$(status_of "$result")"
 assert_no_file "which is not there, so neither is the payload's" \
 	"${payload}/host/speech.toml"
+
+# `none`: no speech configuration whatever the tree holds; the members staged
+# beside a speech configuration stay out with it.
+mkdir -p -- "${repo}/host/secrets"
+printf 'listen_addr = "0.0.0.0:7380"\npod_psk_file = "secrets/pod-psk.toml"\n' >"$speech_default"
+printf 'a credential\n' >"${repo}/host/secrets/pod-psk.toml"
+printf 'listen_addr = "0.0.0.0:7380"\n' >"${repo}/host/speech-record.toml"
+REACHY_SPEECH_CONFIG=none
+REACHY_RECORD_SPEECH_CONFIG=none
+export REACHY_SPEECH_CONFIG REACHY_RECORD_SPEECH_CONFIG
+result=$(build)
+assert_status "a build with both speech knobs none succeeds" 0 "$(status_of "$result")"
+assert_no_file "and stages no speech configuration though the tree holds one" \
+	"${payload}/host/speech.toml"
+assert_no_file "and none of the credentials it names" "${payload}/secrets/pod-psk.toml"
+assert_no_file "and no recording speech configuration either" \
+	"${payload}/host/speech-record.toml"
+assert_contains "and the report says the knob is why" "$(output_of "$result")" \
+	"REACHY_SPEECH_CONFIG=none"
+assert_contains "for both knobs" "$(output_of "$result")" \
+	"REACHY_RECORD_SPEECH_CONFIG=none"
+unset REACHY_SPEECH_CONFIG REACHY_RECORD_SPEECH_CONFIG
+rm -rf -- "$speech_default" "${repo}/host/secrets" "${repo}/host/speech-record.toml"
+result=$(build)
+assert_status "and with both knobs unset the default build is back" 0 "$(status_of "$result")"
 
 # ---------------------------------------------------------------------------
 # A recording session's two members
@@ -2467,14 +2505,15 @@ done
 # A refusal an operator meets on a unit sends them to a document, and a code in
 # a status is only readable against a table. Both live in `docs/bench-runbook.md`
 # and neither is generated from anything, so this is the join: every exit code
-# `deploy-motion.sh` names, and every target the Makefile's help text offers, has
-# to be a row that document actually carries. Read out of this checkout, all
-# three sides.
+# `deploy-motion.sh` names, including the two doors' codes, and every target the
+# Makefile's help text offers, has to be a row that document actually carries.
+# Read out of this checkout, all three sides.
 
 deploy_src=$(cat -- "${real_repo}/tools/deploy-motion.sh")
 for code in rc_no_speech_config:9 rc_no_tty:10 rc_check_refused:11 \
 	rc_no_audio_conf:12 rc_service_unreachable:13 rc_no_record_config:14 \
-	rc_no_bench_config:15 rc_record_config_disagreement:16; do
+	rc_no_bench_config:15 rc_record_config_disagreement:16 \
+	rc_fetch_in_flight:17 rc_resync_failed:18; do
 	name=${code%%:*}
 	number=${code#*:}
 	assert_contains "${name} is still ${number} in the deploy script" "$deploy_src" \
@@ -2560,6 +2599,57 @@ if [ "${#record_preflight_at}" -lt "${#record_provision_at}" ] &&
 else
 	fail "in that order: the refusal, the provisioning, then the build" \
 		"$record_recipe"
+fi
+
+# The pack packs the operator's build, whatever `.local/reachy.conf` names. A
+# recipe line rather than a prerequisite, so the build finishes before the pack
+# reads it under `-j`.
+pack_recipe=$(sed -n '/^motion-pack:/,/^$/p' -- "${real_repo}/Makefile")
+# shellcheck disable=SC2016
+pack_build_step='$(MAKE) motion-build'
+pack_step='tools/pack-motion.sh'
+assert_contains "motion-pack builds" "$pack_recipe" "$pack_build_step"
+assert_lacks "and forces no speech knob on the build" "$pack_recipe" "REACHY_SPEECH_CONFIG="
+# shellcheck disable=SC2016
+if grep -qxF $'\t$(MAKE) motion-build' <<<"$pack_recipe"; then
+	pass "and the build line carries nothing else"
+else
+	fail "and the build line carries nothing else" "$pack_recipe"
+fi
+assert_contains "and packs" "$pack_recipe" "$pack_step"
+assert_lacks "with the build not left as a prerequisite, which -j may reorder" \
+	"${pack_recipe%%$'\n'*}" "motion-build"
+pack_build_at=${pack_recipe%%"$pack_build_step"*}
+pack_at=${pack_recipe%%"$pack_step"*}
+if [ "${#pack_build_at}" -lt "${#pack_at}" ]; then
+	pass "and builds before it packs"
+else
+	fail "and builds before it packs" "$pack_recipe"
+fi
+
+# The release loop is one goal with three recipe lines: three goals typed
+# together are independent under `-j`, and a publish that ran beside the
+# pack would copy the archive an earlier pack left.
+release_recipe=$(sed -n '/^motion-release:/,/^$/p' -- "${real_repo}/Makefile")
+assert_contains "motion-release checks the host before anything is built" \
+	"$(head -n1 <<<"$release_recipe")" "device-host"
+for step in motion-pack motion-publish motion-resync; do
+	# shellcheck disable=SC2016
+	assert_contains "motion-release runs ${step}" "$release_recipe" "\$(MAKE) ${step}"
+	assert_lacks "with ${step} not left as a prerequisite, which -j may reorder" \
+		"${release_recipe%%$'\n'*}" "$step"
+done
+# shellcheck disable=SC2016
+release_pack_at=${release_recipe%%'$(MAKE) motion-pack'*}
+# shellcheck disable=SC2016
+release_publish_at=${release_recipe%%'$(MAKE) motion-publish'*}
+# shellcheck disable=SC2016
+release_resync_at=${release_recipe%%'$(MAKE) motion-resync'*}
+if [ "${#release_pack_at}" -lt "${#release_publish_at}" ] &&
+	[ "${#release_publish_at}" -lt "${#release_resync_at}" ]; then
+	pass "in that order: pack, publish, resync"
+else
+	fail "in that order: pack, publish, resync" "$release_recipe"
 fi
 
 # The step `speech-run` delegates to, which is also a target of its own. Its

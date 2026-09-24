@@ -47,6 +47,10 @@ pod_firmware="${brenn_pod_dir}/firmware"
 # the other repo's script, whose messages speak to its own operators rather than
 # ours.
 mapfile -t config_remedy < <(knob_remedy REACHY_SPEECH_CONFIG "<assembly>/speech.toml")
+[ -n "$speech_config" ] ||
+	die "REACHY_SPEECH_CONFIG is none, so there is no speech configuration to derive the pod's link from." \
+		"A speech run needs the site's assembly directory:" \
+		"${config_remedy[@]}"
 [ -f "$speech_config" ] ||
 	die "there is no speech configuration at ${speech_config}, so the pod's half of the link cannot be derived." \
 		"That file is the assembly directory's, and it is what both halves of the link come from." \

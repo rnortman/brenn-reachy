@@ -247,6 +247,8 @@ if [ "$status" = 0 ]; then
 		;;
 	esac
 	case "$dest" in *@*:*) exit 0 ;; esac
+	# A publish delivers the archive and nothing a fetch reads.
+	case "$dest" in *motion.tar.zst) exit 0 ;; esac
 	# The console copy is its own delivery: it lands beside the records
 	# under a name ending in .console, and what it brings is the launcher's
 	# files rather than a run directory. RSYNC_CONSOLE says whether the
@@ -434,7 +436,7 @@ assert_status "a payload newer than the newest commit pushes" 0 "$(status_of "$r
 assert_contains "the push reaches the device" "$(calls)" \
 	"rsync -a --delete -e ssh -o BatchMode=yes ${payload}/ root@unit:/run/brenn-app/releases/motion/"
 assert_contains "the freshness question is asked of the workspace paths" "$(calls)" \
-	"git -C ${repo} log -1 --format=%ct -- crates cogs driver motion hardware geometry clips bazel MODULE.bazel MODULE.bazel.lock .bazelrc .bazelversion tools/build-motion.sh tools/lib.sh"
+	"git -C ${repo} log -1 --format=%ct -- crates cogs driver motion hardware geometry clips bazel MODULE.bazel MODULE.bazel.lock .bazelrc .bazelversion tools/build-motion.sh tools/lib.sh tools/payload-run.sh"
 
 stage_payload "$before"
 result=$(deploy unit --push)
@@ -820,7 +822,7 @@ stage_payload "$after"
 result=$(deploy unit --push)
 assert_contains "the push makes the release directory" "$(calls)" \
 	"mkdir -p -- /run/brenn-app/releases/motion"
-assert_contains "the push makes the log root the configuration names" "$(calls)" \
+assert_lacks "the push makes no log root: root-owned directories under scratch are what a fetched run as app cannot empty" "$(calls)" \
 	"/run/brenn-app/logs/testing"
 assert_lacks "the log root is read, not retyped" "$(calls)" "/decoy"
 assert_contains "the bus question is asked before the push" "$(calls)" \
@@ -874,13 +876,14 @@ assert_contains "a payload that recorded no build commit is stamped with the tre
 assert_contains "and the stamp says that is where the commit came from" "$stamp" \
 	"commit_source=push"
 assert_contains "with the pushing tree's own HEAD beside it either way" "$stamp" \
-	"pushed_from=${GIT_HEAD}"
+	"stamped_from=${GIT_HEAD}"
+assert_contains "and the stamp says a push wrote it" "$stamp" "stamped_by=push"
 assert_contains "a clean tree is stamped clean" "$stamp" "dirty=no"
 assert_contains "and a checked age says so" "$stamp" "age_unchecked=no"
 assert_contains "and the file says how to read a log with that build" "$stamp" \
 	"git switch --detach ${GIT_HEAD}"
 assert_contains "the push says out loud what it stamped" "$(output_of "$result")" \
-	"commit ${GIT_HEAD} (push), pushed from ${GIT_HEAD}, dirty=no"
+	"commit ${GIT_HEAD} (push), stamped by push from ${GIT_HEAD}, dirty=no"
 
 # A tree with uncommitted edits is exactly what the freshness refusal cannot see,
 # so the stamp is the only thing that can say it.
@@ -921,11 +924,11 @@ assert_contains "the stamp names the commit the payload was built from" "$stamp"
 assert_contains "and says the payload is where that came from" "$stamp" \
 	"commit_source=build"
 assert_contains "and the tree it was pushed from is beside it, not averaged in" \
-	"$stamp" "pushed_from=${GIT_HEAD}"
+	"$stamp" "stamped_from=${GIT_HEAD}"
 assert_contains "so reading the log names the build, not the push" "$stamp" \
 	"git switch --detach ${BUILD_COMMIT}"
 assert_contains "and the push says both out loud" "$(output_of "$result")" \
-	"commit ${BUILD_COMMIT} (build), pushed from ${GIT_HEAD}"
+	"commit ${BUILD_COMMIT} (build), stamped by push from ${GIT_HEAD}"
 assert_contains "a payload that recorded no brenn-pod is stamped unknown" "$stamp" \
 	"brenn_pod=unknown"
 
@@ -1138,7 +1141,7 @@ result=$(deploy unit --run "$run_dest")
 ran=$(calls)
 assert_status "a budgeted run that the analyzer passes succeeds" 0 "$(status_of "$result")"
 assert_contains "the bus question, the log root's clear and the launcher are one invocation" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --resting-timeout 36 --run-window 36 >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 36 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask 2>/dev/null; exit \$rc"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_harness.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/scratch/logs/launch && mkdir -p -- /run/brenn-app/scratch/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; ./reachy_ask --resting-timeout 36 --run-window 36 >/run/brenn-app/scratch/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 36 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/scratch/logs/launch; rc=\$?; kill -INT \$ask 2>/dev/null; wait \$ask 2>/dev/null; exit \$rc"
 assert_contains "the run gets a pty, so the console streams and a ^C reaches it" "$ran" \
 	"ssh -t -o BatchMode=yes root@unit"
 # This suite's stdin is not a terminal, which is the case ssh downgrades
@@ -1179,7 +1182,7 @@ assert_contains "the run says where the log is" "$(output_of "$result")" "178883
 # first time they were wanted.
 
 assert_contains "the launcher's console directory is fetched whole" "$ran" \
-	"root@unit:/run/brenn-app/logs/launch/"
+	"root@unit:/run/brenn-app/scratch/logs/launch/"
 assert_lacks "and no console filename is spelled out" "$ran" "motord_0.log"
 console_dir=$(find "$run_dest" -mindepth 1 -maxdepth 1 -type d -name '*.console')
 assert_contains "the console lands beside the records under the fetch's own stamp" \
@@ -1450,7 +1453,7 @@ assert_status "a launcher that exited before the budget refuses" 1 "$(status_of 
 assert_contains "the refusal says the gesture did not finish" "$(output_of "$result")" \
 	"before the 36s budget was up"
 assert_contains "and says where its console output is" "$(output_of "$result")" \
-	"/run/brenn-app/logs/launch"
+	"/run/brenn-app/scratch/logs/launch"
 assert_lacks "and nothing is fetched from a run that did not happen" "$(calls)" "rsync"
 assert_lacks "and the analyzer is not run over nothing" "$(calls)" "first_motion_report"
 
@@ -1528,7 +1531,7 @@ assert_contains "and says to treat the previous records as gone" \
 assert_contains "and says the launcher never started" "$(output_of "$result")" \
 	"launcher was not started"
 assert_lacks "and does not send the operator to a console nothing wrote" \
-	"$(output_of "$result")" "/run/brenn-app/logs/launch"
+	"$(output_of "$result")" "/run/brenn-app/scratch/logs/launch"
 assert_lacks "and does not claim the unit was left as it was" "$(output_of "$result")" \
 	"nothing was emptied"
 assert_lacks "and nothing is fetched" "$(calls)" "rsync"
@@ -1830,7 +1833,7 @@ assert_status "a probe run that ended itself and passed the analyzer succeeds" 0
 assert_contains "the backstop is the sender's over the one motion" "$probed" \
 	"reachy_ask --tour-budget ${names_table} --motion probe/antenna-step-a"
 assert_contains "the sender is told to play that motion and gets the shared settlement" "$probed" \
-	"./reachy_ask --tour cogs/library.names.json --motion probe/antenna-step-a >/run/brenn-app/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/logs/launch; launcher_rc=\$?; i=0; while kill -0 \"\$ask\" 2>/dev/null && [ \"\$i\" -lt 10 ]"
+	"./reachy_ask --tour cogs/library.names.json --motion probe/antenna-step-a >/run/brenn-app/scratch/logs/launch/reachy_ask.log 2>&1 & ask=\$!; timeout --signal=INT --kill-after=10 900 ./simplelaunch robotcpu_harness.textproto --logdir /run/brenn-app/scratch/logs/launch; launcher_rc=\$?; i=0; while kill -0 \"\$ask\" 2>/dev/null && [ \"\$i\" -lt 10 ]"
 assert_contains "the records say which kind of run they came off" "$probed" \
 	"${probe_dest}/probe-log-"
 assert_contains "the table the run played names the one motion" "$probed" \
@@ -2234,7 +2237,7 @@ assert_contains "the configuration is checked before any device is touched" "$ra
 assert_contains "the checker is built in the default configuration" "$ran" \
 	"bazel build -- //crates/reachy-host:reachy_host"
 assert_contains "the bus question, the pipeline's preflights and the launcher are one invocation" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8000/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8001/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8000/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8001/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/scratch/logs/launch && mkdir -p -- /run/brenn-app/scratch/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/scratch/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/scratch/logs/launch; rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
 assert_contains "the run gets a pty, so a ^C reaches the unit" "$ran" \
 	"ssh -t -o BatchMode=yes root@unit"
 # The voice host's console reaches the operator while the run is happening, not
@@ -2243,7 +2246,7 @@ assert_contains "the run gets a pty, so a ^C reaches the unit" "$ran" \
 # pipeline dying in its first second is invisible to the person talking to it.
 assert_contains "the voice host's console is tailed onto the pty before the launcher starts" \
 	"$ran" \
-	"tail -F /run/brenn-app/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; ./simplelaunch"
+	"tail -F /run/brenn-app/scratch/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; ./simplelaunch"
 assert_contains "and the tail is killed once the launcher returns" "$ran" \
 	"rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
 assert_lacks "nothing puts a budget around a conversation" "$ran" "timeout --signal=INT"
@@ -2883,6 +2886,14 @@ assert_contains "and the knob that names one" "$(output_of "$result")" \
 assert_lacks "and nothing is built" "$(calls)" "bazel"
 stage_record_sources
 
+result=$(REACHY_RECORD_SPEECH_CONFIG=none deploy_tty unit --record-preflight)
+assert_status "REACHY_RECORD_SPEECH_CONFIG=none refuses a recording with the same code" 14 \
+	"$(status_of "$result")"
+assert_contains "and names the knob rather than an empty path" "$(output_of "$result")" \
+	"REACHY_RECORD_SPEECH_CONFIG is none"
+assert_lacks "with no garbled 'there is no ,' line" "$(output_of "$result")" "there is no ,"
+assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
+
 rm -f -- "$bench_source"
 result=$(deploy_tty unit --record-preflight)
 assert_status "a tree with no bench configuration refuses with the run's own code" 15 \
@@ -2933,12 +2944,12 @@ assert_contains "the session's own configuration is what is checked" "$ran" \
 assert_lacks "and not the site's, which no host in this composition loads" "$ran" \
 	"--speech-config host/speech.toml"
 assert_contains "the chain asks the robot for the recording pipeline's own endpoints, starts the recording config and tails both consoles" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_record.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8100/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8101/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/host || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; cp -- /run/brenn-app/releases/motion/host/speech-record.toml /run/brenn-app/logs/testing/config/host/speech-record.toml || exit 7; rm -rf -- /run/brenn-app/logs/launch && mkdir -p -- /run/brenn-app/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; tail -F /run/brenn-app/logs/launch/recorder_0.log 2>/dev/null & tail_pids=\"\$tail_pids \$!\"; ./simplelaunch robotcpu_record.textproto --logdir /run/brenn-app/logs/launch; rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_record.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8100/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8101/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/host || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; cp -- /run/brenn-app/releases/motion/host/speech-record.toml /run/brenn-app/logs/testing/config/host/speech-record.toml || exit 7; rm -rf -- /run/brenn-app/scratch/logs/launch && mkdir -p -- /run/brenn-app/scratch/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/scratch/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; tail -F /run/brenn-app/scratch/logs/launch/recorder_0.log 2>/dev/null & tail_pids=\"\$tail_pids \$!\"; ./simplelaunch robotcpu_record.textproto --logdir /run/brenn-app/scratch/logs/launch; rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
 # The recorder's console is the pose stream itself, so a session that cannot
 # tail it is one where a refused recorder — a torqued servo, a busy port — is
 # invisible until the fetch. Both tails, and one kill covering both.
 assert_contains "the recorder's console is tailed beside the host's" "$ran" \
-	"tail -F /run/brenn-app/logs/launch/recorder_0.log 2>/dev/null & tail_pids=\"\$tail_pids \$!\"; ./simplelaunch"
+	"tail -F /run/brenn-app/scratch/logs/launch/recorder_0.log 2>/dev/null & tail_pids=\"\$tail_pids \$!\"; ./simplelaunch"
 assert_lacks "no driver's launcher config is what starts" "$ran" \
 	"./simplelaunch robotcpu.textproto"
 assert_lacks "nor the harness one" "$ran" "./simplelaunch robotcpu_harness.textproto"
@@ -3275,6 +3286,221 @@ else
 		"guard line ${guard_line}, deployment line ${deploy_line}"
 fi
 
+motion_resync_recipe=$(sed -n '/^motion-resync:/,/^$/p' -- "$makefile")
+assert_contains "Makefile resync target needs a host" \
+	"$(head -n1 <<<"$motion_resync_recipe")" "device-host"
+assert_contains "Makefile resync target invokes the resync exactly" \
+	"$motion_resync_recipe" "tools/deploy-motion.sh \$(REACHY_HOST) --resync"
+motion_publish_recipe=$(sed -n '/^motion-publish:/,/^$/p' -- "$makefile")
+assert_contains "Makefile publish target invokes the host-less publish" \
+	"$motion_publish_recipe" "tools/deploy-motion.sh --publish"
+assert_lacks "Makefile publish target needs no unit" \
+	"$(head -n1 <<<"$motion_publish_recipe")" "device-host"
+assert_contains "Makefile exports the payload directory knob" \
+	"$(cat -- "$makefile")" "export REACHY_PAYLOAD_DIR"
+assert_contains "Makefile exports the payload URL knob" \
+	"$(cat -- "$makefile")" "export REACHY_PAYLOAD_URL"
+
+# ---------------------------------------------------------------------------
+# The two doors: publish and resync
+# ---------------------------------------------------------------------------
+
+have_zstd=yes
+if command -v zstd >/dev/null; then
+	pass "zstd is on PATH (the publish cases list a real archive)"
+else
+	fail "zstd is on PATH (the publish cases list a real archive)" "install zstd"
+	have_zstd=no
+fi
+
+archive="${repo}/target/motion-arm64/payload.tar.zst"
+# Stage a minimal payload tree and pack it the way pack-motion.sh does (`-C dir .`),
+# so members list as `./run`, `./host/speech.toml`.
+make_archive() {
+	local tree="${work}/publish-payload" m
+	rm -rf -- "$tree"
+	mkdir -p -- "${tree}/cogs"
+	printf '#!/bin/sh\n' >"${tree}/run"
+	chmod 0755 -- "${tree}/run"
+	: >"${tree}/cogs/servo_profile.textproto"
+	: >"${tree}/provenance.txt"
+	for m in "$@"; do
+		mkdir -p -- "${tree}/$(dirname -- "$m")"
+		: >"${tree}/${m}"
+	done
+	mkdir -p -- "$(dirname -- "$archive")"
+	tar --zstd -cf "$archive" -C "$tree" .
+}
+served="${work}/served"
+mkdir -p -- "$served"
+url=https://server.example/reachy/ # trailing slash on purpose
+
+# `deploy --publish` with the two knobs taken from the arguments alone: both are
+# unset first, so a value in the caller's environment cannot reach a case.
+#
+#   publish [VAR=value...] [--publish-args...]
+publish() {
+	: >"$CALLS"
+	local out status=0 assignments=()
+	while [ $# -gt 0 ] && [[ $1 == *=* ]]; do
+		assignments+=("$1")
+		shift
+	done
+	out=$(env -u REACHY_PAYLOAD_DIR -u REACHY_PAYLOAD_URL "${assignments[@]}" \
+		"$subject" --publish "$@" 2>&1) || status=$?
+	printf '%s\n---status %s\n' "$out" "$status"
+}
+
+rm -f -- "$archive"
+result=$(publish "REACHY_PAYLOAD_DIR=${served}" "REACHY_PAYLOAD_URL=${url}")
+assert_status "a publish with no archive is refused" 1 "$(status_of "$result")"
+assert_contains "and says how to make one" "$(output_of "$result")" "make motion-pack"
+assert_eq "and calls nothing" "" "$(calls)"
+
+if [ "$have_zstd" = yes ]; then
+	make_archive
+	result=$(publish "REACHY_PAYLOAD_URL=${url}")
+	assert_status "a publish with no payload directory is refused" 1 "$(status_of "$result")"
+	assert_contains "and says so" "$(output_of "$result")" "REACHY_PAYLOAD_DIR is not set"
+	assert_contains "and names the conf file" "$(output_of "$result")" ".local/reachy.conf"
+	assert_contains "and the conf line" "$(output_of "$result")" "REACHY_PAYLOAD_DIR ?="
+	assert_contains "and the make goal" "$(output_of "$result")" "motion-publish"
+	assert_lacks "and copies nothing" "$(calls)" "rsync"
+
+	result=$(publish "REACHY_PAYLOAD_DIR=${served}")
+	assert_status "a publish with no URL is refused" 1 "$(status_of "$result")"
+	assert_contains "and says so" "$(output_of "$result")" "REACHY_PAYLOAD_URL is not set"
+	assert_lacks "and copies nothing" "$(calls)" "rsync"
+
+	result=$(publish "REACHY_PAYLOAD_DIR=${served}" "REACHY_PAYLOAD_URL=http://server.example/reachy")
+	assert_status "a publish to a plain-http URL is refused" 1 "$(status_of "$result")"
+	assert_contains "and says the fetch takes https only" "$(output_of "$result")" "https:// only"
+	assert_lacks "and copies nothing" "$(calls)" "rsync"
+
+	result=$(publish "REACHY_PAYLOAD_DIR=${work}/with space" "REACHY_PAYLOAD_URL=${url}")
+	assert_status "a payload directory with a space is refused" 1 "$(status_of "$result")"
+	assert_contains "as not a plain path" "$(output_of "$result")" "plain path"
+	assert_lacks "and copies nothing" "$(calls)" "rsync"
+	result=$(publish "REACHY_PAYLOAD_DIR=--inplace" "REACHY_PAYLOAD_URL=${url}")
+	assert_status "a payload directory that reads as an rsync option is refused" 1 "$(status_of "$result")"
+	assert_contains "as not a plain path" "$(output_of "$result")" "plain path"
+	assert_lacks "and copies nothing" "$(calls)" "rsync"
+
+	make_archive host/speech.toml host/speech-record.toml
+	result=$(publish "REACHY_PAYLOAD_DIR=${served}" "REACHY_PAYLOAD_URL=${url}")
+	assert_status "an archive carrying a speech configuration publishes" 0 "$(status_of "$result")"
+	assert_eq "with exactly one call" 1 "$(calls | wc -l)"
+	assert_eq "to the one stable name" "${served}/motion.tar.zst" "$(awk '{print $NF}' <<<"$(calls | head -n1)")"
+	assert_lacks "and nothing is refused" "$(output_of "$result")" "not published"
+
+	make_archive
+	result=$(publish "REACHY_PAYLOAD_DIR=${served}" "REACHY_PAYLOAD_URL=${url}")
+	assert_status "a clean archive publishes" 0 "$(status_of "$result")"
+	assert_eq "with exactly one call" 1 "$(calls | wc -l)"
+	publish_line=$(calls | head -n1)
+	assert_eq "and that call is rsync" rsync "${publish_line%% *}"
+	assert_eq "to the one stable name" "${served}/motion.tar.zst" "$(awk '{print $NF}' <<<"$publish_line")"
+	assert_eq "from the packed archive" "$archive" "$(awk '{print $(NF-1)}' <<<"$publish_line")"
+	assert_contains "with the permissions applied" "$publish_line" "--perms"
+	assert_contains "readable by the server" "$publish_line" "--chmod=F644"
+	for flag in --inplace --partial -P --append; do
+		assert_lacks "and without ${flag}, which would defeat the rename into place" \
+			" ${publish_line} " " ${flag} "
+	done
+	assert_eq "and no ssh to any unit" 0 "$(calls | grep -c '^ssh ')"
+	published=$(output_of "$result")
+	assert_contains "the URL is printed with one slash" "$published" \
+		"published  https://server.example/reachy/motion.tar.zst"
+	assert_contains "the sha256 is printed" "$published" \
+		"sha256     $(sha256sum "$archive" | cut -d' ' -f1)"
+	assert_lacks "no unit.conf digest line" "$published" "APP_SHA256="
+	assert_lacks "no unit.conf URL line" "$published" "APP_URL="
+	assert_contains "and it names the resync" "$published" "--resync"
+
+	result=$(publish "REACHY_PAYLOAD_DIR=deploy@server.example:/srv/reachy/" "REACHY_PAYLOAD_URL=${url}")
+	assert_status "a remote payload directory publishes" 0 "$(status_of "$result")"
+	publish_line=$(calls | head -n1)
+	assert_eq "to the remote stable name, with one slash" "deploy@server.example:/srv/reachy/motion.tar.zst" \
+		"$(awk '{print $NF}' <<<"$publish_line")"
+	assert_contains "over batch-mode ssh" "$publish_line" "-e ssh -o BatchMode=yes"
+
+	export RSYNC_STATUS=23
+	result=$(publish "REACHY_PAYLOAD_DIR=${served}" "REACHY_PAYLOAD_URL=${url}")
+	assert_status "a failed copy is refused" 1 "$(status_of "$result")"
+	assert_contains "and names the copy" "$(output_of "$result")" "rsync to"
+	assert_contains "and says what is served is unchanged" "$(output_of "$result")" \
+		"the served archive is unchanged"
+	export RSYNC_STATUS=0
+fi
+
+result=$(publish "REACHY_PAYLOAD_DIR=${served}" "REACHY_PAYLOAD_URL=${url}" extra)
+assert_status "a publish takes no arguments" 1 "$(status_of "$result")"
+assert_contains "and says how it is used" "$(output_of "$result")" "usage:"
+assert_lacks "and copies nothing" "$(calls)" "rsync"
+result=$(deploy unit --publish)
+assert_status "the publish is not a host mode" 1 "$(status_of "$result")"
+assert_contains "and says how it is used" "$(output_of "$result")" "usage:"
+
+rc_codes=$(grep -o '^rc_[a-z_]*=[0-9]*' -- "${script_dir}/deploy-motion.sh" | cut -d= -f2)
+assert_eq "every exit code in the table is distinct" "" "$(sort <<<"$rc_codes" | uniq -d)"
+for code in 17 18; do
+	assert_contains "the table assigns ${code}" $'\n'"${rc_codes}"$'\n' $'\n'"${code}"$'\n'
+done
+for code in 3 4 255 124 125 126 127 137; do
+	assert_lacks "the table misses ${code}, which is someone else's" \
+		$'\n'"${rc_codes}"$'\n' $'\n'"${code}"$'\n'
+done
+
+result=$(deploy unit --resync)
+assert_status "a resync on a free unit succeeds" 0 "$(status_of "$result")"
+assert_eq "in exactly one ssh" 1 "$(calls | grep -c '^ssh ')"
+assert_lacks "and no rsync" "$(calls)" "rsync"
+assert_lacks "and no build" "$(calls)" "bazel"
+resync_line=$(calls | grep '^ssh ')
+assert_contains "it refuses on the pod's daemon" "$resync_line" \
+	"systemctl is-active --quiet reachy-motiond.service && exit 4"
+assert_contains "it asks the boot fetch's state" "$resync_line" \
+	"systemctl show -p ActiveState --value brenn-app-fetch.service"
+assert_contains "and refuses while it is retrying" "$resync_line" "activating"
+assert_contains "with its own code" "$resync_line" "exit 17"
+assert_contains "it runs the unit's resync" "$resync_line" "brenn-app-resync || exit 18"
+assert_lacks "an active brenn-app.service is not refused" "$resync_line" "brenn-app.service && exit 3"
+assert_lacks "nothing is streamed" "$resync_line" "tar "
+assert_lacks "no archive is named" "$resync_line" "payload.tar.zst"
+assert_lacks "and the unit is not fetched from here" "$resync_line" "curl"
+assert_contains "it warns the machine will move" "$(output_of "$result")" "eyes on the machine"
+assert_contains "and says what the unit was given, not what it runs" "$(output_of "$result")" "installed the published payload as current"
+assert_contains "and where run's own account is" "$(output_of "$result")" "journalctl -u brenn-app.service"
+
+SSH_PREPARE_STATUS=4
+result=$(deploy unit --resync)
+assert_status "a resync beside the pod's daemon is refused" 1 "$(status_of "$result")"
+assert_contains "and names it" "$(output_of "$result")" "reachy-motiond.service is running on unit"
+SSH_PREPARE_STATUS=17
+result=$(deploy unit --resync)
+assert_status "a resync beside a retrying boot fetch is refused" 1 "$(status_of "$result")"
+for needle in "boot fetch" brenn-app-fetch.service "300 s" "nothing was resynced"; do
+	assert_contains "and says so: ${needle}" "$(output_of "$result")" "$needle"
+done
+SSH_PREPARE_STATUS=18
+result=$(deploy unit --resync)
+assert_status "a failed unit resync is refused" 1 "$(status_of "$result")"
+assert_contains "and names the unit's resync" "$(output_of "$result")" "brenn-app-resync on unit failed"
+assert_contains "and says nothing changed" "$(output_of "$result")" "still runs what it ran before"
+SSH_PREPARE_STATUS=255
+result=$(deploy unit --resync)
+assert_status "an unreachable unit is refused" 1 "$(status_of "$result")"
+assert_contains "as ssh's failure" "$(output_of "$result")" "ssh to root@unit failed"
+SSH_PREPARE_STATUS=9
+result=$(deploy unit --resync)
+assert_status "an unassigned code is refused" 1 "$(status_of "$result")"
+assert_contains "generically, with the code" "$(output_of "$result")" "resyncing unit failed (exit 9)"
+SSH_PREPARE_STATUS=0
+result=$(deploy unit --resync extra)
+assert_status "a resync takes no arguments" 1 "$(status_of "$result")"
+assert_contains "and says how it is used" "$(output_of "$result")" "usage:"
+assert_lacks "and reaches no unit" "$(calls)" "ssh"
+
 # ---------------------------------------------------------------------------
 # The two names another repository reads
 # ---------------------------------------------------------------------------
@@ -3296,6 +3522,16 @@ assert_contains "and the constants say who else reads them" \
 	"$(cat -- "${script_dir}/deploy-motion.sh")" \
 	"deploy-reachy-pod.sh"
 
+# The two log roots a run writes under the payload's scratch space: the one
+# directory the service's account may write, and the one a root run and the
+# service's own `run` share.
+assert_eq "the launcher's console directory is under the payload's scratch space" \
+	"launch_logs=\"\${store_mount}/scratch/logs/launch\"" \
+	"$(grep '^launch_logs=' -- "${script_dir}/deploy-motion.sh")"
+assert_eq "and so is the logger's root in the checked-in logger config" \
+	'log_root_dir: "/run/brenn-app/scratch/logs/motion"' \
+	"$(grep '^log_root_dir:' -- "$(checkout_root)/cogs/robot_logger.textproto")"
+
 # ---------------------------------------------------------------------------
 # The run budget against the wake lead it is mostly made of
 # ---------------------------------------------------------------------------
@@ -3303,15 +3539,16 @@ assert_contains "and the constants say who else reads them" \
 assert_run_budget_covers_lead "${script_dir}/deploy-motion.sh"
 
 # ---------------------------------------------------------------------------
-# The one set of configuration files, stated in four places
+# The one set of configuration files, stated in five places
 # ---------------------------------------------------------------------------
 #
 # `cogs/pose_reading.rs` reads a run's `config/` and refuses a log that is
-# missing any of these files; three producers stage them — this script for a
-# device push, `host-motion-run.sh` for a host run, `cogs/scenario_test.sh` for
-# a deterministic one. A producer that fell behind the reader writes an
+# missing any of these files; four producers stage them — `lib.sh`'s list for a
+# device push and a pack, `host-motion-run.sh` for a host run,
+# `cogs/scenario_test.sh` for a deterministic one, and the payload's own `run`
+# for a run under the service. A producer that fell behind the reader writes an
 # incomplete `config/` and every log it makes is refused after the run, on
-# hardware, which is the expensive way to find out. So the four lists are
+# hardware, which is the expensive way to find out. So the five lists are
 # compared here, where the checkout is at hand and nothing has to be built.
 root=$(checkout_root)
 
@@ -3326,10 +3563,15 @@ assert_eq "the analyzer's list is the three files a run records" \
 	"cogs/servo_profile.textproto
 cogs/servo_gains.textproto
 cogs/mover_params.textproto" "$reader"
-for producer in tools/deploy-motion.sh tools/host-motion-run.sh cogs/scenario_test.sh; do
+for producer in tools/lib.sh tools/host-motion-run.sh cogs/scenario_test.sh; do
 	assert_eq "${producer} stages exactly what the analyzer reads" \
 		"$reader" "$(shell_config_list "${root}/${producer}")"
 done
+assert_eq "the payload's run copies exactly what the analyzer reads" \
+	"$reader" \
+	"$(sed -n 's/^for f in \(.*\); do$/\1/p' -- "${root}/tools/payload-run.sh" | tr ' ' '\n')"
+assert_eq "and deploy-motion.sh spells no list of its own" \
+	0 "$(grep -c '^run_config_files=(' -- "${root}/tools/deploy-motion.sh" || true)"
 
 # ---------------------------------------------------------------------------
 

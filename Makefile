@@ -68,6 +68,17 @@ ifdef REACHY_EXPERIMENT_DIR
 export REACHY_EXPERIMENT_DIR
 endif
 
+# The payload server's directory and the base URL it is served under, for
+# `motion-publish`: a local path or rsync's `user@host:dir`, and an `https://`
+# URL. Site topology, out of the tree like REACHY_HOST; read by the deploy
+# script, so a value the conf file supplies has to be exported to reach it.
+ifdef REACHY_PAYLOAD_DIR
+export REACHY_PAYLOAD_DIR
+endif
+ifdef REACHY_PAYLOAD_URL
+export REACHY_PAYLOAD_URL
+endif
+
 # The brenn-pod checkout, read for two things a speech run needs: the
 # audio-device binary, which the payload build compiles there and stages, and the
 # provisioning target that writes the pod's link credentials onto the unit. The
@@ -101,6 +112,10 @@ help:
 	@echo "  make bench-selftest  build, push, run the read-only registry on the unit"
 	@echo "  make bench-fetch     bring a run's state file and probe series back"
 	@echo "  make motion-build    the aarch64 motion payload: launcher, binaries, configs"
+	@echo "  make motion-pack     build and pack the payload as payload.tar.zst; prints its sha256"
+	@echo "  make motion-publish  copy the packed archive to the payload server; what is served is what every boot runs"
+	@echo "  make motion-resync   have the unit fetch the published payload now and restart into it"
+	@echo "  make motion-release  pack, publish and install now: the three above, in order, as one goal"
 	@echo "  make motion-deploy   build and push the payload into the unit's RAM"
 	@echo "  make motion-run      build, push, run on the unit, fetch and judge the log"
 	@echo "  make motion-fetch    bring a run's .olog directories back, timestamped"
@@ -567,15 +582,58 @@ MOTION_RECORDS ?= .local/motion-logs
 # session: `REACHY_RECORD_SPEECH_CONFIG` (or `host/speech-record.toml`), the
 # voice half of one, and `BENCH_CONFIG`, the recorder's own configuration. A
 # payload without them builds and runs everything else.
+#
+# Either knob may be `none`: that builds a payload with no speech configuration
+# even when `host/speech.toml` exists.
 .PHONY: motion-build
 motion-build:
 	tools/build-motion.sh
 
-# Push the payload into the unit's RAM and make the directory the logger writes
-# into. The build is a prerequisite rather than a step to remember, which is what
-# makes this the entry point that cannot go stale — deploy-motion.sh refuses a
-# payload older than the newest commit, and this target is why that refusal
-# should never fire.
+# Build the payload and pack it as `target/motion-arm64/payload.tar.zst`,
+# printing its sha256. The archive is the operator's build, speech
+# configuration and all.
+#
+# Two recipe lines rather than a prerequisite: the build has to finish before
+# the pack reads it under any `-j`.
+.PHONY: motion-pack
+motion-pack:
+	$(MAKE) motion-build
+	tools/pack-motion.sh
+
+# Copy the packed archive to the payload server under its one stable name and
+# print the URL, size and sha256. What is served there is what every boot of a
+# unit provisioned with that URL runs, so this is a release to every boot from
+# now on. Needs no unit -- REACHY_PAYLOAD_DIR and REACHY_PAYLOAD_URL name the
+# server -- which is why `device-host` is not a prerequisite and the mode takes
+# no host.
+.PHONY: motion-publish
+motion-publish:
+	tools/deploy-motion.sh --publish
+
+# Have the unit fetch the published payload now and restart brenn-app.service
+# into it: no reboot, no flash. Refuses while the boot fetch is still retrying
+# (it installs the payload itself) or while reachy-motiond.service holds the
+# bus. The payload's `run` tours the library as `app` on start.
+.PHONY: motion-resync
+motion-resync: device-host
+	tools/deploy-motion.sh $(REACHY_HOST) --resync
+
+# Pack, publish and install now: the release loop as one goal. Three
+# recipe lines rather than three command-line goals: goals typed together
+# are independent under `-j`, typed or inherited through MAKEFLAGS, so
+# `make motion-pack motion-publish motion-resync` can publish the archive
+# an earlier pack left while this pack's build is still running, and
+# resync the unit onto it.
+.PHONY: motion-release
+motion-release: device-host
+	$(MAKE) motion-pack
+	$(MAKE) motion-publish
+	$(MAKE) motion-resync
+
+# Push the payload into the unit's RAM. The build is a prerequisite rather than
+# a step to remember, which is what makes this the entry point that cannot go
+# stale — deploy-motion.sh refuses a payload older than the newest commit, and
+# this target is why that refusal should never fire.
 .PHONY: motion-deploy
 motion-deploy: device-host motion-build
 	tools/deploy-motion.sh $(REACHY_HOST) --push

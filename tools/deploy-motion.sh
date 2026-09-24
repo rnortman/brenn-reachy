@@ -8,6 +8,7 @@
 #   tools/deploy-motion.sh <host> --script <records-dir> FILE [--settle-evidence]
 #   tools/deploy-motion.sh <host> --probe <dir> <motion>
 #   tools/deploy-motion.sh <host> --fetch <dir>
+#   tools/deploy-motion.sh <host> --resync
 #   tools/deploy-motion.sh <host> --speech <dir>
 #   tools/deploy-motion.sh <host> --speech-preflight
 #   tools/deploy-motion.sh <host> --speech-fetch <dir>
@@ -15,14 +16,15 @@
 #   tools/deploy-motion.sh <host> --record-preflight
 #   tools/deploy-motion.sh <host> --record-fetch <dir>
 #
-#   --push       rsync the payload into the unit's RAM and create the directory
-#                the logger writes into. Refuses a payload older than the newest
-#                commit to the workspace, or one whose copy of either
-#                out-of-tree member — the audio device's binary, the site's
-#                speech configuration and each credential file that
+#   tools/deploy-motion.sh --publish
+#
+#   --push       rsync the payload into the unit's RAM. Refuses a payload older
+#                than the newest commit to the workspace, or one whose copy of
+#                either out-of-tree member — the audio device's binary, the
+#                site's speech configuration and each credential file that
 #                configuration names — is older than the source it was staged
-#                from, and refuses while anything else on the
-#                unit holds the servo bus. Stamps the workspace's commit beside
+#                from, and refuses while anything else on the unit holds the
+#                servo bus. Stamps the workspace's commit beside
 #                the payload, which is what a fetched run's records name their
 #                build by; a push that cannot state its own commit refuses.
 #   --stale-ok   push the old payload anyway.
@@ -58,6 +60,14 @@
 #                under a name stamped with the moment they were fetched so a
 #                session's runs accumulate rather than overwrite. Refuses a fetch
 #                that brought no records rather than reporting over nothing.
+#   --resync     have the unit fetch the published payload again and restart
+#                brenn-app.service into it: one ssh, no reboot, no flash. The
+#                boot fetch and a resync install the same URL, so the door
+#                refuses while the boot fetch is still retrying (it will install
+#                the payload itself) and refuses while reachy-motiond.service
+#                holds the bus; an active brenn-app.service is what the resync
+#                replaces and is not refused. On success the unit runs `run` as
+#                `app`, which tours the library: eyes on the machine.
 #   --speech     start the production launcher config — the voice host and the
 #                audio device beside the motion stack — with no budget at all,
 #                and stop when the operator does. Preflights the staged speech
@@ -99,6 +109,13 @@
 #   --record-fetch  bring a recording session's records back under the
 #                `record-log-` name, for the session whose terminal died or
 #                whose document is wanted a second time.
+#   --publish    copy the packed archive (make motion-pack) to the payload
+#                server under its one stable name, motion.tar.zst, and print
+#                the URL, size and sha256. Takes no host: the server is named
+#                by REACHY_PAYLOAD_DIR and REACHY_PAYLOAD_URL, not the unit.
+#                What is served there is what every boot of a unit provisioned
+#                with that URL runs, so this is a release to every boot from now
+#                on.
 #
 # A fetch brings back two things under one stamp, named for the kind of run it
 # came off — `motion-log-<stamp>` for a budgeted motion run, `tour-log-<stamp>`
@@ -139,12 +156,16 @@
 #       their working directory, because every configuration file in the payload
 #       is named by a path relative to it.
 #
-#   /run/brenn-app/logs/motion  where the logger writes. Read out of the staged
-#       payload's own cogs/robot_logger.textproto rather than stated here,
-#       created by the push and emptied by every run: the writer makes the run's
-#       own subdirectory under this root, not the root itself, so one root holds
-#       a whole session's runs unless a run clears it. Every mode here reads that
-#       file, so all three want a built payload.
+#   /run/brenn-app/scratch/logs/motion  where the logger writes. Read out of
+#       the staged payload's own cogs/robot_logger.textproto rather than stated
+#       here, made and emptied by every run as it starts: the writer makes the
+#       run's own subdirectory under this root, not the root itself, so one root
+#       holds a whole session's runs unless a run clears it. Every mode here
+#       reads that file, so all three want a built payload. Both log roots sit
+#       under the payload's scratch space so a root run and the service's own
+#       run write to one place; a root run's directories there are root-owned,
+#       so a run as `app` on the same boot cannot empty them -- a reboot sits
+#       between the two kinds of run.
 
 set -euo pipefail
 
@@ -237,24 +258,7 @@ require_members() {
 	done
 }
 
-# The configuration files a run carries home beside its records, at their
-# payload-relative paths.
-#
-# Three, and they are also the only paths an experiment overlay may write: they
-# are the files a run can be varied by -- the profile the residual is judged
-# against, the servo gains, and whether the tracking detector was armed -- and
-# the files an analyzer reads. `session_params.textproto` and
-# `motord_params.textproto` are pinned by the scenario suite's parameter check
-# and read by no analyzer, so they join this list when something reads them.
-#
-# The overlay is a tuning knob and not a way to push arbitrary payload members,
-# which is what makes the list an allowlist rather than a hint: a path outside
-# it is refused.
-run_config_files=(
-	cogs/servo_profile.textproto
-	cogs/servo_gains.textproto
-	cogs/mover_params.textproto
-)
+# run_config_files is in tools/lib.sh: the pack stamps with the same list.
 
 # The site-supplied models the staged speech configuration names, as
 # `speech_model_paths` emits them. Read once in the `--push` arm, where the
@@ -333,11 +337,6 @@ overlay_experiment() {
 			"Those are: ${run_config_files[*]}"
 }
 
-# The sha256 of one file, the digest alone.
-sha256_of() {
-	sha256sum -- "$1" | cut -d' ' -f1
-}
-
 # The logger configuration, read out of the staged payload rather than out of the
 # tree. The values in force on the device are the ones that were staged, and an
 # edit to the checked-in file after the last build is not among them: the
@@ -361,10 +360,11 @@ logger_config="${payload}/cogs/robot_logger.textproto"
 # pushes both configs and starts neither, which is where the production one
 # is used.
 #
-# The log directory is on the same tmpfs as the payload and the records; the
-# launcher creates it, a run empties it first, and a fetch brings it back.
+# The log directory is under the payload's scratch space, beside the logger's
+# root, on the same tmpfs as the payload; the launcher creates it, a run empties
+# it first, and a fetch brings it back.
 launch_config=robotcpu_harness.textproto
-launch_logs="${store_mount}/logs/launch"
+launch_logs="${store_mount}/scratch/logs/launch"
 
 # The launcher config a speech run starts: the production one, which names the
 # voice host and the audio device beside the motion stack. The whole point of
@@ -435,7 +435,10 @@ check_target=//crates/reachy-host:reachy_host
 # operator as `die`'s 1, the way 5 to 8 do. 14 to 16 are the recording session's
 # local refusals, which is why they are three: which of the two configurations a
 # payload is missing, and a pair that would put the pod and the host on
-# different addresses, are three different things to go and fix.
+# different addresses, are three different things to go and fix. 17 and 18 are
+# the resync's, emitted on the unit and reaching an operator as `die`'s 1 the
+# way 5 to 8 do: the boot fetch still retrying, and `brenn-app-resync`
+# reporting failure.
 rc_no_stamp=5
 rc_stamp_unstaged=6
 rc_post_wipe=7
@@ -448,6 +451,8 @@ rc_service_unreachable=13
 rc_no_record_config=14
 rc_no_bench_config=15
 rc_record_config_disagreement=16
+rc_fetch_in_flight=17
+rc_resync_failed=18
 
 # What the remote chain prints when it is about to exec the launcher.
 #
@@ -531,6 +536,33 @@ chain_refusal() {
 			"Treat the previous run's unfetched records on the unit as gone." \
 			"The launcher was not started, so nothing moved." \
 			"${host}'s own error is above; a full or read-only payload store is the usual cause."
+		;;
+	esac
+}
+
+# The resync's two refusals, emitted by its remote command and nothing else.
+#
+#   resync_refusal <rc>
+#
+# Kept apart from `chain_refusal`: the resync runs none of the preparation
+# chain, so none of that chain's parameters mean anything here, and a code
+# of the chain's arriving from a resync would be a bug, not a message.
+# Returns without saying anything for a code that is not one of the two.
+resync_refusal() {
+	local rc=$1
+	case "$rc" in
+	"$rc_fetch_in_flight")
+		die "${host}'s boot fetch (${fetch_service}) is still retrying, so nothing was resynced." \
+			"It fetches the URL a resync would and installs the published payload itself" \
+			"within its next retry -- at most 300 s after the payload server answers." \
+			"Wait for it: systemctl status ${fetch_service} on ${host} shows it active once it has."
+		;;
+	"$rc_resync_failed")
+		die "brenn-app-resync on ${host} failed, so the unit still runs what it ran before." \
+			"Its own message is above. The usual causes: the payload server unreachable from the" \
+			"unit or its certificate not chaining to the unit's anchor, or the server refusing the unit's" \
+			"client certificate; no app/fetch.conf in the unit's generation; a served file that is not an" \
+			"archive; an archive with no run at its root."
 		;;
 	esac
 }
@@ -636,6 +668,18 @@ build_flags=()
 # repos.
 release="${store_mount}/releases/motion"
 
+# The archive `pack-motion.sh` writes, and the one name it is served under. A
+# unit's provisioning names that URL once, and what is served there is what
+# every boot of the unit runs, so a rename here is a generation change there.
+archive="${repo_root}/target/motion-arm64/payload.tar.zst"
+published_name=motion.tar.zst
+
+# The unit's boot-time fetch. While it is `activating` it is still retrying the
+# same URL a resync would fetch, and installs what it finds within its next
+# backoff interval; a resync beside it would install the same bytes twice and
+# restart the payload mid-tour, so the door waits for it.
+fetch_service=brenn-app-fetch.service
+
 # The store name to fetch when the staged configuration names none, and the
 # spelling every site has used.
 record_dir_fallback=framelogs
@@ -704,19 +748,9 @@ staged_provenance="${store_mount}/motion-provenance.staged"
 # unit runs nothing else while a motion test is on it. That is the operator's
 # call and the runbook says so; this script pushes and nothing more.
 
-# What the device payload is built out of: the sources, everything that decides
-# how they are compiled, the compositions and the configuration the processes
-# read, and the two scripts that decide what a built payload is: the one that
-# names the platform and the compilation mode, and the shared prelude it takes
-# its ELF verification from.
-workspace_paths=(
-	crates cogs driver motion hardware geometry clips bazel
-	MODULE.bazel MODULE.bazel.lock .bazelrc .bazelversion
-	tools/build-motion.sh tools/lib.sh
-)
-
 usage() {
-	die "usage: ${prog} <host> --push [--stale-ok]|--run <dir>|--tour <dir>|--script <records-dir> FILE [--settle-evidence]|--probe <dir> <motion>|--fetch <dir>|--speech <dir>|--speech-preflight|--speech-fetch <dir>|--record <dir>|--record-preflight|--record-fetch <dir>"
+	die "usage: ${prog} <host> --push [--stale-ok]|--run <dir>|--tour <dir>|--script <records-dir> FILE [--settle-evidence]|--probe <dir> <motion>|--fetch <dir>|--resync|--speech <dir>|--speech-preflight|--speech-fetch <dir>|--record <dir>|--record-preflight|--record-fetch <dir>" \
+		"       ${prog} --publish"
 }
 
 # Refuse a value that is not a plain path or name, saying what it was.
@@ -739,6 +773,73 @@ plain_name() {
 			"[A-Za-z0-9/_.-] is accepted here."
 		;;
 	esac
+}
+
+# Publish the packed payload to the server every boot of the unit fetches from.
+#
+#   publish_payload
+#
+# Copies the archive to REACHY_PAYLOAD_DIR/motion.tar.zst -- a local directory
+# or an rsync `user@host:dir` -- and prints the URL it is served at under
+# REACHY_PAYLOAD_URL, its size and its sha256. rsync writes the destination
+# under a temporary name in the same directory and renames it into place, on a
+# local or a remote destination alike, so a boot fetch or a resync that reads
+# the file mid-copy gets the whole old archive or the whole new one and never a
+# prefix. None of --inplace, --partial, -P or --append, each of which would
+# defeat that.
+#
+# The archive may carry a speech configuration and the credentials staged
+# beside it; the server must require client-certificate authentication.
+publish_payload() {
+	[ -f "$archive" ] ||
+		die "no archive at ${archive}; pack one first: make motion-pack"
+
+	# Where the archive goes and where it is served from are site
+	# topology, out of the tree like REACHY_HOST.
+	local payload_dir=${REACHY_PAYLOAD_DIR:-} payload_url=${REACHY_PAYLOAD_URL:-}
+	local dir_remedy url_remedy
+	mapfile -t dir_remedy < <(knob_remedy REACHY_PAYLOAD_DIR '<dir or user@host:dir>' motion-publish)
+	[ -n "$payload_dir" ] ||
+		die "REACHY_PAYLOAD_DIR is not set, so there is nowhere to publish to." \
+			"It is the payload server's directory: a local path, or rsync's user@host:dir." \
+			"${dir_remedy[@]}"
+	mapfile -t url_remedy < <(knob_remedy REACHY_PAYLOAD_URL 'https://<host>/reachy' motion-publish)
+	[ -n "$payload_url" ] ||
+		die "REACHY_PAYLOAD_URL is not set, so the address the unit fetches from cannot be printed." \
+			"It is the base URL the payload directory is served under." \
+			"${url_remedy[@]}"
+	case $payload_url in
+	https://*) ;;
+	*)
+		die "REACHY_PAYLOAD_URL is '${payload_url}', and the unit's fetch takes https:// only." \
+			"${url_remedy[@]}"
+		;;
+	esac
+	# The directory is pasted into an rsync argument a remote shell may
+	# re-parse, so it goes through the same kind of screen every pasted
+	# value does -- plain_name's set plus `:` and `@` for the remote form
+	# -- and cannot read as an rsync option.
+	case $payload_dir in
+	-* | *[!A-Za-z0-9/_.:@-]*)
+		die "REACHY_PAYLOAD_DIR is '${payload_dir}', which is not a plain path or user@host:dir." \
+			"Only [A-Za-z0-9/_.:@-] is accepted here, and it cannot begin with '-'."
+		;;
+	esac
+
+	local destination="${payload_dir%/}/${published_name}" url="${payload_url%/}/${published_name}"
+
+	echo "${prog}: publishing ${archive} to ${destination}" >&2
+	# --perms --chmod: the served file has to be readable by the server's
+	# account whatever umask the archive was packed under. -e for the
+	# user@host:dir form; harmless for a local directory.
+	rsync --perms --chmod=F644 -e "ssh -o BatchMode=yes" "$archive" "$destination" ||
+		die "rsync to ${destination} failed (exit $?); the served archive is unchanged." \
+			"rsync's own error is above."
+
+	echo "${prog}: published  ${url}  ($(du -h -- "$archive" | cut -f1))"
+	echo "${prog}: sha256     $(sha256_of "$archive")"
+	echo "${prog}: every boot of a unit provisioned with that URL now runs this build;" \
+		"${prog} <host> --resync installs it on a running unit now."
 }
 
 # A scalar out of the staged protobuf text. One field per line and quoted
@@ -946,160 +1047,6 @@ fetch_records() {
 
 	echo "${prog}: ${out}" >&2
 	echo "$out"
-}
-
-# What build a run's records came off, into the file a run carries home.
-#
-#   stamp_provenance <file> <yes|no: was the payload's age left unchecked>
-#
-# The log reader binds each channel's schema byte for byte, so a run's records
-# are read with the build that recorded them and a records directory that cannot
-# name its build is one nobody can decode after the next `.clk` append. Nothing
-# else in a fetch says which build it was.
-#
-# What it can honestly claim is narrow, and it claims exactly that. The push-time
-# facts are weaker than they look: the freshness refusal compares the payload's
-# age against the newest commit and does not catch uncommitted edits, and
-# --stale-ok skips it altogether. And the pushing tree's HEAD is not by itself
-# the commit the binaries came from: a payload built at one commit can be pushed
-# from a checkout at any other, and the age refusal only turns away a payload
-# that is too old — an older checkout passes it and would be stamped with a
-# commit that never produced the binaries. So the commit the stamp names is the
-# one the build recorded in the payload (`build_commit_name`, lib.sh) whenever
-# the payload carries it, `commit_source` says which of the two answered, and
-# `pushed_from` keeps the pushing tree's HEAD beside it so a tree that moved
-# between the build and the push is visible rather than averaged away.
-#
-# The rest is the same honesty: whether the tree had uncommitted changes when it
-# was pushed, and whether the age was checked at all — a dirty or stale push says
-# so on its face instead of lying by omission, and a clean fresh one makes
-# reading the log a `git switch --detach`.
-#
-# A tree that cannot state its commit is a push refusal, not a stamp saying
-# nothing: the whole point of the file is that a fetched log names its build.
-#
-# Beside the build it names the configuration: a `config_sha256=` line per file a
-# run can be varied by, and the overlay directory that produced them, if any. The
-# files themselves travel home in the log root's `config/` and are what the
-# analyzers read; these lines are the push's own record of what it staged, so a
-# fetched log says both what its configuration is and that nothing rewrote it
-# between the push and the run.
-#
-# And a `wake_model_sha256=` line per site-supplied model the payload carries,
-# out of `staged_wake_models` — the listing the push already read from the staged
-# speech configuration. The commit does not name that file: it is the site's own,
-# not a fetch this tree pins, and a retrained head arrives in the assembly
-# directory under the name of the one before it. So the digest is the only thing
-# a fetched run can be attributed to a head by, which is what reading scores
-# across sessions and across heads needs.
-stamp_provenance() {
-	local into=$1 age_unchecked=$2
-	local pushed_from dirty built commit commit_source brenn_pod reachy_pod name
-	pushed_from=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || pushed_from=
-	[ -n "$pushed_from" ] ||
-		die "this tree cannot state its own commit, so a push from it could not say which build ran." \
-			"Every fetched records directory carries that commit, because a log is only" \
-			"readable by the build that recorded it. Push from a checkout with history."
-	built=
-	brenn_pod=
-	reachy_pod=
-	if [ -f "${payload}/${build_commit_name}" ]; then
-		built=$(sed -n 's/^commit=//p' -- "${payload}/${build_commit_name}")
-		brenn_pod=$(sed -n 's/^brenn_pod=//p' -- "${payload}/${build_commit_name}")
-		reachy_pod=$(sed -n 's/^reachy_pod=//p' -- "${payload}/${build_commit_name}")
-	fi
-	# A payload staged by a build that recorded no brenn-pod field: an older
-	# build script. Nothing here can work either value out — this tree's
-	# MODULE.bazel is where it stands now, not where it stood at the build, and
-	# the pod binary carries no revision a reader here could ask it for.
-	brenn_pod=${brenn_pod:-unknown}
-	reachy_pod=${reachy_pod:-unknown}
-	case $built in
-	'' | unknown)
-		# A payload staged by a build that recorded nothing — an older
-		# build script, or a build in a tree with no history. The
-		# pushing tree's HEAD is the only answer left, and the field
-		# below says that is what it is.
-		commit=$pushed_from
-		commit_source=push
-		;;
-	*)
-		commit=$built
-		commit_source=build
-		;;
-	esac
-	if ! dirty=$(git -C "$repo_root" status --porcelain 2>/dev/null); then
-		dirty=unknown
-	elif [ -n "$dirty" ]; then
-		dirty=yes
-	else
-		dirty=no
-	fi
-	cat >"$into" <<STAMP
-# Which build recorded the records beside this file. Written by ${prog} when the
-# payload was pushed and copied here by the run.
-#
-# The log reader binds a channel's schema byte for byte, so read these records
-# with the build that wrote them:
-#     git switch --detach ${commit}
-#
-# commit_source=build means the payload itself recorded that commit when it was
-# staged, which is the build the binaries came out of. commit_source=push means
-# the payload recorded none and this is the pushing tree's HEAD instead, which
-# describes the binaries only if that tree had not moved since the build.
-# pushed_from is that HEAD either way: where it differs from commit, the tree
-# moved between the build and the push and commit is the one that built.
-#
-# dirty=yes means the workspace held uncommitted changes at push time, so that
-# commit does not fully describe what ran. dirty=unknown means the repository
-# would not answer the status question at push time, so whether there were any is
-# not known. age_unchecked=yes means the push skipped the refusal that compares
-# the payload's age against the newest commit, so the payload may predate that
-# commit.
-#
-# overlay names the directory of experiment configuration the push laid over the
-# payload, or none. A config_sha256 line per file a run can be varied by, over
-# the copy that was pushed: the same files are in config/ beside these records,
-# so a digest that disagrees with one of them is a payload edited on the unit.
-#
-# A wake_model_sha256 line per model the speech configuration supplies itself,
-# naming its payload path and the digest of the copy that was pushed. The wake
-# head is a site file rather than a fetch this tree pins, and heads are retrained
-# under one name, so the commit above says nothing about which one this run
-# listened with. No such line means the payload carried no site-supplied model.
-#
-# brenn_pod is the other half of what built the voice host: the brenn-pod
-# revision the payload's build resolved its speech crates from. A value starting
-# overlay: means they came out of a working tree beside the building checkout
-# rather than a published revision, so no revision names those binaries. unknown
-# means the payload was staged by a build that recorded no such field.
-#
-# reachy_pod is the brenn-pod revision the audio-device binary was compiled from,
-# with +dirty when that checkout held uncommitted changes. named means an
-# operator handed the build a prebuilt artifact, whose revision nothing could
-# ask. unknown means the payload was staged by a build that did not record it,
-# which is also a build that did not hold this field and brenn_pod equal — so a
-# run whose two fields name two revisions is such a payload.
-commit=${commit}
-commit_source=${commit_source}
-brenn_pod=${brenn_pod}
-reachy_pod=${reachy_pod}
-pushed_from=${pushed_from}
-dirty=${dirty}
-age_unchecked=${age_unchecked}
-pushed=$(date -u +%Y%m%dT%H%M%SZ)
-overlay=${experiment_dir:-none}
-STAMP
-	for name in "${run_config_files[@]}"; do
-		echo "config_sha256=${name} $(sha256_of "${payload}/${name}")" >>"$into"
-	done
-	local model_path
-	while IFS=$'\t' read -r _ model_path _; do
-		[ -n "$model_path" ] || continue
-		echo "wake_model_sha256=${model_path} $(sha256_of "${payload}/${model_path}")" >>"$into"
-	done <<<"$staged_wake_models"
-	echo "${prog}: provenance: commit ${commit} (${commit_source}), pushed from ${pushed_from}," \
-		"dirty=${dirty}, age_unchecked=${age_unchecked}" >&2
 }
 
 # One read-only probe of the unit, into a file of its own.
@@ -2313,6 +2260,16 @@ supervised_run() {
 	esac
 }
 
+# The publish is the one mode with no unit in it: it talks to the payload
+# server, so it takes no host and is dispatched ahead of the <host> <mode>
+# grammar every other mode shares.
+if [ "${1:-}" = --publish ]; then
+	shift
+	[ $# -eq 0 ] || usage
+	publish_payload
+	exit 0
+fi
+
 host=${1:-}
 mode=${2:-}
 [ -n "$host" ] || usage
@@ -2403,7 +2360,11 @@ case "$mode" in
 			done <<<"$speech_models"
 		fi
 
-		log_root=$(config_string log_root_dir)
+		# Read for its refusal only: a payload whose logger configuration
+		# does not name its log root is refused before anything is pushed.
+		# The root itself is not made here -- root-owned directories under
+		# scratch are what a fetched run as `app` cannot empty.
+		config_string log_root_dir >/dev/null
 
 		# Before the stamp, so the digests it records are the digests of
 		# the files that land, and before the rsync, so the unit gets
@@ -2414,10 +2375,11 @@ case "$mode" in
 		# the stamp on the unit can only describe the payload it landed
 		# with. Written before anything reaches the unit, so a tree that
 		# cannot state its commit refuses without having touched it.
-		stamp_provenance "${payload}/${provenance_name}" "$age_unchecked"
+		stamp_provenance "${payload}/${provenance_name}" "$age_unchecked" push \
+			"$(date -u +%Y%m%dT%H%M%SZ)"
 
 		# The bus question is asked before anything is pushed, in the
-		# same remote invocation that makes the two directories — so a
+		# same remote invocation that makes the release directory — so a
 		# refusal creates nothing and a clean answer leaves the unit
 		# ready. Refused rather than stopped: what is running on a
 		# device is the operator's to decide. The question and the
@@ -2433,7 +2395,7 @@ case "$mode" in
 		# gate because there the question and the run share one
 		# invocation, and this script starts nothing.
 		remote="$(bus_probe)"
-		remote="${remote}; mkdir -p -- ${release} ${log_root}"
+		remote="${remote}; mkdir -p -- ${release}"
 
 		rc=0
 		ssh_root "$remote" || rc=$?
@@ -2449,7 +2411,7 @@ case "$mode" in
 		rsync -a --delete -e "ssh -o BatchMode=yes" \
 			"${payload}/" "root@${host}:${release}/"
 
-		echo "${prog}: pushed. The log root ${log_root} exists."
+		echo "${prog}: pushed."
 		echo "${prog}: start the run: ${prog} ${host} --run <records-dir>"
 		;;
 
@@ -2582,6 +2544,29 @@ case "$mode" in
 		echo "${prog}: read it: bazel run //cogs:first_motion_report -- ${out}/<run>"
 		;;
 
+	--resync)
+		[ $# -eq 0 ] || usage
+		# Not bus_probe: an active brenn-app.service is the expected
+		# state here -- it is what the activation replaces, and systemd
+		# stops the old `run` (and with it motord, which de-torques)
+		# before starting the new one. Only the pod's daemon is refused.
+		remote="systemctl is-active --quiet ${motiond_service} && exit 4"
+		remote="${remote}; [ \"\$(systemctl show -p ActiveState --value ${fetch_service})\" != activating ] || exit ${rc_fetch_in_flight}"
+		remote="${remote}; brenn-app-resync || exit ${rc_resync_failed}"
+
+		echo "${prog}: resyncing ${host}; on success brenn-app.service restarts into the published payload and the tour begins -- eyes on the machine" >&2
+		rc=0
+		ssh_root "$remote" </dev/null || rc=$?
+		bus_refusal "$rc" "a resync" "nothing was resynced"
+		resync_refusal "$rc"
+		[ "$rc" = 0 ] ||
+			die "resyncing ${host} failed (exit ${rc}); its own error is above."
+
+		echo "${prog}: ${host} installed the published payload as current; brenn-app.service is restarting into it and its run tours as app."
+		echo "${prog}: a robot that stays still: journalctl -u brenn-app.service on ${host} -- run says what it started, or why it started nothing."
+		echo "${prog}: after the tour: ${prog} ${host} --fetch <records-dir>"
+		;;
+
 	--speech)
 		dest=${1:-}
 		[ -n "$dest" ] || usage
@@ -2648,6 +2633,15 @@ case "$mode" in
 		# `--record` refuses on — they are what a session runs — and
 		# these are the same three codes, so a chain that answers here
 		# and a chain that answers there read the same.
+		# An empty path is the `none` spelling, refused by name so the
+		# message does not read as a missing file.
+		[ -n "$record_speech_config" ] ||
+			refuse "$rc_no_record_config" \
+				"REACHY_RECORD_SPEECH_CONFIG is none, so there is no pipeline to record with." \
+				"A recording session needs the operator's own speech configuration — the" \
+				"bypassed wake gate, the parrot brain, no bridge — named by" \
+				"REACHY_RECORD_SPEECH_CONFIG or taken from this tree's gitignored" \
+				"host/speech-record.toml. Name it, or unset the knob, and the build stages it."
 		[ -f "$record_speech_config" ] ||
 			refuse "$rc_no_record_config" \
 				"there is no ${record_speech_config}, so there is no pipeline to record with." \

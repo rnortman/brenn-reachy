@@ -10,11 +10,13 @@
 # unused" is the expected shape of every definition in it.
 # shellcheck disable=SC2034
 #
-# It also reads three variables the sourcing script owns and it cannot assign
+# It also reads six variables the sourcing script owns and it cannot assign
 # itself: `bazel` (which bazel to run, REACHY_BAZEL's value), `build_flags` (the
-# array naming the configuration a build and its cqueries share) and `host` (the
-# device being deployed to, the script's first argument). Each is named in the
-# doc of every function that reads it.
+# array naming the configuration a build and its cqueries share), `host` (the
+# device being deployed to, the script's first argument), `payload` (the staged
+# payload directory), `experiment_dir` (the overlay laid over it, or empty) and
+# `staged_wake_models` (the site-supplied models the staged speech configuration
+# names). Each is named in the doc of every function that reads it.
 # shellcheck disable=SC2154
 
 # The name a script reports itself as in its own messages. Sourcing does not
@@ -855,10 +857,31 @@ pod_stamp_field() {
 # it name the same checkout from every directory. This one's default is already
 # absolute, so every relative value is one somebody typed at a prompt, and their
 # prompt is what they typed it against.
-speech_config=${REACHY_SPEECH_CONFIG:-${repo_root}/host/speech.toml}
-# Whether an operator named it, which is the whole difference between "not there
-# and that is the shipped state" and "not there and you asked for it".
-speech_config_named=${REACHY_SPEECH_CONFIG:+named}
+#
+# The third spelling, `none`, carries no speech configuration whatever the tree
+# holds: the path is then empty, which every reader takes as "no file", and it
+# is not named, so its absence is no refusal.
+#
+# `speech_config_named` says whether an operator named a file, which is the
+# whole difference between "not there and that is the shipped state" and "not
+# there and you asked for it".
+case ${REACHY_SPEECH_CONFIG:-} in
+none)
+	# Carry no speech configuration whatever the tree holds — an operator's
+	# choice for a payload that will not speak; the members staged beside a
+	# speech configuration stay out with it.
+	speech_config=
+	speech_config_named=
+	;;
+'')
+	speech_config=${repo_root}/host/speech.toml
+	speech_config_named=
+	;;
+*)
+	speech_config=$REACHY_SPEECH_CONFIG
+	speech_config_named=named
+	;;
+esac
 
 # Where the speech configuration goes under the payload root: the path
 # `host/host_launch.textproto` spells in the host's `--speech-config` argument.
@@ -893,11 +916,26 @@ host_params_path=host/host_params.textproto
 # the site's.
 #
 # Optional in the build, refused by `deploy-motion.sh --record`. Named and
-# missing is a refused build.
-record_speech_config=${REACHY_RECORD_SPEECH_CONFIG:-${repo_root}/host/speech-record.toml}
-# Whether an operator named it, which is the difference between "not there and
-# that is the shipped state" and "not there and you asked for it".
-record_speech_config_named=${REACHY_RECORD_SPEECH_CONFIG:+named}
+# missing is a refused build. `none` carries none whatever the tree holds, as
+# for the site's configuration.
+#
+# `record_speech_config_named` says whether an operator named a file, which is
+# the difference between "not there and that is the shipped state" and "not
+# there and you asked for it".
+case ${REACHY_RECORD_SPEECH_CONFIG:-} in
+none)
+	record_speech_config=
+	record_speech_config_named=
+	;;
+'')
+	record_speech_config=${repo_root}/host/speech-record.toml
+	record_speech_config_named=
+	;;
+*)
+	record_speech_config=$REACHY_RECORD_SPEECH_CONFIG
+	record_speech_config_named=named
+	;;
+esac
 
 # Where it goes under the payload root: the path
 # `host/host_record_launch.textproto` spells in its `--speech-config` argument.
@@ -924,6 +962,222 @@ esac
 # `bench/record_launch.textproto` spells in the recorder's `--config` argument.
 # `tools/build-motion.test.sh` holds the two to each other.
 bench_config_path=bench/reachy-bench.toml
+
+# ---------------------------------------------------------------------------
+# The payload a run is stamped and packed from
+# ---------------------------------------------------------------------------
+#
+# Here rather than in the push because two scripts write the stamp: the push
+# into the payload it rsyncs, the pack into the payload it archives. One list,
+# one digest, one function, so a fetched run's stamp and a pushed run's say the
+# same things in the same words.
+
+# The configuration files a run carries home beside its records, at their
+# payload-relative paths.
+#
+# Three, and they are also the only paths an experiment overlay may write: they
+# are the files a run can be varied by -- the profile the residual is judged
+# against, the servo gains, and whether the tracking detector was armed -- and
+# the files an analyzer reads. `session_params.textproto` and
+# `motord_params.textproto` are pinned by the scenario suite's parameter check
+# and read by no analyzer, so they join this list when something reads them.
+#
+# The overlay is a tuning knob and not a way to push arbitrary payload members,
+# which is what makes the list an allowlist rather than a hint: a path outside
+# it is refused.
+run_config_files=(
+	cogs/servo_profile.textproto
+	cogs/servo_gains.textproto
+	cogs/mover_params.textproto
+)
+
+# The sha256 of one file, the digest alone.
+sha256_of() {
+	sha256sum -- "$1" | cut -d' ' -f1
+}
+
+# What the device payload is built out of: the sources, everything that decides
+# how they are compiled, the compositions and the configuration the processes
+# read, the two scripts that decide what a built payload is -- the one that
+# names the platform and the compilation mode, and the shared prelude it takes
+# its ELF verification from -- and the payload's own entry point, which the
+# build stages as `run`.
+workspace_paths=(
+	crates cogs driver motion hardware geometry clips bazel
+	MODULE.bazel MODULE.bazel.lock .bazelrc .bazelversion
+	tools/build-motion.sh tools/lib.sh tools/payload-run.sh
+)
+
+# What build a run's records came off, into the file a run carries home.
+#
+#   stamp_provenance <file> <yes|no: age unchecked> <push|pack: who is writing> <instant, %Y%m%dT%H%M%SZ>
+#
+# The log reader binds each channel's schema byte for byte, so a run's records
+# are read with the build that recorded them and a records directory that cannot
+# name its build is one nobody can decode after the next `.clk` append. Nothing
+# else in a fetch says which build it was.
+#
+# What it can honestly claim is narrow, and it claims exactly that. The push- or
+# pack-time facts are weaker than they look: the freshness refusal compares the payload's
+# age against the newest commit and does not catch uncommitted edits, and
+# --stale-ok skips it altogether. And the stamping tree's HEAD is not by itself
+# the commit the binaries came from: a payload built at one commit can be pushed
+# from a checkout at any other, and the age refusal only turns away a payload
+# that is too old — an older checkout passes it and would be stamped with a
+# commit that never produced the binaries. So the commit the stamp names is the
+# one the build recorded in the payload (`build_commit_name`, lib.sh) whenever
+# the payload carries it, `commit_source` says which of the two answered, and
+# `stamped_from` keeps the stamping tree's HEAD beside it so a tree that moved
+# between the build and the stamp is visible rather than averaged away.
+#
+# The rest is the same honesty: whether the tree had uncommitted changes when it
+# was stamped, and whether the age was checked at all — a dirty or stale stamp says
+# so on its face instead of lying by omission, and a clean fresh one makes
+# reading the log a `git switch --detach`.
+#
+# A tree that cannot state its commit is a push or pack refusal, not a stamp saying
+# nothing: the whole point of the file is that a fetched log names its build.
+#
+# Beside the build it names the configuration: a `config_sha256=` line per file a
+# run can be varied by, and the overlay directory that produced them, if any. The
+# files themselves travel home in the log root's `config/` and are what the
+# analyzers read; these lines are the push's or the pack's own record of what it
+# staged, so a fetched log says both what its configuration is and that nothing
+# rewrote it between the push or pack and the run.
+#
+# And a `wake_model_sha256=` line per site-supplied model the payload carries,
+# out of `staged_wake_models` — the listing the caller already read from the staged
+# speech configuration. The commit does not name that file: it is the site's own,
+# not a fetch this tree pins, and a retrained head arrives in the assembly
+# directory under the name of the one before it. So the digest is the only thing
+# a fetched run can be attributed to a head by, which is what reading scores
+# across sessions and across heads needs.
+#
+# Reads the caller's `payload`, `experiment_dir` and `staged_wake_models`.
+stamp_provenance() {
+	local into=$1 age_unchecked=$2 stamped_by=$3 instant=$4
+	case $stamped_by in
+	push | pack) ;;
+	*) die "stamp_provenance: stamped_by must be push or pack, not '${stamped_by}'" ;;
+	esac
+	local stamped_from dirty built commit commit_source brenn_pod reachy_pod name
+	stamped_from=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null) || stamped_from=
+	[ -n "$stamped_from" ] ||
+		die "this tree cannot state its own commit, so a push or pack from it could not say which build ran." \
+			"Every fetched records directory carries that commit, because a log is only" \
+			"readable by the build that recorded it. Run it from a checkout with history."
+	built=
+	brenn_pod=
+	reachy_pod=
+	if [ -f "${payload}/${build_commit_name}" ]; then
+		built=$(sed -n 's/^commit=//p' -- "${payload}/${build_commit_name}")
+		brenn_pod=$(sed -n 's/^brenn_pod=//p' -- "${payload}/${build_commit_name}")
+		reachy_pod=$(sed -n 's/^reachy_pod=//p' -- "${payload}/${build_commit_name}")
+	fi
+	# A payload staged by a build that recorded no brenn-pod field: an older
+	# build script. Nothing here can work either value out — this tree's
+	# MODULE.bazel is where it stands now, not where it stood at the build, and
+	# the pod binary carries no revision a reader here could ask it for.
+	brenn_pod=${brenn_pod:-unknown}
+	reachy_pod=${reachy_pod:-unknown}
+	case $built in
+	'' | unknown)
+		# A payload staged by a build that recorded nothing — an older
+		# build script, or a build in a tree with no history. The
+		# pushing tree's HEAD is the only answer left, and the field
+		# below says that is what it is.
+		commit=$stamped_from
+		commit_source=push
+		;;
+	*)
+		commit=$built
+		commit_source=build
+		;;
+	esac
+	if ! dirty=$(git -C "$repo_root" status --porcelain 2>/dev/null); then
+		dirty=unknown
+	elif [ -n "$dirty" ]; then
+		dirty=yes
+	else
+		dirty=no
+	fi
+	cat >"$into" <<STAMP
+# Which build recorded the records beside this file. Written by ${prog} into the
+# payload and copied here by the run.
+#
+# The log reader binds a channel's schema byte for byte, so read these records
+# with the build that wrote them:
+#     git switch --detach ${commit}
+#
+# commit_source=build means the payload itself recorded that commit when it was
+# staged, which is the build the binaries came out of. commit_source=push means
+# the payload recorded none and this is the stamping tree's HEAD instead, which
+# describes the binaries only if that tree had not moved since the build. A pack
+# refuses a payload that recorded no commit, so a pack's stamp is always
+# commit_source=build. stamped_from is the stamping tree's HEAD either way: where
+# it differs from commit, the tree moved between the build and the stamp and
+# commit is the one that built.
+#
+# stamped_by says which script wrote this stamp: push, into the payload
+# deploy-motion.sh rsynced to a unit; pack, into the payload pack-motion.sh
+# archived for the boot fetch, a resync or a bake. stamped is the instant of
+# that write for a push. For a pack it is the build commit's instant instead,
+# so an archive's bytes -- and the digest a bake records of it -- depend on the
+# tree alone; it says nothing about when the archive was packed, fetched or run.
+#
+# dirty=yes means the workspace held uncommitted changes when the stamp was
+# written, so that commit does not fully describe what ran. dirty=unknown means
+# the repository would not answer the status question then, so whether there
+# were any is not known. age_unchecked=yes means the push or pack skipped the
+# refusal that compares the payload's age against the newest commit, so the
+# payload may predate that commit.
+#
+# overlay names the directory of experiment configuration the push laid over the
+# payload, or none (a pack lays none). A config_sha256 line per file a run can be
+# varied by, over the copy that was stamped: the same files are in config/
+# beside these records, so a digest that disagrees with one of them is a payload
+# edited on the unit.
+#
+# A wake_model_sha256 line per model the speech configuration supplies itself,
+# naming its payload path and the digest of the copy that was stamped. The wake
+# head is a site file rather than a fetch this tree pins, and heads are retrained
+# under one name, so the commit above says nothing about which one this run
+# listened with. No such line means the payload carried no site-supplied model.
+#
+# brenn_pod is the other half of what built the voice host: the brenn-pod
+# revision the payload's build resolved its speech crates from. A value starting
+# overlay: means they came out of a working tree beside the building checkout
+# rather than a published revision, so no revision names those binaries. unknown
+# means the payload was staged by a build that recorded no such field.
+#
+# reachy_pod is the brenn-pod revision the audio-device binary was compiled from,
+# with +dirty when that checkout held uncommitted changes. named means an
+# operator handed the build a prebuilt artifact, whose revision nothing could
+# ask. unknown means the payload was staged by a build that did not record it,
+# which is also a build that did not hold this field and brenn_pod equal — so a
+# run whose two fields name two revisions is such a payload.
+commit=${commit}
+commit_source=${commit_source}
+brenn_pod=${brenn_pod}
+reachy_pod=${reachy_pod}
+stamped_by=${stamped_by}
+stamped_from=${stamped_from}
+stamped=${instant}
+dirty=${dirty}
+age_unchecked=${age_unchecked}
+overlay=${experiment_dir:-none}
+STAMP
+	for name in "${run_config_files[@]}"; do
+		echo "config_sha256=${name} $(sha256_of "${payload}/${name}")" >>"$into"
+	done
+	local model_path
+	while IFS=$'\t' read -r _ model_path _; do
+		[ -n "$model_path" ] || continue
+		echo "wake_model_sha256=${model_path} $(sha256_of "${payload}/${model_path}")" >>"$into"
+	done <<<"$staged_wake_models"
+	echo "${prog}: provenance: commit ${commit} (${commit_source}), stamped by ${stamped_by} from ${stamped_from}," \
+		"dirty=${dirty}, age_unchecked=${age_unchecked}" >&2
+}
 
 # ---------------------------------------------------------------------------
 # Reading the speech configuration

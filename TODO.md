@@ -754,7 +754,7 @@ Compose the logger box on a second `cpu_domain` — the dev host — and measure
 so an online run's records land on real disk instead of on the unit's tmpfs.
 
 Deferral context: the logger runs beside the control process on the unit today,
-writing `.olog` files to `/run/brenn-app/logs/motion`, and the run's records are
+writing `.olog` files to `/run/brenn-app/scratch/logs/motion`, and the run's records are
 pulled off with `rsync` after the run — scripted into `make motion-run` now,
 which fetches before the operator can power the unit down. That works and it
 keeps the deployment doctrine — nothing pushed to a unit touches its flash — but
