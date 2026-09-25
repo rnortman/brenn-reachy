@@ -29,6 +29,7 @@
 #     host/speech-record.toml                           a recording session's voice half
 #     bench/reachy-bench.toml                           the recorder's own configuration
 #     cogs/library.names.json                           the asset name table it reads
+#     cogs/idle.json                                    the idle loop's playlist
 #     models/oww/*.onnx                                 the wake gate's two front graphs
 #     models/silero/silero_vad.onnx                     the endpointer's graph
 #     wherever `[wake] model` puts it                   the wake gate's phrase head
@@ -203,11 +204,13 @@ model_paths=(
 #
 # The host's asset name table is named as a file rather than through a filegroup
 # because it is the one thing the host reads that the build produces: it is
-# generated beside the library it describes and belongs to the cogs. The host's
+# generated beside the library it describes and belongs to the cogs. The idle
+# playlist is named the same way, as a file the host reads by path. The host's
 # own configuration is not here at all -- it is a per-unit file, staged from
 # outside the tree below.
 config_targets=(
 	//cogs:library.names.json
+	//cogs:idle.json
 	//cogs:robot_config_files
 	//driver:motord_params.textproto
 )

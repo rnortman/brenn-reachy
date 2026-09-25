@@ -9,6 +9,26 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 Nothing has been released.
 
+### Added
+
+- **The robot dances between conversations.** The voice host now runs an
+  *idle loop*: while nobody is speaking it plays clips from a committed
+  playlist, `cogs/idle.json`, handing each one off to the next just before it
+  ends so the head never runs down to its stow. When speech takes the head the
+  loop steps back, and it resumes once speech is done. A refused idle clip
+  stops the loop until the next session change; it is never retried with a
+  different clip. Every idle clip goes through the same envelope check and
+  sequencing as speech.
+- **A fetched unit now runs the production configuration.** `brenn-app.service`
+  starts the production launcher, which dances the idle playlist until stopped,
+  instead of touring the library once and quitting. A playlist naming a clip
+  missing from the library keeps the voice host from starting. Publish only a
+  build you would let a power cycle start.
+- **`idle_run_report` judges an idle run.** It reads fetched motion logs and
+  checks the loop's handoffs, refusals and gaps in the sample stream.
+  `speech_run_report` now separates the loop's scripts from speech's before it
+  judges anything.
+
 ### Changed
 
 - **The imported vendor library is posed over the vendor's zero.** Every

@@ -58,6 +58,7 @@ payload="${repo}/target/motion-arm64/release"
 # case below is that these paths and the payload's paths are the same paths.
 config_files=(
 	cogs/library.names.json
+	cogs/idle.json
 	cogs/clip_library.textproto
 	cogs/mover_params.textproto
 	cogs/robot_logger.textproto
@@ -281,6 +282,10 @@ app {
 app {
   name: "voice_host"
   executable: "reachy_host"
+  args: "--speech-config"
+  args: "host/speech.toml"
+  args: "--idle"
+  args: "cogs/idle.json"
 }
 app {
   name: "pod"
@@ -774,7 +779,7 @@ assert_contains "the build builds the deployables the gate names" "$(calls)" \
 assert_contains "one cquery names every built output" "$(calls)" \
 	"//crates/reachy-motord:reachy_motord + //crates/reachy-host:reachy_host + //crates/reachy-ask:reachy_ask + //crates/reachy-bench:reachy_bench + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:robotcpu_harness.textproto + //cogs:robotcpu_record.textproto + //cogs:clockwork_prelaunch_sh"
 assert_contains "one cquery names the configuration" "$(calls)" \
-	"//cogs:library.names.json + //cogs:robot_config_files + //driver:motord_params.textproto"
+	"//cogs:library.names.json + //cogs:idle.json + //cogs:robot_config_files + //driver:motord_params.textproto"
 assert_lacks "and does not name the host's own configuration, which Bazel does not supply" \
 	"$(calls)" "//host:host_params.textproto"
 # Four, not one per file: the shared object and the model set each need one of
@@ -2968,6 +2973,22 @@ else
 	assert_eq "the launcher entry names the path the build stages one at" \
 		"$staged_speech" "$launch_speech"
 fi
+
+# The playlist reaches the host by the `config_targets` route, and a path that
+# moved on one side only is a host that exits at start.
+launch_idle=$(awk -F'"' '
+	/args: "--idle"/ { want = 1; next }
+	want && /args: "/ { print $2; exit }
+' "${real_repo}/host/host_launch.textproto")
+if [ -z "$launch_idle" ]; then
+	fail "the launcher entry names the idle playlist" \
+		"read no --idle argument from host/host_launch.textproto"
+else
+	assert_eq "the idle playlist the launcher entry names is a file the payload stages" \
+		yes "$(member_of "$launch_idle" "$staged_configs")"
+fi
+assert_lacks "the recording session's host runs no idle loop" \
+	"$(cat -- "${real_repo}/host/host_record_launch.textproto")" "--idle"
 
 # The same join for a recording session, whose two per-unit files reach two
 # processes the same way and can disagree the same way: the voice host's

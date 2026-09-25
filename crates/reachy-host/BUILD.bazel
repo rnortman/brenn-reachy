@@ -33,10 +33,15 @@ rust_library(
     },
     visibility = ["//visibility:public"],
     deps = [
+        "//cogs:session_clk_rs",
+        "//crates/motion-proto:motion_proto",
         "//crates/reachy-edge:reachy_edge",
         "//host:host_config_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
         "@brenn_reachy_crates//:prost-reflect",
         "@brenn_reachy_crates//:protox",
+        "@brenn_reachy_crates//:serde",
         "@brenn_reachy_crates//:serde_json",
         "@brenn_reachy_crates//:speech-surface",
         "@brenn_reachy_crates//:thiserror",
@@ -102,8 +107,11 @@ rust_test(
     crate = ":reachy_host",
     deps = [
         "//cogs:script_clk_rs",
+        "//cogs:session_clk_rs",
         "//crates/motion-proto:motion_proto",
         "//crates/reachy-scratch:reachy_scratch",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
         ":pose_fixture",
         ":reachy_host_lib",
         ":speech_fixture",
@@ -226,6 +234,31 @@ rust_test(
     edition = "2024",
     env = {
         "HOST_PARAMS": "host/host_params.example.textproto",
+        "CLIP_NAMES": "cogs/library.names.json",
+    },
+    deps = [
+        ":reachy_host_lib",
+        "//crates/reachy-edge:reachy_edge",
+    ],
+)
+
+# The committed idle playlist, read through the loader the host runs, against
+# the committed name table. It fails at commit what would otherwise be a voice
+# host that exits at start on a unit. A separate crate from the library's own
+# tests because it reads files: both arrive through runfiles, and the
+# environment variables name them beside the `data` attribute that supplies
+# them.
+rust_test(
+    name = "idle_playlist_test",
+    size = "small",
+    srcs = ["tests/idle_playlist.rs"],
+    data = [
+        "//cogs:idle.json",
+        "//cogs:library.names.json",
+    ],
+    edition = "2024",
+    env = {
+        "IDLE_PLAYLIST": "cogs/idle.json",
         "CLIP_NAMES": "cogs/library.names.json",
     },
     deps = [

@@ -1,4 +1,5 @@
-//! Shared motion-run log decoding seam used by the tour and supplied-script reports.
+//! Shared motion-run log reading and measurements used by the tour, supplied-script and idle
+//! reports.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -29,15 +30,15 @@ const SAMPLE_GAP_NS: i64 = NOMINAL_CYCLE_NS + NOMINAL_CYCLE_NS / 2;
 const MOVED_RAD: f64 = 1e-9;
 
 #[derive(Default)]
-pub(crate) struct Run {
-    pub(crate) scripts: Vec<Logged<ScriptWire>>,
-    pub(crate) schedules: Vec<Logged<SessionScheduleWire>>,
-    pub(crate) samples: Vec<Logged<PoseSampleWire>>,
-    pub(crate) events: Vec<Logged<DriverEventWire>>,
-    pub(crate) faults: Vec<Logged<TickFaultWire>>,
-    pub(crate) readings: Vec<Logged<HealthReportWire>>,
-    pub(crate) census: Census,
-    pub(crate) complaints: Complaints,
+pub struct Run {
+    pub scripts: Vec<Logged<ScriptWire>>,
+    pub schedules: Vec<Logged<SessionScheduleWire>>,
+    pub samples: Vec<Logged<PoseSampleWire>>,
+    pub events: Vec<Logged<DriverEventWire>>,
+    pub faults: Vec<Logged<TickFaultWire>>,
+    pub readings: Vec<Logged<HealthReportWire>>,
+    pub census: Census,
+    pub complaints: Complaints,
 }
 
 impl Streams for Run {
@@ -49,7 +50,7 @@ impl Streams for Run {
     }
 }
 
-pub(crate) const CHANNELS: [Bound<Run>; 6] = [
+pub const CHANNELS: [Bound<Run>; 6] = [
     Bound {
         name: SCRIPT_CHANNEL,
         check: binding::<ScriptWire>,
@@ -82,18 +83,18 @@ pub(crate) const CHANNELS: [Bound<Run>; 6] = [
     },
 ];
 
-pub(crate) fn read(dir: &Path) -> Result<Run, clockwork_logs::LogError> {
+pub fn read(dir: &Path) -> Result<Run, clockwork_logs::LogError> {
     read_with(dir, &CHANNELS)
 }
 
 impl Run {
-    pub(crate) fn ordered_samples(&self) -> Vec<&Logged<PoseSampleWire>> {
+    pub fn ordered_samples(&self) -> Vec<&Logged<PoseSampleWire>> {
         let mut ordered: Vec<_> = self.samples.iter().collect();
         ordered.sort_by_key(|sample| sample.message.nominal_time().as_nanos());
         ordered
     }
 
-    pub(crate) fn ordered_events(&self) -> Vec<&Logged<DriverEventWire>> {
+    pub fn ordered_events(&self) -> Vec<&Logged<DriverEventWire>> {
         let mut ordered: Vec<_> = self.events.iter().collect();
         ordered.sort_by_key(|event| event.message.time().as_nanos());
         ordered
@@ -101,20 +102,20 @@ impl Run {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Window {
-    pub(crate) motion_id: u16,
-    pub(crate) start_ns: i64,
-    pub(crate) end_ns: i64,
+pub struct Window {
+    pub motion_id: u16,
+    pub start_ns: i64,
+    pub end_ns: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Span {
-    pub(crate) start_ns: i64,
-    pub(crate) end_ns: i64,
+pub struct Span {
+    pub start_ns: i64,
+    pub end_ns: i64,
 }
 
 impl Window {
-    pub(crate) fn span(self) -> Span {
+    pub fn span(self) -> Span {
         Span {
             start_ns: self.start_ns,
             end_ns: self.end_ns,
@@ -122,20 +123,32 @@ impl Window {
     }
 }
 
-pub(crate) fn overlay_spans(windows: &[Window]) -> Vec<Span> {
+pub fn overlay_spans(windows: &[Window]) -> Vec<Span> {
     windows.iter().copied().map(Window::span).collect()
 }
 
-pub(crate) struct Prepared<'a> {
-    pub(crate) ordered: Vec<&'a Logged<PoseSampleWire>>,
-    pub(crate) events: Vec<&'a Logged<DriverEventWire>>,
-    pub(crate) grid: Grid,
-    pub(crate) skips: Skips<'a>,
-    pub(crate) plant: GroupPlants,
-    pub(crate) stream: Vec<(i64, [Residual; ROWS.len()])>,
+/// One place a replacing schedule cut a playing window short.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Seam {
+    /// The replacing schedule's log time.
+    pub at_ns: i64,
+    /// The window it dropped, ending at `at_ns`.
+    pub outgoing: Window,
+    /// The window the replacing schedule opened, as the plan ends it; none when
+    /// the replacing schedule plays nothing new.
+    pub incoming: Option<Window>,
 }
 
-pub(crate) fn prepare<'a>(run: &'a Run, config: &RunConfig) -> Result<Prepared<'a>, String> {
+pub struct Prepared<'a> {
+    pub ordered: Vec<&'a Logged<PoseSampleWire>>,
+    pub events: Vec<&'a Logged<DriverEventWire>>,
+    pub grid: Grid,
+    pub skips: Skips<'a>,
+    pub plant: GroupPlants,
+    pub stream: Vec<(i64, [Residual; ROWS.len()])>,
+}
+
+pub fn prepare<'a>(run: &'a Run, config: &RunConfig) -> Result<Prepared<'a>, String> {
     let ordered = run.ordered_samples();
     let origin = ordered
         .first()
@@ -161,14 +174,32 @@ pub(crate) fn prepare<'a>(run: &'a Run, config: &RunConfig) -> Result<Prepared<'
     })
 }
 
-pub(crate) fn windows(run: &Run) -> Vec<Window> {
+/// Every window that opened, as the schedules end it.
+pub fn windows(run: &Run) -> Vec<Window> {
+    windows_and_seams(run).0
+}
+
+/// Every window that opened, as the schedules end it, and every seam. A window
+/// dropped at or before its start never opened and is not returned. A window still
+/// open and not carried by a schedule is dropped at that schedule's log time. A
+/// seam is a drop that cut a window already playing and not yet closed; a window
+/// that closed before the next schedule, or one that never opened, is not one.
+/// The seam's incoming window is the first window, in start order, that the
+/// replacing schedule was first to carry, as the plan finally ends it.
+pub fn windows_and_seams(run: &Run) -> (Vec<Window>, Vec<Seam>) {
     let mut ordered: Vec<_> = run.schedules.iter().collect();
     ordered.sort_by_key(|schedule| schedule.at_ns);
     let mut planned: BTreeMap<(i64, u16), (i64, bool)> = BTreeMap::new();
+    let mut drops = Vec::new();
     for schedule in ordered {
+        let at = schedule.at_ns;
         let mut carried = BTreeSet::new();
+        let mut fresh = BTreeSet::new();
         for window in schedule.message.overlays().iter() {
             let key = (window.start().as_nanos(), window.motion_id());
+            if !planned.contains_key(&key) {
+                fresh.insert(key);
+            }
             carried.insert(key);
             planned
                 .entry(key)
@@ -179,37 +210,69 @@ pub(crate) fn windows(run: &Run) -> Vec<Window> {
                 })
                 .or_insert((window.end().as_nanos(), true));
         }
+        let opened = fresh.first().copied();
+        let mut unopened: Vec<(i64, u16)> = Vec::new();
         for (key, held) in &mut planned {
             if held.1 && !carried.contains(key) {
-                held.0 = held.0.min(schedule.at_ns);
+                if at <= key.0 {
+                    unopened.push(*key);
+                } else {
+                    if at < held.0 {
+                        let outgoing = Window {
+                            motion_id: key.1,
+                            start_ns: key.0,
+                            end_ns: at,
+                        };
+                        drops.push((at, outgoing, opened));
+                    }
+                    held.0 = held.0.min(at);
+                }
                 held.1 = false;
             }
         }
+        for key in unopened {
+            planned.remove(&key);
+        }
     }
-    planned
-        .into_iter()
-        .map(|((start_ns, motion_id), (end_ns, _))| Window {
+    let windows = planned
+        .iter()
+        .map(|(&(start_ns, motion_id), &(end_ns, _))| Window {
             motion_id,
             start_ns,
             end_ns,
         })
-        .collect()
+        .collect();
+    let seams = drops
+        .into_iter()
+        .map(|(at_ns, outgoing, opened)| Seam {
+            at_ns,
+            outgoing,
+            incoming: opened.and_then(|key| {
+                planned.get(&key).map(|&(end_ns, _)| Window {
+                    motion_id: key.1,
+                    start_ns: key.0,
+                    end_ns,
+                })
+            }),
+        })
+        .collect();
+    (windows, seams)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SettleMove {
-    pub(crate) start_ns: i64,
-    pub(crate) end_ns: i64,
-    pub(crate) pose_id: u16,
-    pub(crate) pace_ns: i64,
-    pub(crate) measured: bool,
-    pub(crate) reason: Option<String>,
+pub struct SettleMove {
+    pub start_ns: i64,
+    pub end_ns: i64,
+    pub pose_id: u16,
+    pub pace_ns: i64,
+    pub measured: bool,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SettleResult {
-    pub(crate) moves: Vec<SettleMove>,
-    pub(crate) maxima: [Option<(f64, u16, &'static str, i64)>; 6],
+pub struct SettleResult {
+    pub moves: Vec<SettleMove>,
+    pub maxima: [Option<(f64, u16, &'static str, i64)>; 6],
 }
 
 /// The largest observed end-of-move residual over the committed library,
@@ -219,9 +282,9 @@ pub(crate) struct SettleResult {
 /// (`TODO(head-body-interference)`), this is a run bound and not a measured
 /// property of a servo. The envelope floor is derived to provide five times
 /// this bound at the outer merge.
-pub(crate) const SETTLE_BOUND_COUNTS: f64 = 18.0;
+pub const SETTLE_BOUND_COUNTS: f64 = 18.0;
 
-pub(crate) fn settle(
+pub fn settle(
     run: &Run,
     ordered: &[&Logged<PoseSampleWire>],
     overlays: &[Window],
@@ -404,7 +467,7 @@ pub(crate) fn settle(
     SettleResult { moves, maxima }
 }
 
-pub(crate) fn whole_stream_measurements(
+pub fn whole_stream_measurements(
     prepared: &Prepared<'_>,
     run: &Run,
     config: &RunConfig,
@@ -422,7 +485,7 @@ pub(crate) fn whole_stream_measurements(
 }
 /// What the sidecar calls the motion at `motion_id`, or the index itself where
 /// it names none.
-pub(crate) fn named_motion(by_id: &BTreeMap<u16, String>, motion_id: u16) -> String {
+pub fn named_motion(by_id: &BTreeMap<u16, String>, motion_id: u16) -> String {
     by_id
         .get(&motion_id)
         .cloned()
@@ -434,7 +497,7 @@ pub(crate) fn named_motion(by_id: &BTreeMap<u16, String>, motion_id: u16) -> Str
 /// A slice of the one sorted stream rather than a scan of it: every check below
 /// walks every window, and a scan apiece is windows x samples on a tool whose
 /// two factors both grow with the library.
-pub(crate) fn inside<'a>(
+pub fn inside<'a>(
     ordered: &'a [&'a Logged<PoseSampleWire>],
     window: &Window,
 ) -> &'a [&'a Logged<PoseSampleWire>] {
@@ -445,7 +508,7 @@ pub(crate) fn inside<'a>(
 }
 
 /// The driver events the sorted stream holds inside `window`.
-pub(crate) fn events_inside<'a>(
+pub fn events_inside<'a>(
     ordered: &'a [&'a Logged<DriverEventWire>],
     window: &Window,
 ) -> &'a [&'a Logged<DriverEventWire>] {
@@ -463,7 +526,7 @@ pub(crate) fn events_inside<'a>(
 /// machine did not play, whatever the plan said -- and that is this tool's
 /// whole-library assertion: it fails on the first clip the envelope refuses
 /// over the raised base, which is the discovery the run exists for.
-pub(crate) fn every_window_moved(
+pub fn every_window_moved(
     ordered: &[&Logged<PoseSampleWire>],
     planned: &[Window],
     by_id: &BTreeMap<u16, String>,
@@ -518,7 +581,7 @@ pub(crate) fn every_window_moved(
 
 /// The worst figure over the nine rows, and the joint that carried it.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct Worst {
+pub struct Worst {
     /// The figure itself, radians.
     figure: f64,
     /// Which joint stood at it.
@@ -554,7 +617,7 @@ impl std::fmt::Display for Worst {
 /// outside it a pair is clear of the other's arc whatever it is doing, and a
 /// mirror offset taken there says nothing about meeting.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct Nearest {
+pub struct Nearest {
     /// The smallest mirror offset seen with both antennas inside the band.
     offset: Option<f64>,
 }
@@ -594,7 +657,7 @@ impl std::fmt::Display for Nearest {
 /// the run by, which are the same numbers. Nothing here fails a run: a lag is a
 /// reading, and what a reading means is not this tool's to decide until
 /// something knows what the servo can do.
-pub(crate) fn measurements(
+pub fn measurements(
     ordered: &[&Logged<PoseSampleWire>],
     events: &[&Logged<DriverEventWire>],
     planned: &[Window],
@@ -664,7 +727,7 @@ pub(crate) fn measurements(
     }
 }
 
-pub(crate) fn window_measurements(
+pub fn window_measurements(
     prepared: &Prepared<'_>,
     planned: &[Window],
     by_id: &BTreeMap<u16, String>,
@@ -697,11 +760,7 @@ pub(crate) fn window_measurements(
 ///
 /// `standard` is the one thing this tool's two kinds of run disagree about, and
 /// it comes off the table the run was asked for: see [`held_standard`].
-pub(crate) fn stillness(
-    ordered: &[&Logged<PoseSampleWire>],
-    standard: Standard,
-    report: &mut Report,
-) {
+pub fn stillness(ordered: &[&Logged<PoseSampleWire>], standard: Standard, report: &mut Report) {
     let mut held = Stillness::default();
     for sample in ordered {
         held.sample(&sample.message);
@@ -718,20 +777,20 @@ pub(crate) fn stillness(
 /// asked to measure and fails. A content tour holds the antennas almost only
 /// while the head moves, so the same absence there is a reading of the content
 /// and fails nothing.
-#[allow(dead_code)]
-pub(crate) fn held_standard(table: &MotionTable) -> Standard {
+pub fn held_standard(table: &MotionTable) -> Standard {
     if table.probes_only() {
         Standard::JudgedWhereHeadStillRequired
     } else {
         Standard::JudgedWhereHeadStill
     }
 }
-/// The sample stream held for the whole of the tour.
+/// The sample stream held for the whole of the stretch judged, which `over`
+/// names in what the report says.
 ///
 /// The record is the point of the run, so a stretch of it the log does not hold
 /// is a finding whatever else the run did. Judged between the first window
-/// opening and the last one closing: what the driver did before the tour began
-/// and after it ended is not the tour's.
+/// opening and the last one closing: what the driver did before the stretch
+/// began and after it ended is not the stretch's.
 ///
 /// A gap the driver itself reported as skipped cycles is not one of those. It
 /// is the machine saying it missed its slots, which is a reading the run was
@@ -743,12 +802,13 @@ pub(crate) fn held_standard(table: &MotionTable) -> Standard {
 /// One finding rather than one per gap: a run that dropped a stretch drops
 /// hundreds of samples, and a report of hundreds of identical lines is one
 /// nobody reads to the end.
-pub(crate) fn the_stream_held(
+pub fn the_stream_held(
     ordered: &[&Logged<PoseSampleWire>],
     planned: &[Span],
     grid: Grid,
     skips: &Skips<'_>,
     report: &mut Report,
+    over: &str,
 ) {
     let (Some(first), Some(last)) = (
         planned.iter().map(|span| span.start_ns).min(),
@@ -771,7 +831,7 @@ pub(crate) fn the_stream_held(
     let mut gaps = 0_usize;
     let mut accounted = 0_usize;
     let mut worst = (0_i64, 0_i64);
-    // The stretch the tour is judged over runs from the first window opening to
+    // The stretch judged runs from the first window opening to
     // the last one closing, so the two ends are gaps of their own: a stream
     // that started late or stopped early holds no pair to read them off.
     let mut ends = vec![(first, held[0])];
@@ -793,7 +853,7 @@ pub(crate) fn the_stream_held(
     }
     if gaps > 0 {
         report.fail(format!(
-            "the sample stream has {gaps} gap(s) over the tour that no skipped-cycle report \
+            "the sample stream has {gaps} gap(s) over {over} that no skipped-cycle report \
              accounts for; the longest is {:.1} ms from {}",
             worst.0 as f64 / 1e6,
             worst.1
@@ -806,7 +866,7 @@ pub(crate) fn the_stream_held(
         ));
     }
     report.note(format!(
-        "{} sample(s) between the first window opening and the last one closing",
+        "{} sample(s) over {over}, between the first window opening and the last one closing",
         held.len()
     ));
 }
@@ -825,5 +885,164 @@ mod settle_invariant_tests {
         let rho = a + r - margin;
         let angle = ((a * a + rho * rho - r * r) / (2.0 * a * rho)).acos();
         assert!(angle >= 5.0 * SETTLE_BOUND_COUNTS * COUNT_RAD);
+    }
+}
+
+#[cfg(test)]
+mod window_fold_tests {
+    //! How schedules end windows and where seams fall.
+
+    use brenn_reachy__cogs__schedule_clk_rs::{OverlayWindowWire, SessionScheduleWire};
+    use clockwork_rs::SyncTime;
+    use log_read::Logged;
+    use reachy_driver::NOMINAL_CYCLE_NS;
+
+    use super::{Run, Seam, Window, windows_and_seams};
+
+    /// An arbitrary instant a synthetic run starts at, chosen for being nothing
+    /// round.
+    const T0: i64 = 1_772_000_000_123_456_789;
+
+    /// The instant cycle `n` of a synthetic run sits at.
+    fn at_cycle(n: i64) -> i64 {
+        T0 + n * NOMINAL_CYCLE_NS
+    }
+
+    /// A schedule logged at cycle `n`, carrying one window per
+    /// `(motion_id, start, end)`, in cycles.
+    fn schedule(n: i64, windows: &[(u16, i64, i64)]) -> Logged<SessionScheduleWire> {
+        let mut message = SessionScheduleWire::new();
+        message.set_engaged(true);
+        {
+            let mut rows = message.overlays_mut();
+            rows.clear();
+            for &(motion_id, start, end) in windows {
+                let row: &mut OverlayWindowWire =
+                    rows.try_grow().expect("a schedule of few windows");
+                row.set_motion_id(motion_id);
+                row.set_start(SyncTime::from_nanos(at_cycle(start)));
+                row.set_end(SyncTime::from_nanos(at_cycle(end)));
+                row.set_gain(1.0);
+                row.set_speed(1.0);
+            }
+        }
+        Logged {
+            at_ns: at_cycle(n),
+            sequence_number: u32::try_from(n).expect("a small cycle"),
+            message,
+        }
+    }
+
+    /// A window over `motion_id` from cycle `start` to cycle `end`.
+    fn w(motion_id: u16, start: i64, end: i64) -> Window {
+        Window {
+            motion_id,
+            start_ns: at_cycle(start),
+            end_ns: at_cycle(end),
+        }
+    }
+
+    /// What the fold makes of `schedules`.
+    fn fold(schedules: Vec<Logged<SessionScheduleWire>>) -> (Vec<Window>, Vec<Seam>) {
+        windows_and_seams(&Run {
+            schedules,
+            ..Run::default()
+        })
+    }
+
+    /// One row of the fold's table: a name, the schedules, and the windows and
+    /// seams they fold to.
+    type Case = (
+        &'static str,
+        Vec<Logged<SessionScheduleWire>>,
+        Vec<Window>,
+        Vec<Seam>,
+    );
+
+    #[test]
+    fn schedules_end_windows_and_mark_seams() {
+        let replaced = || vec![schedule(0, &[(0, 1, 40)]), schedule(20, &[(1, 21, 60)])];
+        let mut twice = replaced();
+        twice.push(schedule(40, &[(0, 41, 80)]));
+        let cases: Vec<Case> = vec![
+            (
+                "no replacement",
+                vec![schedule(0, &[(0, 1, 40)])],
+                vec![w(0, 1, 40)],
+                vec![],
+            ),
+            (
+                "replacement mid-play",
+                replaced(),
+                vec![w(0, 1, 20), w(1, 21, 60)],
+                vec![Seam {
+                    at_ns: at_cycle(20),
+                    outgoing: w(0, 1, 20),
+                    incoming: Some(w(1, 21, 60)),
+                }],
+            ),
+            (
+                "two consecutive replacements",
+                twice,
+                vec![w(0, 1, 20), w(1, 21, 40), w(0, 41, 80)],
+                vec![
+                    Seam {
+                        at_ns: at_cycle(20),
+                        outgoing: w(0, 1, 20),
+                        incoming: Some(w(1, 21, 40)),
+                    },
+                    Seam {
+                        at_ns: at_cycle(40),
+                        outgoing: w(1, 21, 40),
+                        incoming: Some(w(0, 41, 80)),
+                    },
+                ],
+            ),
+            (
+                "replacement landing exactly on the window's end",
+                vec![schedule(0, &[(0, 1, 20)]), schedule(20, &[(1, 21, 60)])],
+                vec![w(0, 1, 20), w(1, 21, 60)],
+                vec![],
+            ),
+            (
+                "the playing window carried alongside a new one",
+                vec![
+                    schedule(0, &[(0, 1, 40)]),
+                    schedule(20, &[(0, 1, 40), (1, 41, 60)]),
+                ],
+                vec![w(0, 1, 40), w(1, 41, 60)],
+                vec![],
+            ),
+            (
+                "replacement playing nothing new",
+                vec![schedule(0, &[(0, 1, 40)]), schedule(20, &[])],
+                vec![w(0, 1, 20)],
+                vec![Seam {
+                    at_ns: at_cycle(20),
+                    outgoing: w(0, 1, 20),
+                    incoming: None,
+                }],
+            ),
+            (
+                "dropped before it opened",
+                vec![schedule(0, &[(0, 100, 140)]), schedule(50, &[])],
+                vec![],
+                vec![],
+            ),
+            (
+                "dropped exactly at its start",
+                vec![schedule(0, &[(0, 50, 90)]), schedule(50, &[])],
+                vec![],
+                vec![],
+            ),
+        ];
+        for (case, schedules, windows, seams) in cases {
+            let (got_windows, got_seams) = fold(schedules);
+            for window in &got_windows {
+                assert!(window.start_ns < window.end_ns, "{case}: {window:?}");
+            }
+            assert_eq!(got_windows, windows, "{case}");
+            assert_eq!(got_seams, seams, "{case}");
+        }
     }
 }

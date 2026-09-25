@@ -104,7 +104,8 @@ use run_report::event::{
     LISTENING, PLAYBACK_FINISHED, PLAYBACK_FLUSHED, PLAYBACK_STARTED, UTTERANCE,
 };
 use run_report::{
-    EVENT_HEAD, Report, audio_dir, console_dir, quote, recover, utterance_id, write_verdict,
+    EVENT_HEAD, HOST_LOG, Report, audio_dir, console_dir, quote, recover, utterance_id,
+    write_verdict,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -112,9 +113,6 @@ use speech_pipeline::listener::silero::{SILERO_CHUNK, SILERO_SAMPLE_RATE};
 
 /// The launcher's name for the recorder's console, which is the pose stream.
 const RECORDER_LOG: &str = "recorder_0.log";
-
-/// The launcher's name for the voice host's console, which is the speech record.
-const HOST_LOG: &str = "voice_host_0.log";
 
 /// A playback the writer gave up on. Terminal, like a flush: the job settles on
 /// it and no finish follows it.

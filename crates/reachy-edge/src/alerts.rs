@@ -197,7 +197,8 @@ impl Alerts {
     /// The run counts *consecutive* drops, so an accepted script is what says
     /// the sender and this machine still agree about numbering. The refusal
     /// count is not reset by it: a run that refused scripts refused them,
-    /// whatever happened afterwards.
+    /// whatever happened afterwards. It is called for a sender's body; the
+    /// host's own scripts (`HostEdge::offer_own`) do not call it.
     pub fn accepted(&mut self) {
         self.stale_run = 0;
     }

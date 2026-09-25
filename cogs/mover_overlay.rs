@@ -223,7 +223,7 @@ pub(crate) fn screen<'a>(
 
 /// Decide the one command this sample asks the tick for.
 ///
-/// Three answers, and which one it is turns on whether a window covers this
+/// Four answers, and which one it is turns on whether a window covers this
 /// instant:
 ///
 /// - **No window, and the tick has the base.** The ordinary posture path: the
@@ -239,6 +239,12 @@ pub(crate) fn screen<'a>(
 ///   sending it. The contribution the closing window was carrying is absorbed
 ///   into that plan's starting point and decays under the same step bound as
 ///   every other move, so the commanded stream is continuous across the close.
+/// - **A window covers it, and a row was taken over.** A row whose player is
+///   replaced by a fresh join in the same period -- another motion's window in
+///   the same row, or a player that could not be picked up -- is a row vacated
+///   and refilled in one period: the base is re-anchored at the composed
+///   setpoint last commanded, as for a vacate, and the incoming player blends in
+///   from there.
 ///
 /// `anchor` is where the last period left the stream, read off the tick's state
 /// by the caller: this function holds the slot open for the base and the players,
@@ -320,20 +326,21 @@ pub(crate) fn decide(
             }),
     };
 
-    // The rows this period, and whether a window closed out from under one. A
-    // player that ran out is not that: its own exit ramp took its contribution
-    // to zero, which is the whole point of the ramp.
+    // The rows this period, and whether a window closed out from under one or
+    // was taken over. A player that ran out is not that: its own exit ramp
+    // took its contribution to zero, which is the whole point of the ramp.
     let playing = active_rows(state);
-    let (samples, refused) = {
+    let (samples, refused, restarted) = {
         let (mut layer, refusals) =
             Overlays::take_up(&mut state.players_mut()[..], windows, ask.now_ns);
         (
             layer.sample(ask.period, setpoint.antennas),
             refusals.players,
+            refusals.restarted,
         )
     };
     counters.players_refused += refused;
-    let vacated = playing & !active_rows(state) != 0;
+    let vacated = (playing & !active_rows(state)) | restarted != 0;
 
     // The re-anchor, which is the mechanism the whole layer's continuity rests
     // on: the base is moved to the composed setpoint that was last commanded
@@ -1267,6 +1274,246 @@ mod tests {
             base.head_pose_body
         );
         assert_eq!(counters.refused_base, 0);
+    }
+
+    /// A takeover schedule row: `(motion, start, end)`, with times in nanoseconds.
+    type TakeoverWindow = (u16, i64, i64);
+
+    /// Three posed antenna motions of 50 frames at 50 Hz, one segment each,
+    /// posed over the default targets, whose antennas are zero, so each clip's
+    /// delta is the absolute antenna pair it commands at full weight: `lean`
+    /// (id 0) at `[0.3, -0.3]` and `tilt` (id 1) at `[-0.2, 0.2]`, both
+    /// blending 40 ms in and out, and `snap` (id 2) at `[0.1, -0.1]` with no
+    /// blend-in and a 40 ms blend-out. Every target and every commanded value
+    /// in these tests is within 0.3 rad of zero, so no antenna is lifted to
+    /// another turn. A schedule of `(motion, start, end)` windows over them, at
+    /// gain and speed 1, and the base they ride.
+    fn takeover_windows() -> (impl Fn(&[TakeoverWindow]) -> Windows<'static>, JointTargets) {
+        let clip = |name: &str, antennas: [f64; 2], blend_in_ms: u32| {
+            Clip::from_doc_resolved(
+                ClipDoc {
+                    base: Some(BaseDoc::Named("neutral".to_owned())),
+                    version: 1,
+                    kind: "clip".to_owned(),
+                    name: name.to_owned(),
+                    description: None,
+                    channels: vec![Channel::Antennas],
+                    frame_hz: 50.0,
+                    blend_in_ms: Some(blend_in_ms),
+                    blend_out_ms: Some(40),
+                    frames: (0..50)
+                        .map(|_| FrameDoc {
+                            dt: None,
+                            dq: None,
+                            body_yaw: None,
+                            antennas: Some(antennas),
+                        })
+                        .collect(),
+                },
+                &ClipLimits::default(),
+                |_| Some(JointTargets::default()),
+            )
+            .expect("takeover fixture loads")
+        };
+        let clips = [
+            clip("lean", [0.3, -0.3], 40),
+            clip("tilt", [-0.2, 0.2], 40),
+            clip("snap", [0.1, -0.1], 0),
+        ];
+        let mut library = ClipLibraryConfigWire::new_boxed();
+        {
+            let message = library.clear_valid();
+            for clip in &clips {
+                write_clip(clip, message.clips.try_grow().expect("clip slot"))
+                    .expect("fixture writes");
+            }
+            for clip_id in 0..3u16 {
+                let motion = message.motions.try_grow().expect("motion slot");
+                motion.lead_gap_ms = 0;
+                let segment = motion.segments.try_grow().expect("segment slot");
+                segment.clip_id = clip_id;
+                segment.speed = 1.0;
+                segment.gap_after_ms = 0;
+            }
+        }
+        let library: &'static ClipLibraryConfigWire = Box::leak(library);
+        let validated: &'static ValidatedLibrary<'static> = Box::leak(Box::new(
+            ValidatedLibrary::of(library.validate().expect("fixture validates"))
+                .expect("fixture establishes"),
+        ));
+        let schedule = move |rows: &[TakeoverWindow]| {
+            let mut message = brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire::new();
+            let mut windows = message.overlays_mut();
+            for &(motion_id, start, end) in rows {
+                let row: &mut OverlayWindowWire = windows.try_grow().expect("window slot");
+                row.set_motion_id(motion_id);
+                row.set_start(SyncTime::from_nanos(start));
+                row.set_end(SyncTime::from_nanos(end));
+                row.set_gain(1.0);
+                row.set_speed(1.0);
+            }
+            Windows::of(&message, validated)
+        };
+        (schedule, JointTargets::default())
+    }
+
+    /// One period of `decide` under `windows` at `now_ms`, from `setpoint`.
+    fn takeover_step(
+        state: &mut MoverStateWire,
+        windows: &Windows<'_>,
+        now_ms: i64,
+        setpoint: JointTargets,
+        counters: &mut MoverCounters,
+    ) -> JointTargets {
+        let commanded = decide(
+            &MotionConfig::default(),
+            state,
+            windows,
+            false,
+            &Ask {
+                now_ns: now_ms * 1_000_000,
+                period: Duration::from_millis(20),
+                tick_hz: TICK_HZ,
+                fresh: None,
+                standing: None,
+            },
+            &Anchor {
+                setpoint,
+                margin: 1.0,
+            },
+            counters,
+        );
+        let MotionCommand::Track(targets) = commanded.command.expect("a window commands") else {
+            panic!("a window's command is not tracked")
+        };
+        targets
+    }
+
+    /// `lean` played in row 0 from 0 over four periods, each command fed back
+    /// as the next anchor. The last command, with the outgoing contribution
+    /// standing at full weight.
+    fn takeover_lead_in(
+        schedule: &impl Fn(&[TakeoverWindow]) -> Windows<'static>,
+        base: JointTargets,
+        state: &mut MoverStateWire,
+        counters: &mut MoverCounters,
+    ) -> JointTargets {
+        let leaning = schedule(&[(0, 0, 1_000_000_000)]);
+        let mut setpoint = base;
+        for now_ms in [0, 20, 40, 60] {
+            setpoint = takeover_step(state, &leaning, now_ms, setpoint, counters);
+        }
+        for (slot, delta) in [0.3, -0.3].into_iter().enumerate() {
+            assert!(
+                (setpoint.antennas[slot] - base.antennas[slot]).abs() >= 0.25,
+                "the lead-in has {delta} standing on antenna {slot}: {:?}",
+                setpoint.antennas
+            );
+        }
+        setpoint
+    }
+
+    /// The seam the idle loop makes at every clip: a row playing one motion is
+    /// taken over by a window of another in the same period. The sample the
+    /// take-over lands on is the setpoint last commanded plus the re-anchored
+    /// base's first planned step; a mover that did not re-anchor would command
+    /// the bare base there, which stands the whole outgoing contribution --
+    /// 0.3 rad on each antenna -- away.
+    #[test]
+    fn a_row_taken_over_by_another_motion_commands_the_last_setpoint() {
+        let (schedule, base) = takeover_windows();
+        let mut state = MoverStateWire::new();
+        let mut counters = MoverCounters::default();
+        let anchor = takeover_lead_in(&schedule, base, &mut state, &mut counters);
+
+        let tilting = schedule(&[(1, 70_000_000, 1_000_000_000)]);
+        let taken = takeover_step(&mut state, &tilting, 80, anchor, &mut counters);
+        for slot in 0..2 {
+            assert!(
+                (taken.antennas[slot] - anchor.antennas[slot]).abs() <= 0.02,
+                "antenna {slot} stepped from {} to {} on the take-over",
+                anchor.antennas[slot],
+                taken.antennas[slot]
+            );
+            assert!(
+                (anchor.antennas[slot] - base.antennas[slot]).abs() >= 0.25,
+                "the bare base is where a mover that did not re-anchor would be"
+            );
+        }
+        assert!((taken.body_yaw - anchor.body_yaw).abs() <= 1e-9);
+        assert!(
+            (taken.head_pose_body.translation.vector - anchor.head_pose_body.translation.vector)
+                .norm()
+                <= 1e-9
+        );
+
+        let blending = takeover_step(&mut state, &tilting, 100, taken, &mut counters);
+        assert!(
+            blending.antennas[0] < taken.antennas[0] && blending.antennas[1] > taken.antennas[1],
+            "the incoming clip blends in toward its own delta: {:?} then {:?}",
+            taken.antennas,
+            blending.antennas
+        );
+        assert_eq!(counters.players_refused, 0);
+    }
+
+    /// A take-over by a posed clip with no blend-in, the probe instruments'
+    /// shape. The base is re-anchored as for any take-over. But a posed channel
+    /// at full weight commands the clip's own pose whatever the base, so the
+    /// first sample is `snap`'s content, a 0.2 rad step from the setpoint last
+    /// commanded. That is content, not a seam, and the re-anchor does not
+    /// smooth it and must not.
+    #[test]
+    fn a_take_over_by_a_clip_with_no_blend_in_steps_onto_its_content() {
+        let (schedule, base) = takeover_windows();
+        let mut state = MoverStateWire::new();
+        let mut counters = MoverCounters::default();
+        let anchor = takeover_lead_in(&schedule, base, &mut state, &mut counters);
+
+        let snapping = schedule(&[(2, 70_000_000, 1_000_000_000)]);
+        let taken = takeover_step(&mut state, &snapping, 80, anchor, &mut counters);
+        for (slot, content) in [0.1, -0.1].into_iter().enumerate() {
+            assert!(
+                (taken.antennas[slot] - content).abs() <= 1e-9,
+                "antenna {slot}: snap commands {content} at full weight on its first sample, \
+                 and the take-over commanded {}",
+                taken.antennas[slot]
+            );
+            assert!(
+                (taken.antennas[slot] - anchor.antennas[slot]).abs() >= 0.15,
+                "antenna {slot}: the take-over is a step onto snap's content, not a seam \
+                 the re-anchor smooths: {} then {}",
+                anchor.antennas[slot],
+                taken.antennas[slot]
+            );
+        }
+        assert_eq!(counters.players_refused, 0);
+    }
+
+    /// The same motion re-sent in the same row is picked up, not taken over: its
+    /// clock carries on and the base is not re-anchored.
+    #[test]
+    fn the_same_motion_in_the_same_row_is_still_picked_up() {
+        let (schedule, base) = takeover_windows();
+        let mut state = MoverStateWire::new();
+        let mut counters = MoverCounters::default();
+        let anchor = takeover_lead_in(&schedule, base, &mut state, &mut counters);
+
+        let again = schedule(&[(0, 70_000_000, 1_000_000_000)]);
+        takeover_step(&mut state, &again, 80, anchor, &mut counters);
+        let clock = state.players()[0].clock_s();
+        assert!(
+            clock > 0.01 + 1e-9,
+            "the player carried on its clock ({clock} s) rather than rejoining at 0.01 s"
+        );
+        assert_eq!(
+            read_base(state.base())
+                .expect("base reads")
+                .expect("base is held")
+                .targets,
+            base,
+            "a pick-up does not re-anchor the base"
+        );
     }
 
     /// The clocks a scenario derives are the floored ones, not the asked ones.

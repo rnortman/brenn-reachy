@@ -127,14 +127,23 @@ pub fn edge_line_with(kind: &str, at: SyncTime, says: &str, fields: &[(&str, Val
 /// `origin` is on the line because it is what separates a sender disagreeing
 /// with this machine from this machine disagreeing with itself, and a reader
 /// after the fact cannot recover it from anything else the line carries.
+/// [`refusal_line_with`] is the same line carrying fields of its own.
 #[must_use]
 pub fn refusal_line(refusal: &Refusal, origin: Origin, at: SyncTime) -> String {
-    edge_line_with(
-        refusal.kind(),
-        at,
-        &refusal.to_string(),
-        &[("origin", json!(origin_word(origin)))],
-    )
+    refusal_line_with(refusal, origin, at, &[])
+}
+
+/// One body the edge dropped, as a line carrying `fields` after its `origin`.
+#[must_use]
+pub fn refusal_line_with(
+    refusal: &Refusal,
+    origin: Origin,
+    at: SyncTime,
+    fields: &[(&str, Value)],
+) -> String {
+    let mut all = vec![("origin", json!(origin_word(origin)))];
+    all.extend(fields.iter().cloned());
+    edge_line_with(refusal.kind(), at, &refusal.to_string(), &all)
 }
 
 /// The story went backwards: the process telling it restarted.
@@ -216,6 +225,40 @@ pub const fn origin_word(origin: Origin) -> &'static str {
     match origin {
         Origin::Local => "local",
         Origin::Remote => "remote",
+    }
+}
+
+/// The `sender` word on a line about a body this host authored for itself —
+/// the idle loop's: a refusal from `HostEdge::offer_own`, and a failed send
+/// of one. Absent on every other line, so a reader tells the loop's losses
+/// from the scripter's, which carry the same `origin`.
+pub const IDLE_SENDER: &str = "idle";
+
+/// Who authored a body this host offered or sent: a sender, arriving
+/// under its origin, or the host's own idle loop, which is local.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Author {
+    Offered(Origin),
+    Idle,
+}
+
+impl Author {
+    /// The origin a line and the alert table classify the body under.
+    #[must_use]
+    pub const fn origin(self) -> Origin {
+        match self {
+            Self::Offered(origin) => origin,
+            Self::Idle => Origin::Local,
+        }
+    }
+
+    /// The `sender` word the body's lines carry, if any.
+    #[must_use]
+    pub const fn sender(self) -> Option<&'static str> {
+        match self {
+            Self::Offered(_) => None,
+            Self::Idle => Some(IDLE_SENDER),
+        }
     }
 }
 
@@ -438,7 +481,8 @@ mod tests {
     use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 
     use super::{
-        TEXT_LIMIT, edge_line, edge_line_with, lost_line, refusal_line, restart_line, timeline_line,
+        Author, IDLE_SENDER, TEXT_LIMIT, edge_line, edge_line_with, lost_line, refusal_line,
+        restart_line, timeline_line,
     };
     use crate::intake::{Origin, Refusal};
 
@@ -446,6 +490,16 @@ mod tests {
     /// 42 a fixture row carries, so a line stamped from the wrong side shows.
     fn at() -> SyncTime {
         SyncTime::from_nanos(1_700_000_000_000_000_000)
+    }
+
+    #[test]
+    fn the_idle_loop_is_a_local_author_named_idle() {
+        assert_eq!(Author::Idle.origin(), Origin::Local);
+        assert_eq!(Author::Idle.sender(), Some(IDLE_SENDER));
+        for origin in [Origin::Local, Origin::Remote] {
+            assert_eq!(Author::Offered(origin).origin(), origin);
+            assert_eq!(Author::Offered(origin).sender(), None);
+        }
     }
 
     fn row(kind: ReportKindWire, a: u32, b: u32, detail: f64) -> TimelineEntryWire {

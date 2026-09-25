@@ -65,6 +65,12 @@ allowed_label() {
 	# on no unit.
 	//cogs:speech_run_report) return 0 ;;
 	//cogs:speech_run_report_test) return 0 ;;
+	# The idle run report, on the same terms: an offline analyzer that reads
+	# the loop's line kinds and its stow margin off the host library, so the
+	# words it splits a run's script rows by are the ones the host writes.
+	# Workstation only, and in no payload.
+	//cogs:idle_run_report) return 0 ;;
+	//cogs:idle_run_report_test) return 0 ;;
 	# The audio half of the two analyzers' shared vocabulary: the store's
 	# resolver and wav writer, which are the pipeline crate's, read the one
 	# way by both. It is why this edge is a library of its own rather than a
@@ -200,6 +206,8 @@ if [ -z "${TOKIO_QUARANTINE_FIXTURE:-}" ]; then
 		cat <<-'LABELS'
 			//bazel/platform:device_deployables
 			//bazel/platform:motion_payload
+			//cogs:idle_run_report
+			//cogs:idle_run_report_test
 			//cogs:pose_session_report
 			//cogs:pose_session_report_test
 			//cogs:speech_run_report

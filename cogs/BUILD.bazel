@@ -188,6 +188,10 @@ exports_files([
     # the session takes, read at startup by the process that resolves overlay
     # and pose names -- which is outside this package.
     "library.names.json",
+    # The idle loop's playlist: which motions the voice host dances when nobody
+    # is speaking. Hand-edited, never generated; staged at its repo path and
+    # read by the host from the payload root.
+    "idle.json",
     "config.clk",
     "motion.clk",
     "mover.clk",
@@ -541,18 +545,16 @@ merge_simplelaunch_config(
     ],
 )
 
-# What one library tour did, read off its log: the operator's tool for judging
-# a tour run. Run as
-# `bazel run //cogs:library_tour_report -- <log-dir> <names.json>`, which is what
-# `make library-run` does with the fetched records and the committed sidecar.
-# Reads the names sidecar through `reachy-edge` because the log carries motion
-# indices and the list a tour is judged against is a list of names.
+# What one idle run did, read off its fetched records: the operator's tool for
+# judging a run of the idle loop. Run as
+# `bazel run //cogs:idle_run_report -- <records> <names.json>` over the directory
+# `make motion-fetch` prints and the committed sidecar. Depends on `reachy-edge`
+# for the story follower that rebuilds the session's story across its ring and
+# for the rows' sentences, and on `reachy-host` for the loop's own line kinds and
+# `STOW_MARGIN_MS`, which bounds an engagement.
 rust_binary(
-    name = "library_tour_report",
-    srcs = [
-        "library_tour_report.rs",
-        "motion_run_report.rs",
-    ],
+    name = "idle_run_report",
+    srcs = ["idle_run_report.rs"],
     # This tree's own copies of the three configuration files, for the reason
     # `first_motion_report`'s `data` gives.
     data = [
@@ -565,18 +567,70 @@ rust_binary(
     deps = [
         ":log_read",
         ":motion_channels",
+        ":motion_run_report",
+        ":pose_reading",
+        ":run_report",
+        ":schedule_clk_rs",
+        ":session_clk_rs",
+        "//crates/reachy-driver:reachy_driver",
+        "//crates/reachy-edge:reachy_edge",
+        "//crates/reachy-host:reachy_host_lib",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:health_clk_rs",
+        "//driver:pose_clk_rs",
+        "//motion:faults_clk_rs",
+        "//motion:reports_clk_rs",
+        "//motion:timeline_clk_rs",
+        "@brenn_reachy_crates//:serde_json",
+    ],
+)
+
+# The analyzer over crafted idle runs: a replacement that passes and its seam
+# table, obstructions and other faults, gaps inside and across engagements, and
+# the story summary. Cases build the streams an idle run writes rather than a
+# log file; what is under test is the reading.
+rust_test(
+    name = "idle_run_report_test",
+    size = "small",
+    crate = ":idle_run_report",
+    deps = [
+        "//crates/motion-proto:motion_proto",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
+    ],
+)
+
+# What one library tour did, read off its log: the operator's tool for judging
+# a tour run. Run as
+# `bazel run //cogs:library_tour_report -- <log-dir> <names.json>`, which is what
+# `make library-run` does with the fetched records and the committed sidecar.
+# Reads the names sidecar through `reachy-edge` because the log carries motion
+# indices and the list a tour is judged against is a list of names.
+rust_binary(
+    name = "library_tour_report",
+    srcs = ["library_tour_report.rs"],
+    # This tree's own copies of the three configuration files, for the reason
+    # `first_motion_report`'s `data` gives.
+    data = [
+        "mover_params.textproto",
+        "servo_gains.textproto",
+        "servo_profile.textproto",
+    ],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":log_read",
+        ":motion_channels",
+        ":motion_run_report",
         ":pose_reading",
         ":run_report",
         ":schedule_clk_rs",
         ":script_clk_rs",
-        ":stillness_report",
         "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-edge:reachy_edge",
         "//crates/reachy-motion:reachy_motion",
         "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
         "//motion:faults_clk_rs",
-        "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
     ],
 )
 
@@ -589,7 +643,6 @@ rust_test(
     crate = ":library_tour_report",
     deps = [
         "//crates/motion-proto:motion_proto",
-        "//crates/reachy-kin:reachy_kin",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
@@ -827,6 +880,46 @@ rust_test(
     deps = [
         ":committed_poses",
         "//crates/reachy-poses:reachy_poses",
+    ],
+)
+
+# The motion-run log reading and measurements the tour, supplied-script and idle
+# reports share: the channel table, the planned windows and seams, the
+# stream-held check and the per-window measurements. One crate so the three
+# reports read a run through one definition.
+rust_library(
+    name = "motion_run_report",
+    srcs = ["motion_run_report.rs"],
+    crate_name = "motion_run_report",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":log_read",
+        ":motion_channels",
+        ":pose_reading",
+        ":run_report",
+        ":schedule_clk_rs",
+        ":script_clk_rs",
+        ":stillness_report",
+        "//crates/reachy-driver:reachy_driver",
+        "//crates/reachy-edge:reachy_edge",
+        "//crates/reachy-motion:reachy_motion",
+        "//driver:health_clk_rs",
+        "//driver:pose_clk_rs",
+        "//motion:faults_clk_rs",
+        "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
+    ],
+)
+
+# The settle bound's invariant against the envelope's outer clearance, and how
+# schedules end windows and mark seams.
+rust_test(
+    name = "motion_run_report_test",
+    size = "small",
+    crate = ":motion_run_report",
+    deps = [
+        "//crates/reachy-kin:reachy_kin",
+        "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
 
@@ -1614,6 +1707,30 @@ scenario_suite(
     ],
 )
 
+# S16, a clip replaced mid-window: the same four cogs S1 runs on, with three
+# replacements each taking over the row of a window still playing -- sent half
+# way through a cycle so the seam is the take-over and not the grid's -- and
+# what is asserted is the one sample the replacement takes effect on.
+scenario_suite(
+    name = "s16",
+    author_deps = [],
+    channel_publisher_config = SIM_PUBLISHER_CONFIG,
+    checker_deps = [
+        "//crates/reachy-motion:reachy_motion",
+        "//motion:joints_clk_rs",
+        "//motion:reports_clk_rs",
+    ],
+    configs = SIM_CONFIGS,
+    exe = SIM_EXE,
+    log_writer_config = SIM_LOGGER_CONFIG,
+    process_description = SIM_PROCESS,
+    scenario_deps = [
+        ":schedule_clk_rs",
+        "//crates/reachy-motion:reachy_motion",
+        "//motion:joints_clk_rs",
+    ],
+)
+
 # S2, obstruction: the same three cogs S1 runs on, with a hand held against the
 # head cranks part way through the raise and taken off inside the window that
 # raise leaves, so the stow answering it runs end to end.
@@ -1916,10 +2033,7 @@ clk_schema_module(
 # What one supplied script did, judged against its retained compilation names.
 rust_binary(
     name = "script_run_report",
-    srcs = [
-        "motion_run_report.rs",
-        "script_run_report.rs",
-    ],
+    srcs = ["script_run_report.rs"],
     data = [
         "mover_params.textproto",
         "servo_gains.textproto",
@@ -1929,20 +2043,16 @@ rust_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":log_read",
-        ":motion_channels",
+        ":motion_run_report",
         ":pose_reading",
         ":run_report",
         ":schedule_clk_rs",
         ":script_clk_rs",
         ":stillness_report",
         "//crates/motion-proto:motion_proto",
-        "//crates/reachy-driver:reachy_driver",
         "//crates/reachy-edge:reachy_edge",
         "//crates/reachy-motion:reachy_motion",
-        "//driver:health_clk_rs",
         "//driver:pose_clk_rs",
-        "//motion:faults_clk_rs",
-        "@rusty_cogs//crates/clockwork-logs:clockwork_logs",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
 )
@@ -1951,7 +2061,6 @@ rust_test(
     name = "script_run_report_test",
     size = "small",
     crate = ":script_run_report",
-    deps = ["//crates/reachy-kin:reachy_kin"],
 )
 
 # The seam's port numbers, as the compositions type them and as the driver names

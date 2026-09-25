@@ -24,14 +24,14 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clockwork_rs::SyncTime;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::alerts::{Alert, Alerts};
 use crate::config::EdgeConfig;
-use crate::intake::{Accepted, Edge, Origin};
+use crate::intake::{Accepted, Edge, Origin, Refusal};
 use crate::names::{MotionTable, PoseTable};
 use crate::narrate::{
-    edge_line, lost_line, refusal_line, restart_line, severity_word, timeline_line,
+    Author, edge_line, lost_line, refusal_line_with, restart_line, severity_word, timeline_line,
 };
 use crate::story::{Story, Update};
 
@@ -149,12 +149,55 @@ impl HostEdge {
                 Some(accepted)
             }
             Err(refusal) => {
-                surface.say(refusal_line(&refusal, origin, arrival));
-                if let Some(alert) = self.alerts.on_refusal(&refusal, origin) {
-                    surface.alert(&alert);
-                }
+                self.refuse(&refusal, Author::Offered(origin), arrival, surface);
                 None
             }
+        }
+    }
+
+    /// A body this host authored for itself: the idle loop's.
+    ///
+    /// The same gate as [`Self::offer`], and a refusal is narrated and
+    /// classified as an [`Origin::Local`] one. What differs is that an
+    /// acceptance leaves the run of stale drops standing: the run is
+    /// evidence about the senders whose numbering has to clear the mark,
+    /// and this host clearing it says nothing about them. A loop dancing
+    /// between a deaf pipeline's refused bodies would otherwise keep the
+    /// deafness alert from ever firing. Its refusal line carries
+    /// `sender: idle`.
+    pub fn offer_own(
+        &mut self,
+        body: &[u8],
+        arrival: SyncTime,
+        surface: &mut impl Surface,
+    ) -> Option<Accepted> {
+        match self.edge.accept(body, arrival) {
+            Ok(accepted) => Some(accepted),
+            Err(refusal) => {
+                self.refuse(&refusal, Author::Idle, arrival, surface);
+                None
+            }
+        }
+    }
+
+    /// A refusal, said as a line and handed to the alert table, under the
+    /// body's author.
+    fn refuse(
+        &mut self,
+        refusal: &Refusal,
+        author: Author,
+        arrival: SyncTime,
+        surface: &mut impl Surface,
+    ) {
+        let origin = author.origin();
+        let fields: Vec<(&str, Value)> = author
+            .sender()
+            .map(|word| ("sender", json!(word)))
+            .into_iter()
+            .collect();
+        surface.say(refusal_line_with(refusal, origin, arrival, &fields));
+        if let Some(alert) = self.alerts.on_refusal(refusal, origin) {
+            surface.alert(&alert);
         }
     }
 
@@ -398,6 +441,46 @@ mod tests {
         assert_eq!(surface.alerts[0].severity, Severity::Critical);
     }
 
+    /// The loop's lost body says which sender it was; the scripter's, with the
+    /// same origin, says nothing of the kind. The alert is the same for both.
+    #[test]
+    fn the_host_s_own_refusal_line_says_the_idle_loop_sent_it() {
+        let foreign = MotionScript::new(
+            "somebody-else",
+            1,
+            vec![Step::new(0, crate::fixture::NEUTRAL_POSE)],
+            13_000,
+        )
+        .expect("a lawful script for another machine")
+        .encode();
+
+        let mut own = Recorded::default();
+        assert!(
+            host()
+                .offer_own(foreign.as_bytes(), at(), &mut own)
+                .is_none()
+        );
+        let mut scripted = Recorded::default();
+        assert!(
+            host()
+                .offer(foreign.as_bytes(), Origin::Local, at(), &mut scripted)
+                .is_none()
+        );
+
+        let own_line: serde_json::Value =
+            serde_json::from_str(&own.lines[0]).expect("one JSON object");
+        assert_eq!(own_line["sender"], "idle");
+        assert_eq!(own_line["origin"], "local");
+        let scripted_line: serde_json::Value =
+            serde_json::from_str(&scripted.lines[0]).expect("one JSON object");
+        assert!(scripted_line.get("sender").is_none(), "{scripted_line}");
+        for surface in [&own, &scripted] {
+            assert_eq!(surface.lines.len(), 1, "{:?}", surface.lines);
+            assert_eq!(surface.alerts.len(), 1, "{:?}", surface.alerts);
+            assert_eq!(surface.alerts[0].severity, Severity::Critical);
+        }
+    }
+
     /// The word the analyzer joins on is the word the host writes, both ways
     /// round. Wildcard-free at the source, so a third origin is a compile error
     /// rather than a line whose field a reader has never seen.
@@ -423,6 +506,35 @@ mod tests {
         for _ in 0..STALE_ALERT_RUN {
             assert!(
                 host.offer(body(9).as_bytes(), Origin::Remote, at(), &mut surface)
+                    .is_none()
+            );
+        }
+        let loud: Vec<&Alert> = surface
+            .alerts
+            .iter()
+            .filter(|alert| alert.severity == Severity::Critical)
+            .collect();
+        assert_eq!(loud.len(), 1, "{:?}", surface.alerts);
+        assert!(loud[0].title.contains("dropping"), "{}", loud[0].title);
+    }
+
+    /// The idle loop's acceptances are not evidence about a sender, so a
+    /// deaf sender refused between them still raises the deafness alert.
+    #[test]
+    fn the_host_s_own_acceptances_do_not_end_a_run_of_stale_drops() {
+        let mut host = host();
+        let mut surface = Recorded::default();
+        assert!(
+            host.offer(body(9).as_bytes(), Origin::Local, at(), &mut surface)
+                .is_some()
+        );
+        for n in 0..STALE_ALERT_RUN {
+            assert!(
+                host.offer_own(body(20 + n).as_bytes(), at(), &mut surface)
+                    .is_some()
+            );
+            assert!(
+                host.offer(body(5).as_bytes(), Origin::Local, at(), &mut surface)
                     .is_none()
             );
         }

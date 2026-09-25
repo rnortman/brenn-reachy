@@ -1036,7 +1036,11 @@ indistinguishable from someone saying the wake word. A hand kept on the head is
 therefore re-engaged roughly every other refresh, with no person acting between
 cycles. Closing it is a contract change on the script and on the sender, plus
 session state that remembers the last ending was a fault until a wake-caused
-script clears it — a design cycle, not a patch.
+script clears it — a design cycle, not a patch. The idle loop in `reachy_host`
+is a second such sender. It opens a resting machine on its own. After a
+fault-ended session it waits 15 s, doubling to 120 s while the endings keep
+coming, and it resets after a minute of `active` with no ending. That backoff
+is the mitigation until this contract change lands.
 
 Done = a machine stood down by a fault stays down until someone asks for it.
 Marked at `phase_intake`'s `Resting` arm in `cogs/session_cog.rs`.

@@ -63,16 +63,6 @@ const STEADY_TOLERANCE: f64 = 1e-9;
 /// here passing.
 const SWAY_MIN_RAD: f64 = 0.04;
 
-/// How far any row may travel in one cycle across the window's close, radians.
-///
-/// Above what the motion and the hand-back's own decay ask for -- the sway moves
-/// under 0.01 rad a cycle at this gain and a min-jerk absorption of the truncated
-/// contribution over the configured posture clock moves under 0.006 -- and well
-/// below the contribution standing when the window closed, which is what a layer
-/// that dropped its weight instead of re-anchoring would put into a single
-/// period.
-const CONTINUITY_STEP_RAD: f64 = 0.02;
-
 fn main() -> ExitCode {
     check::main("s6_checker", |run, failures| {
         check::heartbeat(run, end_cycle(), failures);
@@ -363,7 +353,7 @@ fn check_continuity(run: &Run, failures: &mut Vec<String>) {
         };
         for at in 0..after.len() {
             let travelled = (after[at] - before[at]).abs();
-            if travelled > CONTINUITY_STEP_RAD {
+            if travelled > check::CONTINUITY_STEP_RAD {
                 failures.push(format!(
                     "row {at} travelled {travelled} rad between cycles {} and {cycle}, across a \
                      window closing at {close}",

@@ -49,19 +49,32 @@
 //! It holds one more opinion, and it is about the motion path. A script the
 //! pipeline authored is a script this host wrote for itself: the scripter's
 //! decision, this process's gate, one loopback datagram. So a run in which this
-//! host dropped its own scripts, or authored scripts the session accepted none
+//! host dropped its own scripts, or authored scripts the session took none
 //! of, is a run in which nothing anybody said could move the head — a failure
 //! whatever the voice half did, and the failure this tool exists to have caught.
 //! A run in which nobody spoke authors nothing and is green.
 //!
 //! The log is where that opinion stops being about paperwork. A script the
-//! session accepted is a script the machine was supposed to move for, so an
+//! session took is a script the machine was supposed to move for, so an
 //! accepted script with no engagement behind it, or with a head that never left
 //! the tolerance box it started in, is the same failure read off the machine
 //! rather than off the narration — and an accepted script with no log at all is
 //! a run whose central question these records cannot answer. Where nothing was
 //! accepted, none of that is asked: the excursion is printed and the run is
 //! green.
+//!
+//! The voice host also runs the idle loop, which dances between turns through
+//! the same gate and the same session, so the session's script rows are two
+//! senders' and are told apart before anything is judged. The loop names the
+//! edge-issued id of every script it sent on its own lines (`idle_opened`,
+//! `idle_replaced`, `idle_resumed`, `idle_refused`); a row whose id is one of
+//! those is the loop's, and every other row is speech's. A refusal at the edge
+//! and a failed send carry no row, so the lines about the loop's bodies say
+//! `sender: idle`. What the loop did is printed here and never judged:
+//! `idle_run_report` judges it. A speech script taken in `active` is narrated as
+//! a replacement and counts as taken. While the loop danced, the head's movement
+//! is not attributed to speech, so its findings become notes. One residual: an
+//! `idle_*` line lost to a console tear leaves that one id counted as speech's.
 //!
 //! Absence of evidence is never read as evidence, in either direction. A story
 //! whose oldest rows fell off the session's ring is a story that says less than
@@ -108,16 +121,16 @@ use motion_channels::{
 use motion_evidence::{ARRIVAL_OFFSET_M, ARRIVAL_TURN_RAD, Motion};
 use motion_proto::DecodeError;
 use reachy_edge::{
-    CompileError, Origin, Refusal, Severity, UNKNOWN_KIND_PREFIX, origin_word, row_says, row_word,
-    severity_word,
+    CompileError, IDLE_SENDER, Origin, Refusal, Severity, UNKNOWN_KIND_PREFIX, origin_word,
+    row_says, row_word, severity_word,
 };
 use reachy_host::{
-    AWAITING_SPEECH_CONFIG, COMPOSED, REFUSAL_PREFIX, STARTED, UNOFFERED, UNPUBLISHED, UNSENT,
-    UNSPOKEN, VOICELESS,
+    AWAITING_SPEECH_CONFIG, COMPOSED, IDLE_SCRIPT_KINDS, REFUSAL_PREFIX, STARTED, UNOFFERED,
+    UNPUBLISHED, UNSENT, UNSPOKEN, VOICELESS,
 };
 use run_report::{
-    EVENT_HEAD, Report, audio_dir, console_dir, event, quote, recover, sibling, utterance_id,
-    verdict,
+    EVENT_HEAD, HOST_LOG, OLOG_EXTENSION, Report, audio_dir, console_dir, event, quote, recover,
+    run_directories, sibling, utterance_id, verdict,
 };
 
 /// Where the attending pose puts the machine, as the committed library states
@@ -131,13 +144,6 @@ fn neutral_targets() -> reachy_motion::joints::JointTargets {
 use serde_json::Value;
 use stillness_report::{Standard, Stillness, say};
 
-/// The launcher's name for the voice host's console.
-///
-/// The app name from the production launcher config with the launcher's own
-/// instance suffix. A run whose config renames the app writes somewhere else,
-/// and this tool says it found nothing rather than guessing at a neighbour.
-const HOST_LOG: &str = "voice_host_0.log";
-
 /// The launcher's name for the pod's console.
 ///
 /// Not read, only looked for: whether the pod ran at all is the first thing an
@@ -147,12 +153,6 @@ const POD_LOG: &str = "pod_0.log";
 
 /// What this tool names the directory it writes one clip per turn into.
 const TURNS_SUFFIX: &str = ".turns";
-
-/// The extension the online logger writes its records under.
-///
-/// A run directory inside the fetch is one that holds a non-empty file of these,
-/// which is the fetch's own rule for what a run directory is (`tools/lib.sh`).
-const OLOG_EXTENSION: &str = "olog";
 
 /// The file the fetch leaves at the root of the records naming the build that
 /// recorded them.
@@ -303,8 +303,8 @@ const NOISE_SAMPLE: usize = 3;
 /// Beside the kind and the sentence rather than inside them: a count of
 /// refusals says a run had trouble, and which side authored the refused body is
 /// the difference between this machine disagreeing with itself and two senders
-/// disagreeing with each other. Every field is empty or false on the lines that
-/// do not carry it, which is every kind but three.
+/// disagreeing with each other. Every field is empty, false or absent on the
+/// lines that do not carry it.
 #[derive(Debug, Default, PartialEq)]
 struct EdgeFields {
     /// Where a refused body was authored: the edge's own `origin` word.
@@ -315,6 +315,11 @@ struct EdgeFields {
     alerts: bool,
     /// Whether the composition said the robot says its criticals out loud.
     speaks: bool,
+    /// The edge's `sender` word: `"idle"` on the lines about the idle loop's
+    /// lost bodies, empty otherwise.
+    sender: String,
+    /// The script id a line names, where it names one.
+    script_id: Option<u64>,
 }
 
 /// One alert the pipeline gave the bus attachment to carry, and what the
@@ -568,8 +573,9 @@ enum Line {
         says: String,
         fields: EdgeFields,
     },
-    /// A row of the session's story, as the edge rendered it.
-    Timeline { kind: String, says: String },
+    /// A row of the session's story, as the edge rendered it. `a` is the row's
+    /// first argument, 0 where the line carries none.
+    Timeline { kind: String, a: u32, says: String },
     /// An alert the edge's table raised.
     Alert {
         severity: String,
@@ -824,6 +830,15 @@ impl Turn {
     }
 }
 
+/// The session's rows that answer a script, and the only ones counted for a
+/// sender. A `script_held` is answered by one of these when the wake that ends
+/// the maneuver drains it.
+const SCRIPT_ROWS: [ReportKind; 3] = [
+    ReportKind::ScriptAccepted,
+    ReportKind::ScriptReplaced,
+    ReportKind::ScriptRefused,
+];
+
 /// Everything the console said, folded down as it was read.
 ///
 /// A fold rather than a `Vec<Line>`: the recommended site setting sends the
@@ -916,6 +931,20 @@ struct Console {
     /// business, which is the safe way round, and said so nobody reads a run
     /// this tool could not attribute as one it attributed.
     origin_unsaid: usize,
+    /// Every script id the idle loop named on its own lines: `idle_opened`,
+    /// `idle_replaced`, `idle_resumed`, `idle_refused`.
+    ///
+    /// The host writes these lines itself, and the session's script rows carry
+    /// the same edge-issued id, so a row naming one of these is the loop's.
+    loop_ids: BTreeSet<u32>,
+    /// The idle loop's bodies lost at this host's gate or its send, per kind:
+    /// how many, and the last sentence that kind said. Read off the lines that
+    /// carry `sender: idle`, since neither kind has a session row to join on.
+    idle_lost: BTreeMap<String, (usize, String)>,
+    /// Every rendered `script_accepted`, `script_replaced` and `script_refused`
+    /// row, in order, as kind, script id and sentence: the rows the session's
+    /// reading partitions by sender.
+    taken: Vec<(ReportKind, u32, String)>,
     /// Every alert the pipeline handed to the bus attachment, in the order the
     /// console carried them.
     handed_off: Vec<HandedOff>,
@@ -1143,16 +1172,35 @@ impl Console {
                 if self.refusals.contains(&kind.as_str()) && fields.origin.is_empty() {
                     self.origin_unsaid += 1;
                 }
-                if self.own_authored(&kind, &fields) {
+                if IDLE_SCRIPT_KINDS.contains(&kind.as_str())
+                    && let Some(id) = fields.script_id.and_then(|id| u32::try_from(id).ok())
+                {
+                    self.loop_ids.insert(id);
+                }
+                // The loop's lines first: a loop `unsent` line carries
+                // `origin: local` too, and read below it would be a send
+                // failure nobody can attribute.
+                let refusal = self.refusals.contains(&kind.as_str());
+                if fields.sender == IDLE_SENDER && (refusal || kind == UNSENT) {
+                    count(&mut self.idle_lost, kind.clone(), says.clone());
+                } else if self.own_authored(&kind, &fields) {
                     count(&mut self.own_refused, kind.clone(), says.clone());
                 } else if kind == UNSENT {
                     count(&mut self.unsent_elsewhere, kind.clone(), says.clone());
-                } else if self.refusals.contains(&kind.as_str()) {
+                } else if refusal {
                     self.remote_refused += 1;
                 }
                 count(&mut self.edges, kind, says);
             }
-            Line::Timeline { kind, says } => count(&mut self.rows, kind, says),
+            Line::Timeline { kind, a, says } => {
+                if let Some(known) = SCRIPT_ROWS
+                    .into_iter()
+                    .find(|known| kind == row_word(*known))
+                {
+                    self.taken.push((known, a, says.clone()));
+                }
+                count(&mut self.rows, kind, says);
+            }
             Line::Alert {
                 severity,
                 title,
@@ -1584,8 +1632,12 @@ impl Console {
     /// scripter's own sink could not hand to the gate, and a locally authored
     /// script that compiled and never reached the session's port. This host
     /// sends every accepted script, including one a remote sender wrote, so the
-    /// send failure alone does not say whose gesture was lost.
+    /// send failure alone does not say whose gesture was lost. A line carrying
+    /// `sender: idle` is never one: the loop's lines are its own account.
     fn own_authored(&self, kind: &str, fields: &EdgeFields) -> bool {
+        if fields.sender == IDLE_SENDER {
+            return false;
+        }
         let local = fields.origin == origin_word(Origin::Local);
         (self.refusals.contains(&kind) && local)
             || (kind == UNOFFERED && fields.source == SCRIPTER_SOURCE)
@@ -2055,57 +2107,6 @@ impl Records {
     }
 }
 
-/// Every run directory inside a fetch, in sort order.
-///
-/// A directory directly under the fetch holding a non-empty record file, which
-/// is what the fetch's own rule counts. A directory this process cannot list is
-/// not a run directory either, but it is said rather than silently absent: it
-/// is a fetch or a filesystem an operator can fix, and reading it as a logger
-/// that recorded nothing would point them at the machine instead.
-fn run_directories(records: &Path) -> (Vec<PathBuf>, Vec<String>) {
-    let mut unlisted = Vec::new();
-    let entries = match std::fs::read_dir(records) {
-        Ok(entries) => entries,
-        Err(err) => {
-            return (Vec::new(), vec![format!("{}: {err}", records.display())]);
-        }
-    };
-    let mut found: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_dir()
-                && match holds_records(path) {
-                    Ok(holds) => holds,
-                    Err(err) => {
-                        unlisted.push(format!("{}: {err}", path.display()));
-                        false
-                    }
-                }
-        })
-        .collect();
-    found.sort();
-    (found, unlisted)
-}
-
-/// Whether a directory holds a record file with anything in it.
-///
-/// Non-empty, because a logger that created its file and wrote nothing leaves
-/// one of zero bytes behind and a report over it would say the head sat still
-/// rather than that nothing was recorded. A file whose size will not answer is
-/// counted as no record, on the same grounds: an unmeasurable file is not
-/// evidence about a machine.
-fn holds_records(dir: &Path) -> Result<bool, std::io::Error> {
-    let entries = std::fs::read_dir(dir)?;
-    Ok(entries.flatten().any(|entry| {
-        entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == OLOG_EXTENSION)
-            && entry.metadata().is_ok_and(|facts| facts.len() > 0)
-    }))
-}
-
 /// What the session did with the scripts that reached it, and where that was
 /// read.
 ///
@@ -2113,16 +2114,33 @@ fn holds_records(dir: &Path) -> Result<bool, std::io::Error> {
 /// same fact is written and they are not equally good: the session republishes
 /// its whole story on its own channel, and the edge renders whatever of that
 /// story it was there for. The console's rows are the fallback.
+///
+/// Partitioned by sender before anything is counted: a row whose script id the
+/// idle loop named on its own lines is the loop's, and every other row is
+/// speech's.
+#[derive(Default)]
 struct Session {
-    /// How many scripts the session accepted.
-    accepted: usize,
-    /// How many it refused.
+    /// How many of speech's scripts the session accepted as an opening.
+    engaged: usize,
+    /// How many of speech's scripts the session took as a replacement.
+    replaced: usize,
+    /// How many of speech's scripts it refused.
     refused: usize,
-    /// The last thing a refusal row said, for the reason words in it.
+    /// The last thing a refusal row of speech's said, for the reason words in
+    /// it.
     refusal_says: String,
+    /// How many of the idle loop's scripts the session accepted or took as a
+    /// replacement.
+    loop_taken: usize,
+    /// How many of the idle loop's scripts it refused.
+    loop_refused: usize,
+    /// The last thing a refusal row of the loop's said.
+    loop_refusal_says: String,
+    /// Whether the idle loop named any script it sent: whether it danced.
+    danced: bool,
     /// Where these numbers came from, for the operator reading them.
     from: &'static str,
-    /// Whether the two counts are floors rather than totals.
+    /// Whether the counts are floors rather than totals.
     ///
     /// Either account can be one: the log holds a ring the session drops the
     /// oldest rows off, and the console holds whatever of the narration the
@@ -2141,41 +2159,77 @@ impl Session {
     /// A run whose narration never reached the console is still read here.
     fn of(console: &Console, records: &Records) -> Self {
         match records.readable() {
-            Some(log) => Self::told(log),
+            Some(log) => Self::told(log, console),
             None => Self::rendered(console),
         }
     }
 
-    /// The session's story as it published it, off the channel log.
-    fn told(log: &Log) -> Self {
-        let refused = log.rows(ReportKind::ScriptRefused);
-        Self {
-            accepted: log.rows(ReportKind::ScriptAccepted).len(),
-            refused: refused.len(),
-            refusal_says: refused.last().map(|row| row_says(row)).unwrap_or_default(),
+    /// The session's story as it published it, off the channel log, split by
+    /// the ids the console's loop lines name.
+    fn told(log: &Log, console: &Console) -> Self {
+        let mut session = Self {
+            danced: !console.loop_ids.is_empty(),
             from: "the session's own story in the channel log",
             at_least: log.truncated(),
+            ..Self::default()
+        };
+        for logged in &log.reports {
+            let row = &logged.message;
+            if let Some(kind) = row.kind().to_known() {
+                session.tally(kind, row.a(), || row_says(row), &console.loop_ids);
+            }
         }
+        session
     }
 
     /// The session's story as the edge rendered it onto the console.
     fn rendered(console: &Console) -> Self {
-        let rows = |kind| {
-            console
-                .rows
-                .get(kind)
-                .cloned()
-                .unwrap_or_else(|| (0, String::new()))
-        };
-        let (accepted, _) = rows(row_word(ReportKind::ScriptAccepted));
-        let (refused, refusal_says) = rows(row_word(ReportKind::ScriptRefused));
-        Self {
-            accepted,
-            refused,
-            refusal_says,
+        let mut session = Self {
+            danced: !console.loop_ids.is_empty(),
             from: "the session's story as the console renders it",
             at_least: false,
+            ..Self::default()
+        };
+        for (kind, a, says) in &console.taken {
+            session.tally(*kind, *a, || says.clone(), &console.loop_ids);
         }
+        session
+    }
+
+    /// One script row, counted for the sender its id says it was. Rows of
+    /// every other kind count nowhere: a `script_held` is answered by one of
+    /// these three when the wake that ends the maneuver drains it.
+    fn tally(
+        &mut self,
+        kind: ReportKind,
+        a: u32,
+        says: impl FnOnce() -> String,
+        loop_ids: &BTreeSet<u32>,
+    ) {
+        let idle = loop_ids.contains(&a);
+        match (kind, idle) {
+            (ReportKind::ScriptAccepted | ReportKind::ScriptReplaced, true) => self.loop_taken += 1,
+            (ReportKind::ScriptRefused, true) => {
+                self.loop_refused += 1;
+                self.loop_refusal_says = says();
+            }
+            (ReportKind::ScriptAccepted, false) => self.engaged += 1,
+            (ReportKind::ScriptReplaced, false) => self.replaced += 1,
+            (ReportKind::ScriptRefused, false) => {
+                self.refused += 1;
+                self.refusal_says = says();
+            }
+            _ => {}
+        }
+    }
+
+    /// How many of speech's scripts the session took.
+    ///
+    /// A replacement counts as the session taking the script: with the loop
+    /// dancing, speech's body arrives in `active` and is narrated
+    /// `script_replaced`, not `script_accepted`.
+    const fn taken(&self) -> usize {
+        self.engaged + self.replaced
     }
 }
 
@@ -2295,10 +2349,17 @@ fn object(value: Value) -> Option<Line> {
                     .get("speaks")
                     .and_then(Value::as_bool)
                     .unwrap_or_default(),
+                sender: text("sender"),
+                script_id: object.get("script_id").and_then(Value::as_u64),
             },
         },
         Some("timeline") => Line::Timeline {
             kind: text("kind"),
+            a: object
+                .get("a")
+                .and_then(Value::as_u64)
+                .and_then(|a| u32::try_from(a).ok())
+                .unwrap_or(0),
             says: text("says"),
         },
         Some("alert") => Line::Alert {
@@ -2750,7 +2811,12 @@ fn bridged(console: &Console, report: &mut Report) {
 /// dropped on it is this machine disagreeing with itself and no retry
 /// anywhere. The second is the session declining what did reach it. The third
 /// is the outcome independent of either account — scripts authored and none
-/// accepted — so a run whose narration was lost still fails.
+/// taken — so a run whose narration was lost still fails.
+///
+/// Every finding is about speech's scripts only. The idle loop's rows are told
+/// apart by the ids its own lines name, and its bodies lost at the gate or the
+/// send by the `sender` word on their lines; what became of them is printed and
+/// never judged here.
 ///
 /// The counts are printed whatever the verdict, because a run in which nobody
 /// spoke asks for no motion and is a good run: the permissive standard the rest
@@ -2774,32 +2840,44 @@ fn the_motion_path(console: &Console, session: &Session, records: &Records, repo
         }
     ));
     report.note(format!(
-        "{}{} accepted and {} refused, read from {}",
+        "{}{} taken ({} engaged, {} as a replacement) and {} refused, read from {}",
         if session.at_least { "at least " } else { "" },
-        session.accepted,
+        session.taken(),
+        session.engaged,
+        session.replaced,
         session.refused,
         session.from
     ));
+    let rendered = Session::rendered(console);
+    // The log's count is a floor once the ring has dropped rows, so the
+    // console's rendered account of speech's rows, split by the same loop ids,
+    // keeps an aged-out acceptance from reading as none; a console that shows
+    // none still fails.
+    let aged_out = records.readable().is_some_and(|log| log.truncated())
+        && session.taken() == 0
+        && rendered.taken() > 0;
+    let took_some = session.taken() > 0 || aged_out;
     // Both accounts, where both exist: the log is the one judged on, and a
     // console that says something else is a narration the edge missed part of
     // rather than a second verdict. A truncated story is not compared at all —
     // the two numbers are counted over different windows, and "disagrees" would
     // be this tool's own arithmetic reported as news about the run.
     if let Some(log) = records.readable() {
-        let rendered = Session::rendered(console);
         if log.truncated() {
             report.note(format!(
-                "the console renders {} accepted and {} refused; the log's story has dropped {} \
+                "the console renders {} taken and {} refused; the log's story has dropped {} \
                  row(s) off its front, so the two are counted over different windows and are not \
                  compared",
-                rendered.accepted, rendered.refused, log.dropped
+                rendered.taken(),
+                rendered.refused,
+                log.dropped
             ));
         } else {
             report.note(format!(
-                "the console renders {} accepted and {} refused, which {} the log",
-                rendered.accepted,
+                "the console renders {} taken and {} refused, which {} the log",
+                rendered.taken(),
                 rendered.refused,
-                if (rendered.accepted, rendered.refused) == (session.accepted, session.refused) {
+                if (rendered.taken(), rendered.refused) == (session.taken(), session.refused) {
                     "agrees with"
                 } else {
                     "disagrees with"
@@ -2839,7 +2917,7 @@ fn the_motion_path(console: &Console, session: &Session, records: &Records, repo
                 ))
                 .collect::<Vec<_>>()
                 .join("; "),
-            if session.accepted == 0 {
+            if !took_some {
                 "so nothing said to the robot moved its head"
             } else {
                 "so this much of what was said to the robot never reached it"
@@ -2875,11 +2953,49 @@ fn the_motion_path(console: &Console, session: &Session, records: &Records, repo
             quote(&session.refusal_says)
         ));
     }
-    if authored > 0 && session.accepted == 0 {
-        report.fail(format!(
-            "the pipeline authored {authored} motion script(s) and the session accepted none: \
-             whatever the head did this run, it was not what anybody said to the robot"
+    if session.danced {
+        report.note(format!(
+            "the idle loop: {}{} taken, {} refused by the session{}; its scripts are told apart \
+             by the ids its own lines name, and idle_run_report is what judges them",
+            if session.at_least { "at least " } else { "" },
+            session.loop_taken,
+            session.loop_refused,
+            if session.loop_refused > 0 {
+                format!(", the last saying `{}`", quote(&session.loop_refusal_says))
+            } else {
+                String::new()
+            }
         ));
+    }
+    if !console.idle_lost.is_empty() {
+        let lost: usize = console.idle_lost.values().map(|(count, _)| count).sum();
+        report.note(format!(
+            "{lost} of the idle loop's bodies were lost at this host's gate or its send: {}",
+            console
+                .idle_lost
+                .iter()
+                .map(|(kind, (count, says))| format!(
+                    "`{}` ×{count} — {}",
+                    quote(kind),
+                    quote(says)
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    match records.readable() {
+        Some(log) if authored > 0 && aged_out => report.note(format!(
+            "the log's story has dropped {} row(s) off its front and the rows left hold none of \
+             speech's taken scripts; the console renders {} of speech's script(s) taken, so the \
+             session took speech's scripts and the log's window no longer holds them",
+            log.dropped,
+            rendered.taken()
+        )),
+        _ if authored > 0 && session.taken() == 0 => report.fail(format!(
+            "the pipeline authored {authored} motion script(s) and the session took none: \
+             whatever the head did this run, it was not what anybody said to the robot"
+        )),
+        _ => {}
     }
 }
 
@@ -2964,13 +3080,20 @@ fn alerts_travelled(console: &Console, report: &mut Report) {
 /// commanded nowhere sits wherever the last run left it. A departure past
 /// either tolerance is movement; a run inside both left the box its own
 /// arrival check would have called one pose.
+///
+/// While the idle loop danced, the head's movement is the loop's as much as
+/// speech's and is not evidence either way: the engagement, the solvable
+/// estimates and the excursion are printed as notes, and what these records
+/// establish for speech is the session's account. A run with no channel log
+/// still fails when speech's scripts were taken, whoever moved the head: the
+/// fetch is broken either way.
 fn the_head_moved(records: &Records, session: &Session, report: &mut Report) {
     let Some(log) = records.readable() else {
-        if session.accepted > 0 {
+        if session.taken() > 0 {
             report.fail(format!(
                 "{} script(s) were accepted and there is no channel log to show whether the head \
                  moved: {}",
-                session.accepted,
+                session.taken(),
                 records.why()
             ));
         } else {
@@ -3004,16 +3127,33 @@ fn the_head_moved(records: &Records, session: &Session, report: &mut Report) {
             near.offset_m, near.turn_rad, near.at
         ));
     }
-    if session.accepted == 0 {
+    if session.taken() == 0 {
         return;
     }
+    if session.danced {
+        report.note(
+            "the idle loop danced this run, so the head's movement is not evidence that speech's \
+             scripts moved it; what these records establish for speech is the session's account \
+             above",
+        );
+    }
+    let judge = |report: &mut Report, text: String| {
+        if session.danced {
+            report.note(text);
+        } else {
+            report.fail(text);
+        }
+    };
     match log.took_the_machine() {
         Took::Yes => {}
-        Took::No => report.fail(format!(
-            "{} script(s) were accepted and the session never took the machine: its story \
-             narrates no engagement that reached `active`, so no schedule ever ran",
-            session.accepted
-        )),
+        Took::No => judge(
+            report,
+            format!(
+                "{} script(s) were accepted and the session never took the machine: its story \
+                 narrates no engagement that reached `active`, so no schedule ever ran",
+                session.taken()
+            ),
+        ),
         // The engagement is the oldest thing a session narrates and the first
         // row its ring drops, so its absence from a truncated story is this
         // tool reaching the end of the evidence rather than news about a run.
@@ -3030,22 +3170,30 @@ fn the_head_moved(records: &Records, session: &Session, report: &mut Report) {
     // reporting that as stillness points an operator at the machine instead of
     // at the recording.
     if log.motion.solved() < 2 {
-        report.fail(format!(
-            "{} script(s) were accepted and the log holds no pair of solvable head estimates to \
+        judge(
+            report,
+            format!(
+                "{} script(s) were accepted and the log holds no pair of solvable head estimates to \
              show whether it moved: {} solved of {} recorded",
-            session.accepted,
-            log.motion.solved(),
-            log.motion.seen()
-        ));
+                session.taken(),
+                log.motion.solved(),
+                log.motion.seen()
+            ),
+        );
         return;
     }
     if excursion.offset_m <= ARRIVAL_OFFSET_M && excursion.turn_rad <= ARRIVAL_TURN_RAD {
-        report.fail(format!(
-            "the head never moved: its largest excursion over the run was {:.4} m and {:.4} rad, \
+        judge(
+            report,
+            format!(
+                "the head never moved: its largest excursion over the run was {:.4} m and {:.4} rad, \
              inside the {ARRIVAL_OFFSET_M} m and {ARRIVAL_TURN_RAD} rad an arrival is judged by, \
              and {} script(s) were accepted",
-            excursion.offset_m, excursion.turn_rad, session.accepted
-        ));
+                excursion.offset_m,
+                excursion.turn_rad,
+                session.taken()
+            ),
+        );
     }
 }
 
@@ -5469,7 +5617,7 @@ mod tests {
             report
                 .findings
                 .iter()
-                .any(|finding| finding.contains("the session accepted none")),
+                .any(|finding| finding.contains("the session took none")),
             "the outcome is a finding of its own: {:?}",
             report.findings
         );
@@ -6144,7 +6292,8 @@ mod tests {
         assert!(
             measured(
                 &report,
-                "1 accepted and 0 refused, read from the session's own story"
+                "1 taken (1 engaged, 0 as a replacement) and 0 refused, read from the session's \
+                 own story"
             ),
             "{:?}",
             report.measured
@@ -6152,8 +6301,353 @@ mod tests {
         assert!(
             measured(
                 &report,
-                "the console renders 0 accepted and 0 refused, which disagrees"
+                "the console renders 0 taken and 0 refused, which disagrees"
             ),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The row the session publishes for a script it took as a replacement.
+    fn replaced(script: u32) -> TimelineEntryWire {
+        row(ReportKindWire::SCRIPT_REPLACED, script, 4)
+    }
+
+    /// The row the session publishes for a script it refused, for `reason`.
+    fn refused_row(script: u32, reason: u32) -> TimelineEntryWire {
+        row(ReportKindWire::SCRIPT_REFUSED, script, reason)
+    }
+
+    /// One of the idle loop's own lines, built by the edge's builder so the
+    /// words are the ones the host writes.
+    fn idle_line(kind: &str, script_id: Option<u32>, reason: Option<&str>) -> String {
+        let mut fields = vec![(
+            "script_id",
+            script_id.map_or(serde_json::Value::Null, serde_json::Value::from),
+        )];
+        if let Some(reason) = reason {
+            fields.push(("reason", serde_json::Value::from(reason)));
+        }
+        reachy_edge::edge_line_with(kind, SyncTime::from_nanos(4), "the loop", &fields)
+    }
+
+    /// A loop body the gate refused as stale, as the edge narrates it.
+    fn idle_stale() -> String {
+        reachy_edge::refusal_line_with(
+            &reachy_edge::Refusal::Stale {
+                seq: 5,
+                accepted: 9,
+            },
+            reachy_edge::Origin::Local,
+            SyncTime::from_nanos(5),
+            &[("sender", reachy_edge::IDLE_SENDER.into())],
+        )
+    }
+
+    /// A loop script that compiled and could not be sent.
+    const IDLE_UNSENT: &str = r#"{"stream":"edge","at_ns":4,"kind":"unsent","says":"script 2 compiled and could not be sent to the control process","script_id":2,"origin":"local","sender":"idle"}"#;
+
+    /// The loop's openings and replacements do not stand in for speech's: a
+    /// pipeline whose every body was refused fails while the loop dances.
+    #[test]
+    fn idle_dancing_does_not_pass_a_pipeline_whose_every_script_was_refused() {
+        let (_dir, at) = records(
+            "speech-report-idle-refused-pipeline",
+            &[
+                STARTED.to_owned(),
+                COMPOSED.to_owned(),
+                authored("wake"),
+                refused(reachy_edge::Origin::Local),
+                idle_line(reachy_host::IDLE_OPENED, Some(1), None),
+                idle_line(reachy_host::IDLE_REPLACED, Some(2), None),
+            ],
+        );
+        let held = neutral_targets().head_pose_body;
+        let mut story = engagement();
+        story.extend([accepted(1), replaced(2)]);
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story,
+                poses: vec![held, moved(&held, ARRIVAL_OFFSET_M * 10.0, 0.0), held],
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(
+            found(&report, "never reached the session"),
+            "{:?}",
+            report.findings
+        );
+        assert!(found(&report, "took none"), "{:?}", report.findings);
+        assert!(!found(&report, "idle loop"), "{:?}", report.findings);
+    }
+
+    /// Speech's own refusal fails the run whatever the loop's rows say.
+    #[test]
+    fn a_speech_script_the_session_refused_fails_while_the_loop_danced() {
+        let (_dir, at) = records(
+            "speech-report-idle-speech-refused",
+            &[
+                STARTED.to_owned(),
+                COMPOSED.to_owned(),
+                authored("wake"),
+                idle_line(reachy_host::IDLE_OPENED, Some(1), None),
+                idle_line(reachy_host::IDLE_REPLACED, Some(2), None),
+            ],
+        );
+        let held = neutral_targets().head_pose_body;
+        let mut story = engagement();
+        story.extend([
+            accepted(1),
+            replaced(2),
+            refused_row(3, u32::from(RefusalReasonWire::NOT_RESTING.0)),
+        ]);
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story,
+                poses: vec![held, moved(&held, ARRIVAL_OFFSET_M * 10.0, 0.0), held],
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(
+            found(&report, "the session refused 1 script(s)"),
+            "{:?}",
+            report.findings
+        );
+        assert!(found(&report, "took none"), "{:?}", report.findings);
+        assert!(!found(&report, "idle loop"), "{:?}", report.findings);
+        assert!(
+            measured(&report, "the idle loop: 2 taken, 0 refused"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// Everything the loop lost — at the session, at the gate, at the send — is
+    /// printed and never judged.
+    #[test]
+    fn an_idle_refusal_is_not_a_speech_failure() {
+        let (_dir, at) = records(
+            "speech-report-idle-refusal",
+            &[
+                STARTED.to_owned(),
+                COMPOSED.to_owned(),
+                idle_line(reachy_host::IDLE_OPENED, Some(1), None),
+                idle_line(reachy_host::IDLE_REFUSED, Some(1), Some("session")),
+                idle_stale(),
+                idle_line(reachy_host::IDLE_REFUSED, None, Some("edge")),
+                IDLE_UNSENT.to_owned(),
+                idle_line(reachy_host::IDLE_REFUSED, Some(2), Some("unsent")),
+            ],
+        );
+        let mut story = engagement();
+        story.extend([
+            accepted(1),
+            refused_row(1, u32::from(RefusalReasonWire::FAULT_ENDING.0)),
+        ]);
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story,
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            measured(&report, "the idle loop: 1 taken, 1 refused"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(
+                &report,
+                "2 of the idle loop's bodies were lost at this host's gate or its send"
+            ),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(
+                &report,
+                "0 taken (0 engaged, 0 as a replacement) and 0 refused"
+            ),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The records of a speech script the session took as a replacement while
+    /// the loop danced, with the head at these poses.
+    fn replaced_while_dancing(name: &str, poses: Vec<Isometry3<f64>>) -> (Scratch, PathBuf) {
+        let (dir, at) = records(
+            name,
+            &[
+                STARTED.to_owned(),
+                COMPOSED.to_owned(),
+                authored("wake"),
+                idle_line(reachy_host::IDLE_OPENED, Some(1), None),
+            ],
+        );
+        let mut story = engagement();
+        story.extend([accepted(1), replaced(2)]);
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story,
+                poses,
+                ..Recorded::default()
+            },
+        );
+        (dir, at)
+    }
+
+    /// With the loop dancing, speech arrives in `active` and is narrated as a
+    /// replacement, and that is the session taking it.
+    #[test]
+    fn speech_taken_as_a_replacement_counts() {
+        let held = neutral_targets().head_pose_body;
+        let (_dir, at) = replaced_while_dancing(
+            "speech-report-replacement-counts",
+            vec![held, moved(&held, ARRIVAL_OFFSET_M * 10.0, 0.0), held],
+        );
+        let report = judge(&at);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            measured(&report, "1 taken (0 engaged, 1 as a replacement)"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(&report, "the idle loop: 1 taken, 0 refused"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The records of a speech script `speech` narrated on the console as script
+    /// 7, over a story ring that kept only the loop's replacement.
+    fn aged_out_of_the_ring(name: &str, speech: &str) -> (Scratch, PathBuf) {
+        let held = neutral_targets().head_pose_body;
+        let (dir, at) = records(
+            name,
+            &[
+                STARTED.to_owned(),
+                COMPOSED.to_owned(),
+                authored("wake"),
+                idle_line(reachy_host::IDLE_OPENED, Some(1), None),
+                idle_line(reachy_host::IDLE_REPLACED, Some(2), None),
+                speech.to_owned(),
+            ],
+        );
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story: vec![replaced(2)],
+                dropped: 40,
+                poses: vec![held, moved(&held, ARRIVAL_OFFSET_M * 10.0, 0.0), held],
+                ..Recorded::default()
+            },
+        );
+        (dir, at)
+    }
+
+    /// Speech taken early and then aged out of the ring by the loop's rows is
+    /// read off the console rather than reported as none taken.
+    #[test]
+    fn speech_taken_before_the_ring_turned_over_is_not_took_none() {
+        let (_dir, at) = aged_out_of_the_ring(
+            "speech-report-aged-out-taken",
+            r#"{"stream":"timeline","at_ns":6,"kind":"script_replaced","a":7,"says":"script 7 replaced the schedule"}"#,
+        );
+        let report = judge(&at);
+        assert!(!found(&report, "took none"), "{:?}", report.findings);
+        assert!(
+            measured(&report, "the log's window no longer holds them"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(&report, "at least 0 taken"),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// Speech the session refused, aged out of the ring the same way, still took
+    /// none: the console renders none of speech's scripts taken.
+    #[test]
+    fn speech_refused_and_aged_out_of_the_ring_still_took_none() {
+        let (_dir, at) = aged_out_of_the_ring(
+            "speech-report-aged-out-refused",
+            r#"{"stream":"timeline","at_ns":6,"kind":"script_refused","a":7,"says":"script 7 refused"}"#,
+        );
+        let report = judge(&at);
+        assert!(found(&report, "took none"), "{:?}", report.findings);
+    }
+
+    /// While the loop danced, the head's movement says nothing about speech's
+    /// scripts either way; with no loop, a still head fails as it always did.
+    #[test]
+    fn the_head_s_movement_is_not_speech_s_evidence_while_the_loop_danced() {
+        let held = neutral_targets().head_pose_body;
+        let (_dir, at) = replaced_while_dancing(
+            "speech-report-dancing-moved",
+            vec![held, moved(&held, ARRIVAL_OFFSET_M * 10.0, 0.0), held],
+        );
+        let report = judge(&at);
+        assert!(
+            measured(&report, "is not evidence that speech's scripts moved it"),
+            "{:?}",
+            report.measured
+        );
+
+        let (_still, at) =
+            replaced_while_dancing("speech-report-dancing-still", vec![held, held, held]);
+        let report = judge(&at);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            measured(&report, "the head never moved"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            measured(&report, "is not evidence"),
+            "{:?}",
+            report.measured
+        );
+
+        let (_alone, at) = records(
+            "speech-report-no-loop-still",
+            &[STARTED.to_owned(), COMPOSED.to_owned(), authored("wake")],
+        );
+        let mut story = engagement();
+        story.push(accepted(1));
+        recorded_into(
+            &at,
+            OLDER,
+            &Recorded {
+                story,
+                poses: vec![held, held, held],
+                ..Recorded::default()
+            },
+        );
+        let report = judge(&at);
+        assert!(
+            found(&report, "the head never moved"),
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            !measured(&report, "is not evidence"),
             "{:?}",
             report.measured
         );
@@ -6217,7 +6711,7 @@ mod tests {
             report.measured
         );
         assert!(
-            measured(&report, "at least 1 accepted"),
+            measured(&report, "at least 1 taken"),
             "the count off a ring is a floor and says so: {:?}",
             report.measured
         );

@@ -28,7 +28,7 @@ use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
 use reachy_motion::joints::{JointRef, row};
 use scenario::check;
 use scenario::read::Run;
-use scenario::{cycle_at, cycle_within, drain_cycle, stow_clocks};
+use scenario::{cycle_at, drain_cycle, stow_clocks};
 
 use s7_scenario::{
     CLOSING_SCRIPT_ID, HOLD_RAD, HOLD_SCRIPT_ID, REFRESH_SCRIPT_ID, closing_cycle,
@@ -79,7 +79,14 @@ fn main() -> ExitCode {
         check::estimates_per_sample(run, failures);
         check::estimates_valid(run, failures);
         check_schedules(run, engaged, failures);
-        check_replacements(run, failures);
+        check::replacements(
+            run,
+            &[
+                (REFRESH_SCRIPT_ID, refresh_cycle(), 1),
+                (CLOSING_SCRIPT_ID, closing_cycle(), 2),
+            ],
+            failures,
+        );
         check_torque_untouched(run, bracket, failures);
         check_presence(run, failures);
         check_overlay_played(run, failures);
@@ -219,58 +226,6 @@ fn check_closing_steps(run: &Run, failures: &mut Vec<String>) {
         failures.push(format!(
             "the closing schedule is {found:?}, and the closing script asks for {wanted:?}"
         ));
-    }
-}
-
-/// What the session said about each replacement: the script's own number, the
-/// epoch it was written under, and the wake it was decided on.
-///
-/// The epoch is the join. A row naming an epoch other than the one that went
-/// out on the channel would leave an operator reading the timeline against a
-/// mover that answered a different number, which is the whole use the row has.
-fn check_replacements(run: &Run, failures: &mut Vec<String>) {
-    let replaced: Vec<(i64, u32, u32)> = run
-        .reports
-        .iter()
-        .filter(|report| report.message.kind() == ReportKindWire::SCRIPT_REPLACED)
-        .map(|report| {
-            (
-                cycle_within(report.message.time().as_nanos()),
-                report.message.a(),
-                report.message.b(),
-            )
-        })
-        .collect();
-    let expected = [
-        (REFRESH_SCRIPT_ID, refresh_cycle(), 1_usize),
-        (CLOSING_SCRIPT_ID, closing_cycle(), 2_usize),
-    ];
-    if replaced.len() != expected.len() {
-        failures.push(format!(
-            "the session narrated {replaced:?} as replacements, and this run replaces the running \
-             schedule {} times",
-            expected.len()
-        ));
-        return;
-    }
-    for ((at, script_id, epoch), (wanted_id, sent_on, index)) in replaced.iter().zip(expected) {
-        if *script_id != wanted_id {
-            failures.push(format!(
-                "the session replaced its schedule on script {script_id}, and this run sends \
-                 {wanted_id}"
-            ));
-        }
-        check::answered_on_its_wake("replacement", *at, sent_on, failures);
-        match run.schedules.get(index) {
-            Some(logged) if logged.message.epoch() == *epoch => {}
-            Some(logged) => failures.push(format!(
-                "the session narrated the replacement under epoch {epoch} and published epoch {} \
-                 at cycle {}: the row and the channel name one schedule",
-                logged.message.epoch(),
-                cycle_within(logged.at_ns)
-            )),
-            None => {}
-        }
     }
 }
 

@@ -64,6 +64,18 @@ pub const ARRIVAL_TOLERANCE: f64 = 1e-3;
 /// slack is for the last fractional cycle of a move, not for a policy.
 pub const STEP_SLACK: f64 = 1e-9;
 
+/// How far any row may travel in one cycle on a sample the mover re-anchors or
+/// hands back on, radians.
+///
+/// Above what a seam that keeps the stream continuous asks for -- a re-anchored
+/// or handed-back base absorbs the offset it starts from as a min-jerk move over
+/// the configured posture clock, which moves under 0.006 rad a cycle, and
+/// content at the scenarios' gains moves under 0.01 -- and well below the
+/// contribution standing at the seam, which is what a layer that dropped its
+/// weight instead of re-anchoring would put into a single period. Each scenario
+/// that uses the bound asserts that the contribution it drops is above it.
+pub const CONTINUITY_STEP_RAD: f64 = 0.02;
+
 /// The two antennas, named rather than numbered, each with the slot it occupies
 /// in a command's antenna pair: which bus rows they sit on and which way round
 /// the pair reads are both the motion library's statement, and a checker holding
@@ -729,6 +741,20 @@ pub fn arrived_at(
 /// session whose request went missing are identical in every other stream. This
 /// is the assertion that the scenario really did say what it meant to say.
 pub fn scripts_sent(run: &Run, wanted: &[(u32, i64)], failures: &mut Vec<String>) {
+    let instants: Vec<(u32, i64)> = wanted
+        .iter()
+        .map(|&(script_id, cycle)| (script_id, cycle_at(cycle)))
+        .collect();
+    scripts_sent_at(run, &instants, failures);
+}
+
+/// [`scripts_sent`] for a scenario that sends a script between cycles: these
+/// ids, at these instants, in this order.
+///
+/// The session wakes on the message rather than on the bus cycle, so a script
+/// sent part way through a cycle is taken at the instant it was sent, and that
+/// instant is what the run is asserted to have replayed.
+pub fn scripts_sent_at(run: &Run, wanted: &[(u32, i64)], failures: &mut Vec<String>) {
     if run.scripts.len() != wanted.len() {
         failures.push(format!(
             "the run replayed {} scripts, and the scenario sent {}",
@@ -737,15 +763,14 @@ pub fn scripts_sent(run: &Run, wanted: &[(u32, i64)], failures: &mut Vec<String>
         ));
         return;
     }
-    for (index, (found, (script_id, cycle))) in run.scripts.iter().zip(wanted).enumerate() {
-        let at = cycle_at(*cycle);
+    for (index, (found, &(script_id, at))) in run.scripts.iter().zip(wanted).enumerate() {
         if found.at_ns != at {
             failures.push(format!(
                 "script {index} reached the run at {}, and the scenario sent it at {at}",
                 found.at_ns
             ));
         }
-        if found.message.script_id() != *script_id {
+        if found.message.script_id() != script_id {
             failures.push(format!(
                 "script {index} is numbered {}, and the scenario sent {script_id}",
                 found.message.script_id()
@@ -1139,6 +1164,66 @@ pub fn answered_on_its_wake(what: &str, at: i64, sent_on: i64, failures: &mut Ve
              script is answered on the wake it arrives on, so the answer is due by cycle {by}"
         ));
     }
+}
+
+/// What the session said about each replacement: the script's own number, the
+/// epoch it was written under, and the wake it was decided on.
+///
+/// The epoch is the join. A row naming an epoch other than the one that went
+/// out on the channel would leave an operator reading the timeline against a
+/// mover that answered a different number, which is the whole use the row has.
+///
+/// Each of `expected` is the script's id, the cycle it was sent on, and the
+/// index into `run.schedules` of the schedule it published. Returns the cycle
+/// each replacement was answered on, in `expected`'s order, for a checker that
+/// dates something off it.
+pub fn replacements(
+    run: &Run,
+    expected: &[(u32, i64, usize)],
+    failures: &mut Vec<String>,
+) -> Vec<Option<i64>> {
+    let replaced: Vec<(i64, u32, u32)> = run
+        .reports
+        .iter()
+        .filter(|report| report.message.kind() == ReportKindWire::SCRIPT_REPLACED)
+        .map(|report| {
+            (
+                cycle_within(report.message.time().as_nanos()),
+                report.message.a(),
+                report.message.b(),
+            )
+        })
+        .collect();
+    if replaced.len() != expected.len() {
+        failures.push(format!(
+            "the session narrated {replaced:?} as replacements, and this run replaces the running \
+             schedule {} times",
+            expected.len()
+        ));
+        return vec![None; expected.len()];
+    }
+    let mut answered = Vec::with_capacity(expected.len());
+    for ((at, script_id, epoch), &(wanted_id, sent_on, index)) in replaced.iter().zip(expected) {
+        if *script_id != wanted_id {
+            failures.push(format!(
+                "the session replaced its schedule on script {script_id}, and this run sends \
+                 {wanted_id}"
+            ));
+        }
+        answered_on_its_wake("replacement", *at, sent_on, failures);
+        match run.schedules.get(index) {
+            Some(logged) if logged.message.epoch() == *epoch => {}
+            Some(logged) => failures.push(format!(
+                "the session narrated the replacement under epoch {epoch} and published epoch {} \
+                 at cycle {}: the row and the channel name one schedule",
+                logged.message.epoch(),
+                cycle_within(logged.at_ns)
+            )),
+            None => {}
+        }
+        answered.push(Some(*at));
+    }
+    answered
 }
 
 /// The session answered a message on the wake that read it: that cycle or the

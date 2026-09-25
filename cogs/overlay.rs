@@ -448,7 +448,14 @@ pub struct Refusals {
     /// the window names. The window plays on from a fresh join, which is what a
     /// window opening does anyway.
     pub players: u64,
+    /// Rows that held an active player and were joined afresh this execution:
+    /// a row taken over in one period. Not a refusal -- the host re-anchors
+    /// on it as it does on a vacated row. A bit per row.
+    pub restarted: u8,
 }
+
+// `Refusals::restarted` holds a bit per row.
+const _: () = assert!(MAX_OVERLAYS <= 8);
 
 /// The overlays playing this execution.
 pub struct Overlays<'a> {
@@ -504,7 +511,10 @@ impl<'a> Overlays<'a> {
     /// behind. A row the slot cannot answer for is counted and joined afresh at
     /// the window's own offset: the timeline is authoritative in absolute time,
     /// so a fresh join eases onto the delta where the window says the motion
-    /// should be.
+    /// should be. A row joined afresh while it held an active player -- one of
+    /// another motion, or one that could not be picked up -- is reported in
+    /// [`Refusals::restarted`], so the host can treat it as vacated and refilled
+    /// in one period.
     ///
     /// The window's gain and speed are read from the window, not from the row:
     /// a row picked up keeps the speed it was joined at, because the clock it
@@ -540,6 +550,8 @@ impl<'a> Overlays<'a> {
             if !kept {
                 refusals.players += 1;
             }
+            // Read after `readable`, so a slot it had to clear holds no player.
+            let was_active = bool::from(state.active);
             let picked_up = bool::from(state.active) && state.motion_id == window.motion_id;
             let refused = picked_up && ClipPlayer::resumable(&view, state).is_err();
             if refused {
@@ -551,6 +563,9 @@ impl<'a> Overlays<'a> {
                 // A row holding no player, one of another motion, or one this
                 // build cannot pick up: the window starts afresh at its own
                 // offset, since the timeline is authoritative in absolute time.
+                if was_active {
+                    refusals.restarted |= 1 << row;
+                }
                 state.active = true.into();
                 state.motion_id = window.motion_id;
                 ClipPlayer::joining_at(view, window.speed, window.joined_at(now_ns), state)
@@ -1004,8 +1019,9 @@ mod tests {
     }
 
     /// A row holding another motion's player is joined afresh rather than
-    /// restored over the wrong track, and the reuse is not a refusal: a window
-    /// opening in a used row is the ordinary case.
+    /// restored over the wrong track. The take-over is reported as a restart,
+    /// not a refusal: a window opening in a used row is the ordinary case, and
+    /// what the host needs to know is that the row's contribution was replaced.
     #[test]
     fn a_row_reused_for_another_motion_starts_that_motion() {
         let library = library();
@@ -1025,7 +1041,13 @@ mod tests {
         );
         {
             let (mut fresh, refusals) = Overlays::take_up(&mut rows, &second, 200_000_000);
-            assert_eq!(refusals, Refusals::default());
+            assert_eq!(
+                refusals,
+                Refusals {
+                    players: 0,
+                    restarted: 1
+                }
+            );
             fresh.sample(PERIOD, [0.0, 0.0]);
         }
         assert_eq!(rows[0].motion_id(), 1);
@@ -1058,7 +1080,14 @@ mod tests {
 
         {
             let (rejoined, refusals) = Overlays::take_up(&mut rows, &windows, 100_000_000);
-            assert_eq!(refusals, Refusals { players: 1 });
+            assert_eq!(
+                refusals,
+                Refusals {
+                    players: 1,
+                    restarted: 1
+                },
+                "a resume refused on an active row is a restart as well as a refusal"
+            );
             assert!(rejoined.any(), "the window plays on");
         }
         assert!(rows[0].active());
@@ -1091,7 +1120,13 @@ mod tests {
             .antenna_turns_right = 1;
 
         let (mut rejoined, refusals) = Overlays::take_up(&mut rows, &windows, 20_000_000);
-        assert_eq!(refusals, Refusals { players: 1 });
+        assert_eq!(
+            refusals,
+            Refusals {
+                players: 1,
+                restarted: 1
+            }
+        );
         assert!(!rejoined.sample(PERIOD, [0.0, 0.0]).is_empty());
         assert_eq!(
             rows[0]
@@ -1100,6 +1135,66 @@ mod tests {
                 .antenna_turns_right,
             0
         );
+    }
+
+    /// A row that held no player is joined, not restarted.
+    #[test]
+    fn a_first_join_is_no_restart() {
+        let library = library();
+        let validated = ValidatedLibrary::of(read(&library)).expect("playable");
+        let mut rows = core::array::from_fn::<_, MAX_OVERLAYS, _>(|_| ClipPlayerSnapWire::new());
+        let windows = Windows::of(&schedule(&[(0, 0, 400_000_000, 1.0, 1.0)]), &validated);
+        let (joined, refusals) = Overlays::take_up(&mut rows, &windows, 0);
+        assert!(joined.any());
+        assert_eq!(refusals.restarted, 0);
+    }
+
+    /// A row picked up by a window of its own motion carries on its clock and is
+    /// no restart.
+    #[test]
+    fn a_pick_up_is_no_restart() {
+        let library = library();
+        let validated = ValidatedLibrary::of(read(&library)).expect("playable");
+        let mut rows = core::array::from_fn::<_, MAX_OVERLAYS, _>(|_| ClipPlayerSnapWire::new());
+        let windows = Windows::of(&schedule(&[(0, 0, 400_000_000, 1.0, 1.0)]), &validated);
+        {
+            let (mut playing, _) = Overlays::take_up(&mut rows, &windows, 0);
+            playing.sample(PERIOD, [0.0, 0.0]);
+        }
+        let before = rows[0].clock_s();
+        {
+            let (mut picked_up, refusals) = Overlays::take_up(&mut rows, &windows, 20_000_000);
+            assert_eq!(refusals.restarted, 0);
+            picked_up.sample(PERIOD, [0.0, 0.0]);
+        }
+        assert!(
+            rows[0].clock_s() > before,
+            "the picked-up player advanced rather than rejoining"
+        );
+    }
+
+    /// Only the row taken over is reported: a row that keeps its motion beside
+    /// it is picked up.
+    #[test]
+    fn a_restart_is_reported_in_its_own_row() {
+        let library = library();
+        let validated = ValidatedLibrary::of(read(&library)).expect("playable");
+        let mut rows = core::array::from_fn::<_, MAX_OVERLAYS, _>(|_| ClipPlayerSnapWire::new());
+        let first = Windows::of(
+            &schedule(&[(0, 0, 400_000_000, 1.0, 1.0), (1, 0, 400_000_000, 1.0, 1.0)]),
+            &validated,
+        );
+        {
+            let (mut playing, refusals) = Overlays::take_up(&mut rows, &first, 0);
+            assert_eq!(refusals, Refusals::default());
+            playing.sample(PERIOD, [0.0, 0.0]);
+        }
+        let second = Windows::of(
+            &schedule(&[(0, 0, 400_000_000, 1.0, 1.0), (0, 0, 400_000_000, 1.0, 1.0)]),
+            &validated,
+        );
+        let (_, refusals) = Overlays::take_up(&mut rows, &second, 20_000_000);
+        assert_eq!(refusals.restarted, 0b10);
     }
 
     /// A player whose clip and fade-out are both over contributes nothing and is

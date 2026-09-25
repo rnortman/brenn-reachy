@@ -11,9 +11,10 @@
 //! two lists, the words for adding to them, the printer that turns them into
 //! stdout, stderr and an exit status, how the fetch's directories are named
 //! beside a record directory — the layout both analyzers read the same fetch
-//! through — how a console line that tore is read back into the events it
-//! holds, the spellings that reading matches on, and the bounding every piece
-//! of console text passes through before it reaches a person.
+//! through — which directory inside a fetch is a run, how a console line that
+//! tore is read back into the events it holds, the spellings that reading
+//! matches on, and the bounding every piece of console text passes through
+//! before it reaches a person.
 
 #![forbid(unsafe_code)]
 
@@ -136,10 +137,74 @@ pub fn console_dir(records: &Path) -> PathBuf {
     sibling(records, CONSOLE_SUFFIX)
 }
 
+/// The launcher's name for the voice host's console, inside [`console_dir`].
+///
+/// The app name from the production launcher config with the launcher's own
+/// instance suffix. A run whose config renames the app writes somewhere else,
+/// and a report says it found nothing rather than guessing at a neighbour.
+pub const HOST_LOG: &str = "voice_host_0.log";
+
 /// The recorded-audio store the fetch wrote beside `records`.
 #[must_use]
 pub fn audio_dir(records: &Path) -> PathBuf {
     sibling(records, AUDIO_SUFFIX)
+}
+
+/// The extension the online logger writes its records under.
+///
+/// A run directory inside the fetch is one that holds a non-empty file of these,
+/// which is the fetch's own rule for what a run directory is (`tools/lib.sh`).
+pub const OLOG_EXTENSION: &str = "olog";
+
+/// Every run directory inside a fetch, in sort order.
+///
+/// A directory directly under the fetch holding a non-empty record file, which
+/// is what the fetch's own rule counts. A directory this process cannot list is
+/// not a run directory either, but it is said rather than silently absent: it
+/// is a fetch or a filesystem an operator can fix, and reading it as a logger
+/// that recorded nothing would point them at the machine instead.
+pub fn run_directories(records: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let mut unlisted = Vec::new();
+    let entries = match std::fs::read_dir(records) {
+        Ok(entries) => entries,
+        Err(err) => {
+            return (Vec::new(), vec![format!("{}: {err}", records.display())]);
+        }
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && match holds_records(path) {
+                    Ok(holds) => holds,
+                    Err(err) => {
+                        unlisted.push(format!("{}: {err}", path.display()));
+                        false
+                    }
+                }
+        })
+        .collect();
+    found.sort();
+    (found, unlisted)
+}
+
+/// Whether a directory holds a record file with anything in it.
+///
+/// Non-empty, because a logger that created its file and wrote nothing leaves
+/// one of zero bytes behind and a report over it would say the head sat still
+/// rather than that nothing was recorded. A file whose size will not answer is
+/// counted as no record, on the same grounds: an unmeasurable file is not
+/// evidence about a machine.
+pub fn holds_records(dir: &Path) -> Result<bool, std::io::Error> {
+    let entries = std::fs::read_dir(dir)?;
+    Ok(entries.flatten().any(|entry| {
+        entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == OLOG_EXTENSION)
+            && entry.metadata().is_ok_and(|facts| facts.len() > 0)
+    }))
 }
 
 /// What one console line holds: the whole JSON objects in it, and the text

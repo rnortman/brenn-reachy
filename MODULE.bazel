@@ -159,9 +159,9 @@ crate.spec(
 )
 
 # Deserialization for the bench's configuration file, the clip assets, and the
-# motion intent wire contract. `derive` because every one of those types is a
-# plain struct with a `#[derive]` on it. reachy-bench, reachy-clips,
-# motion-proto.
+# motion intent wire contract, and the idle loop's playlist file. `derive`
+# because every one of those types is a plain struct with a `#[derive]` on it.
+# reachy-bench, reachy-clips, motion-proto, reachy-host.
 crate.spec(
     features = ["derive"],
     package = "serde",

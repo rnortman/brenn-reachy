@@ -1156,6 +1156,25 @@ pub fn motion_id(name: &str) -> u16 {
         .motion_id
 }
 
+/// How long the motion called `name` runs and how long its overlay fades out
+/// afterwards, milliseconds, as the committed sidecar states them.
+///
+/// Read rather than restated for the reason [`motion_id`] is: a regenerated
+/// library that retimes a motion moves every instant a scenario derives from it.
+///
+/// # Panics
+///
+/// If the sidecar is not the emitter's JSON, or carries no motion of that name.
+#[must_use]
+pub fn motion_window_ms(name: &str) -> (i64, i64) {
+    let window = motion_table()
+        .resolve(name)
+        .unwrap_or_else(|| panic!("the committed clip library carries no motion named {name}"))
+        .window;
+    let ms = |value: u64| i64::try_from(value).expect("a motion's timing fits in i64 ms");
+    (ms(window.duration_ms), ms(window.blend_out_ms))
+}
+
 /// The number the committed pose library gives the pose called `name`, and the
 /// pace it holds for it.
 ///

@@ -1,18 +1,21 @@
 //! The voice host's entry point: configuration, the two loopback ports, and the
 //! loop that owns the edge.
 //!
-//! Five steps, in this order and for a reason. Read the configuration, because
+//! Six steps, in this order and for a reason. Read the configuration, because
 //! the name this machine answers to and every screen below is a value out of
 //! it. Read the clip name table, because an overlay names a motion and only
-//! that file says which index a name has. Bind the reports port, because a
+//! that file says which index a name has. Read the idle playlist, where one was
+//! named, because it names motions and only that table says whether they are
+//! there. Bind the reports port, because a
 //! second host already reading it is the one failure that has to stop this one
 //! before anything is asked of the machine. Install the stop flag. Start the
 //! voice pipeline, where one was configured, with its motion seams pointed at
 //! the gate this loop owns. Then run the loop.
 //!
 //! Every one of those failures is an exit and none of them is retried: a
-//! configuration that does not parse, a name table that is not there, a port
-//! somebody else holds, a speech configuration the pipeline will not run on.
+//! configuration that does not parse, a name table that is not there, a
+//! playlist that names a motion the table does not hold, a port somebody else
+//! holds, a speech configuration the pipeline will not run on.
 //! A speech configuration that is not on the machine at all is not among them —
 //! that is how a unit starts, and it runs the edge half and says so.
 //! What supervises this process decides what happens next,
@@ -36,13 +39,16 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use std::time::Duration;
+
 use clockwork_rs::SyncTime;
 use reachy_edge::{
-    DATAGRAM_CAP, HostEdge, LOOPBACK, MotionTable, Origin, POLL, PoseTable, REPORTS_OUT_PORT,
-    SCRIPTS_IN_PORT, Surface, edge_line_with, now, origin_word,
+    Accepted, Author, DATAGRAM_CAP, HostEdge, LOOPBACK, MotionTable, POLL, PoseTable,
+    REPORTS_OUT_PORT, SCRIPTS_IN_PORT, Surface, edge_line_with, now, origin_word,
 };
 use reachy_host::check;
 use reachy_host::edge::{Console, Publishing, Speaker};
+use reachy_host::idle::{Idle, Verdict};
 use reachy_host::intents::{Intents, Waiting, waking_queue};
 use reachy_host::params::{self, HostSettings};
 use reachy_host::sinks::Stdout;
@@ -74,6 +80,11 @@ struct Options {
     /// two are different formats owned by different repositories — this repo's
     /// textproto for the edge, the pod platform's TOML for the pipeline.
     speech_config: Option<PathBuf>,
+    /// The idle loop's playlist, payload-relative.
+    ///
+    /// With it, the host dances the playlist whenever nobody is speaking.
+    /// Without it, no loop runs.
+    idle: Option<PathBuf>,
     /// Load both configurations, look for every file they name, and exit —
     /// without binding a port, starting a pipeline or touching a robot.
     ///
@@ -88,6 +99,7 @@ impl Default for Options {
         Self {
             config: PathBuf::from(DEFAULT_CONFIG),
             speech_config: None,
+            idle: None,
             check: false,
         }
     }
@@ -96,7 +108,7 @@ impl Default for Options {
 /// How to invoke this, for a refusal to print.
 fn usage() -> String {
     format!(
-        "usage: reachy-host [--config PATH] [--speech-config PATH] [--check]\n\
+        "usage: reachy-host [--config PATH] [--speech-config PATH] [--idle PATH] [--check]\n\
          \n\
          Runs the robot's voice host: binds {REPORTS_OUT_PORT} on loopback, follows the\n\
          session's story, and sends compiled scripts to {SCRIPTS_IN_PORT}. One line of JSON\n\
@@ -107,10 +119,16 @@ fn usage() -> String {
          meet the gate above. Without the flag, or with a path nothing has been pushed to\n\
          yet, the host runs its edge half alone and says which of the two it is.\n\
          \n\
-         With --check the process instead loads both configurations, looks for every file\n\
-         they name relative to the working directory, prints one line of JSON per\n\
-         conclusion and exits: zero when everything loaded and every file is there. It\n\
-         binds nothing and prints no file's contents.\n\
+         With --idle naming a playlist, the host also dances that playlist's clips whenever\n\
+         nobody is speaking: it opens a resting machine, replaces each clip just before it\n\
+         ends, steps back while speech holds the head, and waits out a growing backoff\n\
+         after a session that ended on a fault. A playlist that does not load is a nonzero\n\
+         exit.\n\
+         \n\
+         With --check the process instead loads both configurations and the playlist, where\n\
+         one is named, looks for every file they name relative to the working directory,\n\
+         prints one line of JSON per conclusion and exits: zero when everything loaded and\n\
+         every file is there. It binds nothing and prints no file's contents.\n\
          \n\
          Nothing is retried and nothing is persisted. A configuration that does not parse,\n\
          a clip name table that is not there and a port already held are each a nonzero\n\
@@ -139,7 +157,7 @@ fn main() -> ExitCode {
 
 /// What the invocation asks for.
 ///
-/// Three optional flags, two of them naming a path. A word this does not know is a
+/// Four optional flags, three of them naming a path. A word this does not know is a
 /// refusal rather than something ignored: a host run on the shipped
 /// configuration when an operator meant a unit's own would answer to the wrong
 /// pod name.
@@ -151,6 +169,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut options = Options::default();
     let mut given = false;
     let mut speech_given = false;
+    let mut idle_given = false;
     let mut args = args;
     while let Some(word) = args.next() {
         match word.as_str() {
@@ -160,6 +179,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
             "--speech-config" => {
                 let value = path_once(&word, args.next(), &mut speech_given)?;
                 options.speech_config = Some(PathBuf::from(value));
+            }
+            "--idle" => {
+                let value = path_once(&word, args.next(), &mut idle_given)?;
+                options.idle = Some(PathBuf::from(value));
             }
             "--check" => {
                 if options.check {
@@ -214,7 +237,12 @@ fn checked(options: &Options) -> ExitCode {
 /// If the sink cannot be written, which for the caller's stdout is a console
 /// that has gone away mid-preflight.
 fn write_check(out: &mut impl io::Write, options: &Options, base: &Path) -> bool {
-    let found = check::inspect(&options.config, options.speech_config.as_deref(), base);
+    let found = check::inspect(
+        &options.config,
+        options.speech_config.as_deref(),
+        options.idle.as_deref(),
+        base,
+    );
     let at = now();
     for conclusion in &found {
         writeln!(out, "{}", check::conclusion_line(conclusion, at)).expect("a writable stream");
@@ -226,6 +254,18 @@ fn write_check(out: &mut impl io::Write, options: &Options, base: &Path) -> bool
 fn run(options: &Options) -> Result<(), String> {
     let settings = params::load(&options.config).map_err(|error| error.to_string())?;
     let (table, poses) = names(&settings)?;
+    let mut idle = match &options.idle {
+        None => None,
+        Some(path) => {
+            let playlist = Idle::load(path, &table)
+                .map_err(|error| format!("--idle {}: {error}", path.display()))?;
+            Some(Idle::new(
+                playlist,
+                settings.edge.pod(),
+                now().as_nanos().unsigned_abs(),
+            ))
+        }
+    };
 
     let reports = UdpSocket::bind((LOOPBACK, REPORTS_OUT_PORT)).map_err(|error| {
         // Only the address-in-use case names another reader. A permission
@@ -291,6 +331,7 @@ fn run(options: &Options) -> Result<(), String> {
         (LOOPBACK, SCRIPTS_IN_PORT).into(),
         &waiting,
         &mut host,
+        idle.as_mut(),
         &mut surface,
         &until(&stop, &voice),
     );
@@ -488,21 +529,42 @@ impl Until<'_> {
 /// to the story follower, which would refuse it as a wrong-sized blob and
 /// narrate a drop that nothing dropped; a stray one from elsewhere on loopback
 /// costs one pass over an empty queue.
+///
+/// With an idle loop, the read sleeps no longer than the loop's next deadline,
+/// and the loop is polled after the queue drain, so a body already waiting
+/// always reaches the edge ahead of the loop's. A stale stow the loop drops is
+/// never offered.
+// The destination, the queue, the edge and the loop are each what a case
+// substitutes.
+#[allow(clippy::too_many_arguments)]
 fn follow(
     reports: &UdpSocket,
     scripts: &UdpSocket,
     scripts_to: SocketAddr,
     waiting: &Waiting,
     host: &mut HostEdge,
+    mut idle: Option<&mut Idle>,
     surface: &mut impl Surface,
     until: &Until,
 ) -> Result<(), String> {
     let mut buffer = vec![0u8; DATAGRAM_CAP];
+    let mut due: Option<SyncTime> = None;
     while !until.reached() {
+        if idle.is_some() {
+            reports
+                .set_read_timeout(Some(read_timeout(due, now())))
+                .map_err(|error| {
+                    format!("setting the read timeout on the reports port: {error}")
+                })?;
+        }
         match reports.recv_from(&mut buffer) {
             Ok((0, _)) => {}
             Ok((read, _)) => {
-                host.follow(&buffer[..read], now(), surface);
+                if let Some(update) = host.follow(&buffer[..read], now(), surface)
+                    && let Some(idle) = idle.as_deref_mut()
+                {
+                    idle.story(&update, surface);
+                }
             }
             Err(error)
                 if matches!(
@@ -516,22 +578,91 @@ fn follow(
 
         while let Some(offered) = waiting.next() {
             let arrival = now();
+            if idle.as_deref().is_some_and(|idle| {
+                idle.speech(&offered.body, offered.origin, arrival, surface) == Verdict::Drop
+            }) {
+                continue; // the loop narrated the drop
+            }
             if let Some(accepted) = host.offer(&offered.body, offered.origin, arrival, surface) {
-                // Fire and forget: the session narrates what it decided with
-                // the script, and a send that failed is said here because
-                // nothing else would ever mention it.
-                if let Err(error) = scripts.send_to(accepted.bytes(), scripts_to) {
-                    surface.say(unsent_line(
-                        accepted.script_id,
-                        offered.origin,
-                        &error.to_string(),
-                        arrival,
-                    ));
+                if let Some(idle) = idle.as_deref_mut() {
+                    idle.speech_accepted(&offered.body, arrival, surface);
+                }
+                send(
+                    scripts,
+                    scripts_to,
+                    &accepted,
+                    Author::Offered(offered.origin),
+                    arrival,
+                    surface,
+                );
+            }
+        }
+
+        if let Some(idle) = idle.as_deref_mut() {
+            let at = now();
+            let poll = idle.poll(at, surface);
+            due = poll.due;
+            if let Some(script) = poll.send {
+                let body = script.encode();
+                match host.offer_own(body.as_bytes(), at, surface) {
+                    Some(accepted) => {
+                        if send(scripts, scripts_to, &accepted, Author::Idle, at, surface) {
+                            idle.sent(accepted.script_id, at, surface);
+                        } else {
+                            idle.unsent(accepted.script_id, at, surface);
+                        }
+                    }
+                    None => idle.refused(at, surface),
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Send an accepted script to the control process, say so if it could not go,
+/// and whether it went.
+fn send(
+    scripts: &UdpSocket,
+    to: SocketAddr,
+    accepted: &Accepted,
+    author: Author,
+    at: SyncTime,
+    surface: &mut impl Surface,
+) -> bool {
+    // Fire and forget: the session narrates what it decided with the script,
+    // and a send that failed is said here because nothing else would ever
+    // mention it.
+    match scripts.send_to(accepted.bytes(), to) {
+        Ok(_) => true,
+        Err(error) => {
+            surface.say(unsent_line(
+                accepted.script_id,
+                author,
+                &error.to_string(),
+                at,
+            ));
+            false
+        }
+    }
+}
+
+/// The shortest read timeout the socket accepts: zero is an error.
+const READ_FLOOR: Duration = Duration::from_millis(1);
+
+/// How long the next read may sleep: until the loop's next deadline, never
+/// past the liveness tick and never zero.
+///
+/// A sleep bound, not a command: the bounds here are on a socket timeout.
+fn read_timeout(due: Option<SyncTime>, now: SyncTime) -> Duration {
+    let Some(due) = due else {
+        return POLL;
+    };
+    let ns = due.as_nanos().saturating_sub(now.as_nanos());
+    u64::try_from(ns)
+        .map_or(READ_FLOOR, Duration::from_nanos)
+        .min(POLL)
+        .max(READ_FLOOR)
 }
 
 /// The asset libraries' name tables, read once at startup.
@@ -565,8 +696,17 @@ fn started_line(settings: &HostSettings, config: &Path, at: SyncTime) -> String 
 /// Carries the origin the body was offered under, because this host sends every
 /// script its gate accepted and a send that failed does not say whose gesture
 /// was lost: a reader counting what this machine did to its own scripts needs
-/// the same word a refusal carries.
-fn unsent_line(script_id: u32, origin: Origin, detail: &str, at: SyncTime) -> String {
+/// the same word a refusal carries. The idle loop's scripts carry
+/// `sender: idle` as well, because they share `origin: local` with the
+/// scripter's.
+fn unsent_line(script_id: u32, author: Author, detail: &str, at: SyncTime) -> String {
+    let mut fields = vec![
+        ("script_id", serde_json::json!(script_id)),
+        ("origin", serde_json::json!(origin_word(author.origin()))),
+    ];
+    if let Some(word) = author.sender() {
+        fields.push(("sender", serde_json::json!(word)));
+    }
     edge_line_with(
         reachy_host::UNSENT,
         at,
@@ -574,10 +714,7 @@ fn unsent_line(script_id: u32, origin: Origin, detail: &str, at: SyncTime) -> St
             "script {script_id} compiled and could not be sent to the control process: {detail}. \
              nothing is retried; the sender's next refresh is what recovers"
         ),
-        &[
-            ("script_id", serde_json::json!(script_id)),
-            ("origin", serde_json::json!(origin_word(origin))),
-        ],
+        &fields,
     )
 }
 
@@ -590,18 +727,25 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use clockwork_rs::{SyncTime, blob_from_bytes};
-    use motion_proto::{MotionScript, Step};
+    use clockwork_rs::{SyncTime, blob_as_bytes, blob_from_bytes};
+    use motion_proto::{MotionScript, STOW_POSE, Step, unix_millis};
     use pose_fixture::{NEUTRAL_POSE, poses};
-    use reachy_edge::{Alert, EdgeConfig, HostEdge, LOOPBACK, MotionTable, Origin, Surface};
+    use reachy_edge::{
+        Alert, Author, EdgeConfig, HostEdge, LOOPBACK, MotionTable, Origin, POLL, PoseTable,
+        Surface, now,
+    };
     use reachy_host::intents::queue;
+    use reachy_host::{Idle, Playlist};
     use reachy_scratch::scratch_dir;
 
     use brenn_reachy__cogs__script_clk_rs::ScriptWire;
+    use brenn_reachy__cogs__session_clk_rs::SessionPhaseWire;
+    use brenn_reachy__motion__reports_clk_rs::ReportKindWire;
+    use brenn_reachy__motion__timeline_clk_rs::{TimelineEntryWire, TimelineWire};
 
     use super::{
-        DEFAULT_CONFIG, Options, Publishing, Started, Until, Voice, alert_seam, follow,
-        install_alerts, outcome, parse, start_voice, unsent_line, until, voice_ended,
+        DEFAULT_CONFIG, Options, Publishing, READ_FLOOR, Started, Until, Voice, alert_seam, follow,
+        install_alerts, outcome, parse, read_timeout, start_voice, unsent_line, until, voice_ended,
     };
 
     /// The pod the fixture bodies are addressed to.
@@ -732,6 +876,7 @@ mod tests {
             scripts_to,
             &waiting,
             &mut host,
+            None,
             &mut surface,
             &Until { stop: &stop, ended },
         )
@@ -807,6 +952,7 @@ mod tests {
             unreachable_destination(),
             &waiting,
             &mut host,
+            None,
             &mut surface,
             &Until {
                 stop: &stop,
@@ -841,6 +987,7 @@ mod tests {
                 unreachable_destination(),
                 &waiting,
                 &mut host,
+                None,
                 &mut surface,
                 &Until {
                     stop: &stop,
@@ -939,6 +1086,371 @@ mod tests {
         assert_eq!(outcome(Ok(()), voice.and_then(Voice::stop)), Ok(()));
     }
 
+    /// A name table holding two motions and the poses a loop script names.
+    ///
+    /// The stow takes 2000 ms because the loop sizes its scripts' timeouts on
+    /// that budget: the fixture's 3000 ms stow leaves no room inside them, and
+    /// the edge refuses every loop script as uncompilable.
+    const IDLE_SIDECAR: &str = r#"{
+  "motions": [
+    {"motion_id": 1, "name": "a/one", "duration_ms": 2000, "blend_out_ms": 200},
+    {"motion_id": 2, "name": "a/two", "duration_ms": 3000, "blend_out_ms": 200}
+  ],
+  "poses": [
+    {"pose_id": 0, "name": "neutral", "duration_ms": 800},
+    {"pose_id": 4, "name": "stow", "duration_ms": 2000}
+  ]
+}
+"#;
+
+    /// The seed every loop in these cases picks with.
+    const IDLE_SEED: u64 = 0x5EED_1DEA_0000_0042;
+
+    /// The tables [`IDLE_SIDECAR`] states.
+    fn idle_tables() -> (MotionTable, PoseTable) {
+        reachy_edge::parse(IDLE_SIDECAR).expect("the idle fixture's library")
+    }
+
+    /// A loop over both fixture motions, addressing `pod`.
+    fn idle_for(pod: &str) -> Idle {
+        let (table, _) = idle_tables();
+        let playlist = Playlist::parse(r#"{"playlist":["a/one","a/two"]}"#, &table)
+            .expect("the fixture playlist");
+        Idle::new(playlist, pod, IDLE_SEED)
+    }
+
+    /// A story datagram whose one row is the machine coming to rest from
+    /// starting, stamped now.
+    fn resting_story() -> Vec<u8> {
+        let mut row = TimelineEntryWire::new();
+        row.set_time(now());
+        row.set_kind(ReportKindWire::PHASE_CHANGED);
+        row.set_a(u32::from(SessionPhaseWire::RESTING.0));
+        row.set_b(u32::from(SessionPhaseWire::STARTING.0));
+        let mut wire = TimelineWire::new();
+        {
+            let mut entries = wire.entries_mut();
+            *entries.try_grow().expect("room for one row") = row;
+        }
+        blob_as_bytes(&wire).to_vec()
+    }
+
+    /// Run the loop with `idle` over the fixture library, until a stop
+    /// arrives, and hand back what was said and the loop.
+    ///
+    /// The story datagram, when given, is in the reports socket's buffer and
+    /// the bodies are in the queue before the loop starts.
+    fn drive_idle(
+        reports: &UdpSocket,
+        scripts_to: SocketAddr,
+        story: Option<&[u8]>,
+        bodies: &[Vec<u8>],
+        mut idle: Idle,
+    ) -> (Recorded, Idle) {
+        if let Some(story) = story {
+            let sender = UdpSocket::bind((LOOPBACK, 0)).expect("an ephemeral port");
+            sender
+                .send_to(story, reports.local_addr().expect("a bound port"))
+                .expect("a datagram to a bound port");
+        }
+        let (intents, waiting) = queue();
+        for body in bodies {
+            intents
+                .offer(body.clone(), Origin::Local)
+                .expect("a queue with room");
+        }
+        let scripts = UdpSocket::bind((LOOPBACK, 0)).expect("an ephemeral port");
+        let (table, poses) = idle_tables();
+        let mut host = HostEdge::new(EdgeConfig::for_pod(POD), table, poses);
+        let mut surface = Recorded::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let raise = Arc::clone(&stop);
+        let stopper = thread::spawn(move || {
+            thread::sleep(READ * 10);
+            raise.store(true, Ordering::Relaxed);
+        });
+        follow(
+            reports,
+            &scripts,
+            scripts_to,
+            &waiting,
+            &mut host,
+            Some(&mut idle),
+            &mut surface,
+            &Until {
+                stop: &stop,
+                ended: Box::new(|| false),
+            },
+        )
+        .expect("a loop that was stopped rather than broken");
+        stopper.join().expect("the stopping thread");
+        (surface, idle)
+    }
+
+    /// A control port of this case's own, with a read that ends once nothing
+    /// more is waiting.
+    fn control_port() -> UdpSocket {
+        let control = UdpSocket::bind((LOOPBACK, 0)).expect("an ephemeral port");
+        control
+            .set_read_timeout(Some(READ * 5))
+            .expect("a read timeout on a bound socket");
+        control
+    }
+
+    /// Every script datagram at `control`, in arrival order.
+    fn received(control: &UdpSocket) -> Vec<ScriptWire> {
+        let mut scripts = Vec::new();
+        let mut buffer = vec![0u8; 4096];
+        while let Ok((read, _)) = control.recv_from(&mut buffer) {
+            scripts.push(
+                blob_from_bytes(&buffer[..read]).expect("the bytes of a `Script` and nothing else"),
+            );
+        }
+        scripts
+    }
+
+    /// The lines of `kind`, parsed.
+    fn of_kind(said: &Recorded, kind: &str) -> Vec<serde_json::Value> {
+        said.lines
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON object"))
+            .filter(|line| line["kind"] == kind)
+            .collect()
+    }
+
+    /// That `script` is a loop script as the edge compiled it: the raise and
+    /// the stow as its steps, and the clip as its one play window.
+    fn assert_loop_script(script: &ScriptWire) {
+        assert_eq!(script.steps().len(), 2, "the raise and the stow");
+        assert_eq!(script.overlays().len(), 1, "the clip");
+    }
+
+    /// A speech body for `pod`, numbered 1: below any sequence the loop's
+    /// wall-clock numbering gives.
+    fn speech_body(pod: &str, steps: Vec<Step>) -> Vec<u8> {
+        speech_body_numbered(pod, 1, steps)
+    }
+
+    /// A speech body for `pod`, numbered `seq`.
+    fn speech_body_numbered(pod: &str, seq: u64, steps: Vec<Step>) -> Vec<u8> {
+        MotionScript::new(pod, seq, steps, 13_000)
+            .expect("a lawful script")
+            .encode()
+            .into_bytes()
+    }
+
+    #[test]
+    fn the_read_sleeps_until_the_loop_is_due_and_no_longer_than_the_tick() {
+        let t0 = SyncTime::from_nanos(1_800_000_000_000_000_000);
+        let ahead = |ns: i64| SyncTime::from_nanos(t0.as_nanos() + ns);
+        assert_eq!(read_timeout(None, t0), POLL);
+        assert_eq!(
+            read_timeout(Some(ahead(30_000_000)), t0),
+            Duration::from_millis(30)
+        );
+        assert_eq!(read_timeout(Some(ahead(10_000_000_000)), t0), POLL);
+        assert_eq!(read_timeout(Some(t0), t0), READ_FLOOR);
+        assert_eq!(read_timeout(Some(ahead(-5_000_000)), t0), READ_FLOOR);
+        assert_eq!(read_timeout(Some(ahead(200_000)), t0), READ_FLOOR);
+    }
+
+    #[test]
+    fn the_loop_opens_a_resting_machine_through_the_edge() {
+        let reports = reports_port();
+        let control = control_port();
+        let destination = control.local_addr().expect("a bound port");
+
+        let (said, _) = drive_idle(
+            &reports,
+            destination,
+            Some(&resting_story()),
+            &[],
+            idle_for(POD),
+        );
+        let scripts = received(&control);
+        assert_eq!(scripts.len(), 1, "{:?}", said.lines);
+        assert_loop_script(&scripts[0]);
+        let opened = of_kind(&said, "idle_opened");
+        assert_eq!(opened.len(), 1, "{:?}", said.lines);
+        assert_eq!(opened[0]["script_id"], scripts[0].script_id());
+    }
+
+    #[test]
+    fn a_queued_body_reaches_the_edge_ahead_of_the_loop_s() {
+        // The closing body's stow is 1 ms out, so once it is accepted the head
+        // is already due back to the loop, and the same pass's poll opens.
+        let reports = reports_port();
+        let control = control_port();
+        let destination = control.local_addr().expect("a bound port");
+        let closing = speech_body(
+            POD,
+            vec![Step::new(0, NEUTRAL_POSE), Step::new(1, STOW_POSE)],
+        );
+
+        let (said, _) = drive_idle(
+            &reports,
+            destination,
+            Some(&resting_story()),
+            &[closing],
+            idle_for(POD),
+        );
+        let scripts = received(&control);
+        assert_eq!(scripts.len(), 2, "{:?}", said.lines);
+        assert_eq!(scripts[0].script_id(), 1, "the speech body went first");
+        assert_eq!(scripts[0].steps().len(), 2, "the raise and the stow");
+        assert!(scripts[0].overlays().is_empty(), "speech plays nothing");
+        assert_loop_script(&scripts[1]);
+        assert_eq!(
+            of_kind(&said, "idle_suspended").len(),
+            1,
+            "{:?}",
+            said.lines
+        );
+        assert_eq!(of_kind(&said, "idle_opened").len(), 1, "{:?}", said.lines);
+    }
+
+    #[test]
+    fn a_resume_on_the_accepting_pass_is_numbered_above_the_speech_body() {
+        // Numbered a minute ahead of the wall clock, so a loop numbering from
+        // the clock alone would be refused stale by the edge.
+        let reports = reports_port();
+        let control = control_port();
+        let destination = control.local_addr().expect("a bound port");
+        let closing = speech_body_numbered(
+            POD,
+            unix_millis(std::time::SystemTime::now()) + 60_000,
+            vec![Step::new(0, NEUTRAL_POSE), Step::new(1, STOW_POSE)],
+        );
+
+        let (said, _) = drive_idle(
+            &reports,
+            destination,
+            Some(&resting_story()),
+            &[closing],
+            idle_for(POD),
+        );
+        let scripts = received(&control);
+        assert_eq!(scripts.len(), 2, "{:?}", said.lines);
+        assert_loop_script(&scripts[1]);
+        assert_eq!(of_kind(&said, "idle_opened").len(), 1, "{:?}", said.lines);
+        assert!(
+            of_kind(&said, "idle_refused").is_empty(),
+            "{:?}",
+            said.lines
+        );
+    }
+
+    #[test]
+    fn an_accepted_speech_body_takes_the_head() {
+        // Without `speech_accepted`, the loop would still own the head and
+        // open the resting machine.
+        let reports = reports_port();
+        let control = control_port();
+        let destination = control.local_addr().expect("a bound port");
+        let hold = speech_body(POD, vec![Step::new(0, NEUTRAL_POSE)]);
+
+        let (said, _) = drive_idle(
+            &reports,
+            destination,
+            Some(&resting_story()),
+            &[hold],
+            idle_for(POD),
+        );
+        let scripts = received(&control);
+        assert_eq!(scripts.len(), 1, "{:?}", said.lines);
+        assert_eq!(scripts[0].script_id(), 1, "the hold's");
+        assert_eq!(
+            of_kind(&said, "idle_suspended").len(),
+            1,
+            "{:?}",
+            said.lines
+        );
+        assert!(of_kind(&said, "idle_opened").is_empty(), "{:?}", said.lines);
+    }
+
+    #[test]
+    fn a_speech_body_the_edge_refuses_leaves_the_loop_dancing() {
+        let reports = reports_port();
+        let control = control_port();
+        let destination = control.local_addr().expect("a bound port");
+        let misaddressed = speech_body("someone-else", vec![Step::new(0, NEUTRAL_POSE)]);
+
+        let (said, _) = drive_idle(
+            &reports,
+            destination,
+            Some(&resting_story()),
+            &[misaddressed],
+            idle_for(POD),
+        );
+        let scripts = received(&control);
+        assert_eq!(scripts.len(), 1, "{:?}", said.lines);
+        assert_loop_script(&scripts[0]);
+        assert!(
+            of_kind(&said, "idle_suspended").is_empty(),
+            "{:?}",
+            said.lines
+        );
+    }
+
+    #[test]
+    fn a_stale_stow_is_never_offered() {
+        // No story: the loop has no phase, so it sends nothing of its own, and
+        // the head is the loop's, so a bare stow is stale.
+        let reports = reports_port();
+        let control = control_port();
+        let destination = control.local_addr().expect("a bound port");
+        let stow = speech_body(POD, vec![Step::new(0, STOW_POSE)]);
+
+        let (said, _) = drive_idle(&reports, destination, None, &[stow], idle_for(POD));
+        assert!(received(&control).is_empty(), "{:?}", said.lines);
+        let dropped = of_kind(&said, "idle_dropped_stow");
+        assert_eq!(dropped.len(), 1, "{:?}", said.lines);
+        assert_eq!(dropped[0]["origin"], "local");
+        assert_eq!(
+            said.lines.len(),
+            1,
+            "the edge never saw the body, so nothing else mentions it: {:?}",
+            said.lines,
+        );
+    }
+
+    #[test]
+    fn a_loop_script_the_edge_refuses_halts_the_loop() {
+        // Many passes run before the stop; the halt holds across all of them.
+        let reports = reports_port();
+        let control = control_port();
+        let destination = control.local_addr().expect("a bound port");
+
+        let (said, _) = drive_idle(
+            &reports,
+            destination,
+            Some(&resting_story()),
+            &[],
+            idle_for("someone-else"),
+        );
+        assert!(received(&control).is_empty(), "{:?}", said.lines);
+        assert_eq!(of_kind(&said, "idle_refused").len(), 1, "{:?}", said.lines);
+    }
+
+    #[test]
+    fn a_loop_script_that_cannot_be_sent_halts_the_loop() {
+        let reports = reports_port();
+
+        let (said, _) = drive_idle(
+            &reports,
+            unreachable_destination(),
+            Some(&resting_story()),
+            &[],
+            idle_for(POD),
+        );
+        assert_eq!(of_kind(&said, "unsent").len(), 1, "{:?}", said.lines);
+        assert_eq!(of_kind(&said, "unsent")[0]["sender"], "idle");
+        let refused = of_kind(&said, "idle_refused");
+        assert_eq!(refused.len(), 1, "{:?}", said.lines);
+        assert_eq!(refused[0]["reason"], "unsent");
+        assert!(of_kind(&said, "idle_opened").is_empty(), "{:?}", said.lines);
+    }
+
     /// A destination a send to cannot reach: an IPv6 address from a socket the
     /// operating system opened for IPv4. The refusal is the kernel's and is
     /// immediate, which is what makes the unsent line's case deterministic.
@@ -958,6 +1470,7 @@ mod tests {
             Ok(Options {
                 config: PathBuf::from(DEFAULT_CONFIG),
                 speech_config: None,
+                idle: None,
                 check: false,
             }),
         );
@@ -970,6 +1483,7 @@ mod tests {
             Ok(Options {
                 config: PathBuf::from("/run/reachy/host_params.textproto"),
                 speech_config: None,
+                idle: None,
                 check: false,
             }),
         );
@@ -1000,6 +1514,20 @@ mod tests {
                 .speech_config,
             Some(PathBuf::from("/run/reachy/speech.toml")),
         );
+    }
+
+    #[test]
+    fn the_idle_flag_names_a_playlist_once() {
+        assert_eq!(
+            parsed(&["--idle", "cogs/idle.json"])
+                .expect("a named playlist")
+                .idle,
+            Some(PathBuf::from("cogs/idle.json")),
+        );
+        assert_eq!(parsed(&[]).expect("no arguments").idle, None);
+        assert!(parsed(&["--idle"]).is_err());
+        let refused = parsed(&["--idle", "a", "--idle", "b"]).expect_err("a repeated flag");
+        assert!(refused.contains("--idle"), "{refused}");
     }
 
     #[test]
@@ -1060,6 +1588,7 @@ mod tests {
         let options = Options {
             config,
             speech_config: Some(speech),
+            idle: None,
             check: true,
         };
 
@@ -1078,6 +1607,30 @@ mod tests {
     }
 
     #[test]
+    fn a_payload_carrying_a_playlist_that_loads_checks_the_playlist() {
+        let dir = scratch_dir("reachy-host-checked-idle");
+        let config = checkable(dir.as_ref());
+        std::fs::write(dir.join("library.names.json"), IDLE_SIDECAR).expect("a file");
+        std::fs::write(dir.join("idle.json"), r#"{"playlist":["a/one","a/two"]}"#).expect("a file");
+        let options = Options {
+            config,
+            speech_config: None,
+            idle: Some(PathBuf::from("idle.json")),
+            check: true,
+        };
+
+        let (settled, lines) = checked_lines(&options, dir.as_ref());
+        assert!(settled, "{lines:?}");
+        let idle: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON object"))
+            .filter(|line| line["kind"] == "idle")
+            .collect();
+        assert_eq!(idle.len(), 1, "{lines:?}");
+        assert_eq!(idle[0]["held"], true, "{lines:?}");
+    }
+
+    #[test]
     fn a_payload_missing_a_file_its_configuration_names_does_not() {
         let dir = scratch_dir("reachy-host-checked-missing");
         let config = checkable(dir.as_ref());
@@ -1090,6 +1643,7 @@ mod tests {
         let options = Options {
             config,
             speech_config: Some(speech),
+            idle: None,
             check: true,
         };
 
@@ -1439,7 +1993,7 @@ mod tests {
     #[test]
     fn a_script_that_could_not_be_sent_says_which_one() {
         let at = SyncTime::from_nanos(1_700_000_000_000_000_000);
-        let line = unsent_line(7, Origin::Remote, "no route to host", at);
+        let line = unsent_line(7, Author::Offered(Origin::Remote), "no route to host", at);
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("one JSON object");
         assert_eq!(parsed["kind"], "unsent");
         assert_eq!(parsed["at_ns"], at.as_nanos());
@@ -1448,6 +2002,7 @@ mod tests {
             parsed["origin"], "remote",
             "this host sends a bus sender's accepted script too, and says so",
         );
+        assert!(parsed.get("sender").is_none(), "{line}");
         assert!(
             parsed["says"]
                 .as_str()

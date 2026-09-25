@@ -45,6 +45,10 @@
 //! host's own configuration is not held to that: the launcher and an operator
 //! both name it wherever it is.
 //!
+//! The idle playlist is the third input, where one is named, and it is checked
+//! the way the run reads it: through the run's own loader, against the name
+//! table the host configuration names.
+//!
 //! The recording directory is held to the same rule for the opposite reason.
 //! It is the one path the configuration names that the run *creates* rather
 //! than reads, so an absolute one is not a file the unit fails to find — it is
@@ -58,6 +62,7 @@ use clockwork_rs::SyncTime;
 use reachy_edge::{MotionTable, PoseTable};
 use serde_json::json;
 
+use crate::idle::Idle;
 use crate::params;
 
 /// The asset libraries' name tables at `path`, or a fragment saying why there
@@ -101,12 +106,19 @@ pub struct Conclusion {
 /// directory in a test. The check is over the configurations as written: a
 /// speech configuration that was not named is a legal host and not a finding,
 /// because the edge half runs alone on a unit whose payload carries no
-/// pipeline inputs.
+/// pipeline inputs. A named playlist is loaded through the run's own loader,
+/// against the name table the host configuration names; an unnamed one is not a
+/// finding.
 ///
 /// The last conclusion is the verdict, so a reader of the stream has the answer
 /// without accumulating the lines before it.
 #[must_use]
-pub fn inspect(config: &Path, speech_config: Option<&Path>, base: &Path) -> Vec<Conclusion> {
+pub fn inspect(
+    config: &Path,
+    speech_config: Option<&Path>,
+    idle: Option<&Path>,
+    base: &Path,
+) -> Vec<Conclusion> {
     let mut found = Vec::new();
     let host = match params::load(config) {
         Ok(settings) => {
@@ -165,6 +177,10 @@ pub fn inspect(config: &Path, speech_config: Option<&Path>, base: &Path) -> Vec<
         if let Some(brenn) = voice.brenn.as_ref() {
             found.push(commandable(&host.library_names, brenn, base));
         }
+    }
+
+    if let Some(path) = idle {
+        found.push(playlist(host.as_ref(), path, base));
     }
 
     let verdict = verdict(&found);
@@ -298,6 +314,56 @@ fn commandable(
             at.display(),
             listed(&holds),
         ),
+    }
+}
+
+/// Whether the idle playlist at `path` loads the way the run loads it.
+///
+/// Through the run's own loader and against the name table the host
+/// configuration names, so a playlist this passes is one the run starts on.
+fn playlist(host: Option<&params::HostSettings>, path: &Path, base: &Path) -> Conclusion {
+    let conclusion = |held: bool, says: String| Conclusion {
+        kind: "idle",
+        subject: "idle".to_owned(),
+        held,
+        says,
+    };
+    let Some(host) = host else {
+        return conclusion(
+            false,
+            format!(
+                "the idle playlist {} resolves through the name table the host configuration \
+                 names, and that configuration did not load",
+                path.display()
+            ),
+        );
+    };
+    let names = base.join(&host.library_names);
+    let (table, _) = match name_tables(&names) {
+        Ok(tables) => tables,
+        Err(detail) => {
+            return conclusion(
+                false,
+                format!(
+                    "the idle playlist {} resolves through {}, which {detail}",
+                    path.display(),
+                    names.display()
+                ),
+            );
+        }
+    };
+    let at = base.join(path);
+    match Idle::load(&at, &table) {
+        Ok(list) => conclusion(
+            true,
+            format!(
+                "{} is a playlist of {} motions, every one in the name table and none a probe or \
+                 bench motion",
+                at.display(),
+                list.len()
+            ),
+        ),
+        Err(error) => conclusion(false, one_line(&error.to_string())),
     }
 }
 
@@ -643,7 +709,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         assert!(about(&found, "pod_psk_file").held, "{found:?}");
         assert!(about(&found, "brenn.bridge.token_file").held, "{found:?}");
@@ -664,7 +730,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         assert!(
             !found
@@ -698,7 +764,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         for (field, file) in MODELLED {
             let names = about(&found, field);
@@ -726,7 +792,7 @@ mod tests {
         std::fs::remove_file(dir.join(speech_fixture::WAKE_EMBEDDING))
             .expect("the fixture's embedding model");
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let missing = about(&found, "wake.embedding");
         assert!(!missing.held, "{missing:?}");
@@ -760,7 +826,7 @@ mod tests {
             &["reachy00", "reachy01"],
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let addressee = about(&found, "pod");
         assert_eq!(addressee.kind, "addressee", "{addressee:?}");
@@ -784,7 +850,7 @@ mod tests {
             &["fixture-reachy", "reachy00"],
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let addressee = about(&found, "pod");
         assert!(addressee.held, "{addressee:?}");
@@ -806,7 +872,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let addressee = about(&found, "pod");
         assert!(addressee.held, "{addressee:?}");
@@ -831,7 +897,7 @@ mod tests {
             &["reachy00"],
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         assert!(
             !found
@@ -853,7 +919,7 @@ mod tests {
         );
         std::fs::remove_file(dir.join("psk.toml")).expect("the fixture's key table");
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let names = about(&found, "pod_psk_file");
         assert!(!names.held, "{names:?}");
@@ -878,7 +944,7 @@ mod tests {
         library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::carrying(dir.as_ref(), speech_fixture::Events::Dropped);
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         for field in ["pod_psk_file", "brenn.bridge.token_file"] {
             let refused = about(&found, field);
@@ -904,7 +970,7 @@ mod tests {
         );
         speech_fixture::records(&speech, Path::new("framelogs"), 64 * 1024 * 1024);
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let says = speech_says(&found, &speech);
         assert!(
@@ -937,7 +1003,7 @@ mod tests {
             );
             speech_fixture::records(&speech, Path::new("framelogs"), cap);
 
-            let found = inspect(&config, Some(&speech), dir.as_ref());
+            let found = inspect(&config, Some(&speech), None, dir.as_ref());
             let says = speech_says(&found, &speech);
             assert!(says.contains(&format!("under a {printed} cap")), "{says:?}");
         }
@@ -956,7 +1022,7 @@ mod tests {
         );
         speech_fixture::records(&speech, Path::new("framelogs"), 9_000_000_000_000_000_000);
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         let says = speech_says(&found, &speech);
         // The figure itself, not merely a unit: a cap read at the wrong
         // magnitude is one an operator would believe.
@@ -974,7 +1040,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let says = speech_says(&found, &speech);
         assert!(says.contains("it records nothing"), "{says:?}");
@@ -993,7 +1059,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         let says = speech_says(&found, &speech);
         assert!(
             says.contains("the gate declines above no_speech 0.2"),
@@ -1002,7 +1068,7 @@ mod tests {
         assert!(!says.contains("logprob"), "{says:?}");
 
         speech_fixture::declining_below(&speech, -0.9);
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         let says = speech_says(&found, &speech);
         assert!(
             says.contains("the gate declines above no_speech 0.2 or below logprob -0.9"),
@@ -1021,7 +1087,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let says = speech_says(&found, &speech);
         assert!(
@@ -1046,7 +1112,7 @@ mod tests {
         let store = dir.join("framelogs");
         speech_fixture::records(&speech, store.as_path(), 64 * 1024 * 1024);
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let refused = about(&found, "record.dir");
         assert_eq!(refused.kind, "absolute", "{refused:?}");
@@ -1079,7 +1145,7 @@ mod tests {
             64 * 1024 * 1024,
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let refused = about(&found, "record.dir");
         assert_eq!(refused.kind, "absolute", "{refused:?}");
@@ -1107,7 +1173,7 @@ mod tests {
         let text = std::fs::read_to_string(&speech).expect("the fixture");
         std::fs::write(&speech, text.replace("enabled = true", "enabled = false")).expect("a file");
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         assert!(
             !found
@@ -1132,7 +1198,7 @@ mod tests {
         );
         speech_fixture::records(&speech, Path::new("framelogs"), 64 * 1024 * 1024);
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         assert!(
             !found
@@ -1148,7 +1214,7 @@ mod tests {
         let config = params(dir.as_ref(), "names.json");
         std::fs::create_dir(dir.join("names.json")).expect("a directory in the way");
 
-        let found = inspect(&config, None, dir.as_ref());
+        let found = inspect(&config, None, None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         assert!(
             about(&found, "library_names_path")
@@ -1171,7 +1237,7 @@ mod tests {
         let text = std::fs::read_to_string(&speech).expect("the fixture");
         std::fs::write(&speech, format!("listen_adr = \"127.0.0.1:0\"\n{text}")).expect("a file");
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let refused = about(&found, &speech.display().to_string());
         assert_eq!(refused.kind, "speech_config");
@@ -1196,7 +1262,7 @@ mod tests {
         let config = dir.join("host_params.textproto");
         std::fs::write(&config, "pod: \"fixture-reachy\"\nnot_a_field: 1\n").expect("a file");
 
-        let found = inspect(&config, None, dir.as_ref());
+        let found = inspect(&config, None, None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let refused = about(&found, &config.display().to_string());
         assert_eq!(refused.kind, "params");
@@ -1209,7 +1275,7 @@ mod tests {
         let config = params(dir.as_ref(), "names.json");
         library_names(dir.as_ref(), "names.json");
 
-        let found = inspect(&config, None, dir.as_ref());
+        let found = inspect(&config, None, None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         assert!(
             found
@@ -1257,7 +1323,7 @@ mod tests {
         let token = std::fs::read_to_string(dir.join("bus.token")).expect("the token");
 
         let at = SyncTime::from_nanos(1);
-        let printed: String = inspect(&config, Some(&speech), dir.as_ref())
+        let printed: String = inspect(&config, Some(&speech), None, dir.as_ref())
             .iter()
             .map(|conclusion| conclusion_line(conclusion, at))
             .collect();
@@ -1274,7 +1340,7 @@ mod tests {
         let config = params(dir.as_ref(), "names.json");
         library_names(dir.as_ref(), "names.json");
 
-        let found = inspect(&config, None, Path::new(""));
+        let found = inspect(&config, None, None, Path::new(""));
         assert!(
             !settled(&found),
             "the table is in the scratch directory, not this process's: {found:?}",
@@ -1301,7 +1367,7 @@ mod tests {
         );
         speech_fixture::presence_poses(&speech, "stow", pose_fixture::NEUTRAL_POSE);
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let poses = about(&found, "presence poses");
         assert_eq!(poses.kind, "poses", "{poses:?}");
@@ -1333,7 +1399,7 @@ mod tests {
         );
         speech_fixture::presence_poses(&speech, "peek", pose_fixture::NEUTRAL_POSE);
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let poses = about(&found, "presence poses");
         assert!(!poses.held, "{poses:?}");
@@ -1364,7 +1430,7 @@ mod tests {
         );
         speech_fixture::presence_poses(&speech, "peek", "attentive");
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let poses = about(&found, "presence poses");
         assert!(!poses.held, "{poses:?}");
@@ -1390,7 +1456,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let poses = about(&found, "presence poses");
         assert!(poses.held, "{poses:?}");
@@ -1417,7 +1483,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let poses = about(&found, "presence poses");
         assert!(!poses.held, "{poses:?}");
@@ -1447,7 +1513,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         assert!(about(&found, "library_names_path").held, "{found:?}");
         let poses = about(&found, "presence poses");
@@ -1468,7 +1534,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         assert!(
             !found
@@ -1476,5 +1542,110 @@ mod tests {
                 .any(|conclusion| conclusion.subject == "presence poses"),
             "{found:?}",
         );
+    }
+
+    /// A name table holding two motions and the fixture's poses, at `name`
+    /// inside `dir`, with the host configuration pointing at it.
+    fn idle_names(dir: &Path, name: &str) -> PathBuf {
+        std::fs::write(
+            dir.join(name),
+            r#"{
+  "motions": [
+    {"motion_id": 1, "name": "a/one", "duration_ms": 2000, "blend_out_ms": 200},
+    {"motion_id": 2, "name": "a/two", "duration_ms": 3000, "blend_out_ms": 200}
+  ],
+  "poses": [
+    {"pose_id": 0, "name": "neutral", "duration_ms": 800},
+    {"pose_id": 4, "name": "stow", "duration_ms": 2000}
+  ]
+}
+"#,
+        )
+        .expect("a file");
+        params(dir, name)
+    }
+
+    /// A playlist file in `dir`, holding `text`.
+    fn playlist_file(dir: &Path, text: &str) -> PathBuf {
+        let path = dir.join("idle.json");
+        std::fs::write(&path, text).expect("a file");
+        path
+    }
+
+    /// The `idle` conclusion, which the case expects to be there.
+    fn idle(found: &[Conclusion]) -> &Conclusion {
+        found
+            .iter()
+            .find(|conclusion| conclusion.kind == "idle")
+            .unwrap_or_else(|| panic!("an idle conclusion: {found:?}"))
+    }
+
+    #[test]
+    fn a_named_playlist_that_loads_is_a_held_conclusion() {
+        let dir = scratch_dir("reachy-host-check-idle-clean");
+        let config = idle_names(dir.as_ref(), "names.json");
+        playlist_file(dir.as_ref(), r#"{"playlist": ["a/one", "a/two"]}"#);
+
+        let found = inspect(&config, None, Some(Path::new("idle.json")), dir.as_ref());
+        let conclusion = idle(&found);
+        assert!(conclusion.held, "{conclusion:?}");
+        assert_eq!(conclusion.subject, "idle");
+        assert!(conclusion.says.contains("2 motions"), "{conclusion:?}");
+        assert!(settled(&found), "{found:?}");
+    }
+
+    #[test]
+    fn a_playlist_naming_a_motion_the_table_lacks_is_not() {
+        let dir = scratch_dir("reachy-host-check-idle-unknown");
+        let config = idle_names(dir.as_ref(), "names.json");
+        playlist_file(dir.as_ref(), r#"{"playlist": ["a/one", "a/missing"]}"#);
+
+        let found = inspect(&config, None, Some(Path::new("idle.json")), dir.as_ref());
+        let conclusion = idle(&found);
+        assert!(!conclusion.held, "{conclusion:?}");
+        assert!(conclusion.says.contains("a/missing"), "{conclusion:?}");
+        let verdict = verdict(&found);
+        assert!(!verdict.held, "{verdict:?}");
+        assert!(verdict.says.contains("idle"), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_named_playlist_that_is_not_there_is_not() {
+        let dir = scratch_dir("reachy-host-check-idle-absent");
+        let config = idle_names(dir.as_ref(), "names.json");
+
+        let found = inspect(&config, None, Some(Path::new("idle.json")), dir.as_ref());
+        let conclusion = idle(&found);
+        assert!(!conclusion.held, "{conclusion:?}");
+        assert!(
+            conclusion.says.contains("could not be read"),
+            "{conclusion:?}"
+        );
+        assert!(!settled(&found), "{found:?}");
+    }
+
+    #[test]
+    fn no_playlist_named_is_no_idle_conclusion() {
+        let dir = scratch_dir("reachy-host-check-idle-unnamed");
+        let config = idle_names(dir.as_ref(), "names.json");
+
+        let found = inspect(&config, None, None, dir.as_ref());
+        assert!(
+            !found.iter().any(|conclusion| conclusion.kind == "idle"),
+            "{found:?}",
+        );
+        assert!(settled(&found), "{found:?}");
+    }
+
+    #[test]
+    fn a_playlist_with_no_host_configuration_to_resolve_through_is_not() {
+        let dir = scratch_dir("reachy-host-check-idle-no-host");
+        playlist_file(dir.as_ref(), r#"{"playlist": ["a/one", "a/two"]}"#);
+        let config = dir.join("host_params.textproto");
+
+        let found = inspect(&config, None, Some(Path::new("idle.json")), dir.as_ref());
+        let conclusion = idle(&found);
+        assert!(!conclusion.held, "{conclusion:?}");
+        assert!(conclusion.says.contains("did not load"), "{conclusion:?}");
     }
 }

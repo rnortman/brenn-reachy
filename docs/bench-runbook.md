@@ -41,9 +41,8 @@ All RAM: nothing touches the eMMC; a reboot clears it.
 ## Clearing the bus
 
 `brenn-app.service` and `reachy-motiond.service` each open the servo port; the
-scripts refuse rather than stop either — what runs on a device is the
-operator's. A fetched unit runs `brenn-app.service` from boot; stop it before
-a bench night.
+scripts refuse rather than stop either. A fetched unit runs `brenn-app.service`
+from boot; stop it before a bench night.
 
     ssh root@"$REACHY_HOST" systemctl stop reachy-motiond.service
     ssh root@"$REACHY_HOST" systemctl start reachy-motiond.service   # after
@@ -90,10 +89,12 @@ unattended motion.
 `motion-pack` packs the operator's build, speech configuration and all: the
 server admits only a unit presenting its provisioned certificate.
 `motion-resync` makes the unit fetch the archive and restart
-`brenn-app.service`, which tours as `app`. Every boot fetches the same URL:
+`brenn-app.service`, which dances the idle playlist, `cogs/idle.json`, as
+`app` until stopped; a name absent from `cogs/library.names.json` keeps
+`voice_host` from starting. Every boot fetches the same URL:
 **publish only a build you would let a power cycle start.** `make motion-fetch`
-brings the records home. Reboot between a root run and a fetched run: they
-cannot share log roots.
+brings the records home; `//cogs:idle_run_report` judges them. Reboot between
+a root run and a fetched run: they cannot share log roots.
 
 ## The hold test, and tuning
 

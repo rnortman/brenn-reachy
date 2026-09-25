@@ -29,6 +29,11 @@
 # edge half and says so on its own console, where a launcher app that exited
 # would have taken the session's narration with it.
 #
+# `--idle` names the playlist the host dances when nobody is speaking. It is a
+# committed file staged by `tools/build-motion.sh`'s `config_targets` at its
+# repo path, so it is always there. This entry is merged into the production
+# config only, so the harness and recording configs run no loop.
+#
 # Named `voice_host` rather than `host`: the launcher spells each app's console
 # `<name>_<run>.log` and this repo says "host" for the workstation half of the
 # bench -- `make motion-host-run`, `cogs/robot_host.clk`, `hostcpu.textproto` --
@@ -45,4 +50,6 @@ app {
   executable: "reachy_host"
   args: "--speech-config"
   args: "host/speech.toml"
+  args: "--idle"
+  args: "cogs/idle.json"
 }

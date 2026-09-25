@@ -1,7 +1,5 @@
 //! Judge one supplied motion script against the log and names used to compile it.
 
-mod motion_run_report;
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -116,6 +114,7 @@ fn main() -> ExitCode {
                 prepared.grid,
                 &prepared.skips,
                 &mut report,
+                "the script",
             );
             window_measurements(&prepared, &planned, &by_id, &mut report);
             whole_stream_measurements(&prepared, &run, &config, &mut report);
@@ -422,9 +421,6 @@ fn strict_settle(
 
 #[cfg(test)]
 mod tests {
-    use super::motion_run_report::settle;
-    use super::motion_run_report::{Run, SETTLE_BOUND_COUNTS, SettleMove};
-    use super::motion_run_report::{Span, every_window_moved, windows};
     use super::{SettleResult, compare_request, continuity_spans, parse_args, strict_settle};
     use brenn_reachy__cogs__schedule_clk_rs::{
         OverlayWindowWire, ScheduledStepWire, SessionScheduleWire, StepKindWire,
@@ -435,6 +431,9 @@ mod tests {
     use log_read::Logged;
     use motion_proto::PlayWindow;
     use motion_proto::STOW_POSE;
+    use motion_run_report::settle;
+    use motion_run_report::{Run, SETTLE_BOUND_COUNTS, SettleMove};
+    use motion_run_report::{Span, every_window_moved, windows};
     use pose_reading::RunConfig;
     use reachy_edge::names::{MotionEntry, MotionTable, PoseEntry, PoseTable};
     use reachy_motion::arm::DEFAULT_GAINS;

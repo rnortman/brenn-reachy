@@ -46,8 +46,6 @@ use pose_reading::{RunConfig, no_faults};
 use reachy_edge::names::MotionTable;
 use run_report::{Report, verdict};
 
-mod motion_run_report;
-
 use motion_run_report::{
     Run, Window, every_window_moved, held_standard, named_motion, overlay_spans, prepare, read,
     settle, stillness, the_stream_held, whole_stream_measurements, window_measurements, windows,
@@ -217,6 +215,7 @@ fn analyze(run: &Run, table: &MotionTable, config: &RunConfig) -> Report {
         prepared.grid,
         &prepared.skips,
         &mut report,
+        "the tour",
     );
     window_measurements(&prepared, &planned, &by_id, &mut report);
     whole_stream_measurements(&prepared, run, config, &mut report);
@@ -280,12 +279,12 @@ mod tests {
     //! is under test is the reading. A fixture run is two motions long, which
     //! is enough for order, repetition and omission to be different things.
 
-    use super::motion_run_report::SETTLE_BOUND_COUNTS;
     use super::{
         ANTENNA_CONTACT_BAND_RAD, CHANNELS, DriverEventWire, EventKindWire, HealthReportWire,
         Logged, MotionTable, POSE_CHANNEL, PoseSampleWire, Report, Run, RunConfig, ScriptWire,
         SessionScheduleWire, TickFaultWire, Window, analyze, settle, windows,
     };
+    use motion_run_report::SETTLE_BOUND_COUNTS;
     use pose_reading::TEMPERATURE_STOP_C;
     use reachy_motion::arm::DEFAULT_GAINS;
     use reachy_motion::plant::{ClassProfile, GroupProfiles, SHIPPED_PROFILES};
@@ -448,10 +447,8 @@ mod tests {
             velocity: 0,
             following_lag_us: 0,
         });
-        let result = super::motion_run_report::prepare(
-            &run,
-            &RunConfig::stated(profiles, DEFAULT_GAINS, true),
-        );
+        let result =
+            motion_run_report::prepare(&run, &RunConfig::stated(profiles, DEFAULT_GAINS, true));
         let error = match result {
             Ok(_) => panic!("zero profiles cannot form a plant"),
             Err(error) => error,

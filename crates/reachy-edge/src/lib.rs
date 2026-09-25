@@ -74,8 +74,9 @@ pub use names::{
     MAX_MOTIONS, MAX_POSES, MotionEntry, MotionTable, PoseEntry, PoseTable, SidecarError, parse,
 };
 pub use narrate::{
-    UNKNOWN_KIND_PREFIX, edge_line, edge_line_with, lost_line, origin_word, refusal_line,
-    restart_line, row_says, row_word, severity_word, timeline_line,
+    Author, IDLE_SENDER, UNKNOWN_KIND_PREFIX, edge_line, edge_line_with, lost_line, origin_word,
+    refusal_line, refusal_line_with, restart_line, row_says, row_word, severity_word,
+    timeline_line,
 };
 pub use ports::{LOOPBACK, REPORTS_OUT_PORT, SCRIPTS_IN_PORT};
 pub use run::{DATAGRAM_CAP, HostEdge, POLL, Surface, alert_line, now};
