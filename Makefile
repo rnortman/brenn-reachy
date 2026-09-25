@@ -124,6 +124,7 @@ help:
 	@echo "  make motion-script SCRIPT=... [SETTLE_EVIDENCE=1]  rehearse one supplied script on the unit"
 	@echo "  make speech-run      build, push, run the voice pipeline; ^C ends it"
 	@echo "  make speech-fetch    bring a speech run's records back, timestamped"
+	@echo "  make speech-replay WAV=... [REPLAY_LINGER_MS=...]  play a wav into the unit's running host as its pod"
 	@echo "  make pose-record     de-torqued, hands on the head: record poses and speech"
 	@echo "  make pose-fetch      bring a recording session's streams back, timestamped"
 
@@ -325,11 +326,11 @@ pod-overlay-status:
 # set is the one that unit implements.
 #
 # `host_closure_test` is named beside the filegroup because it is testonly and a
-# filegroup cannot carry that. It is the only target that links OpenSSL and ONNX
-# Runtime, so it is where the voice pipeline's native libraries are proved to
-# resolve for the unit's architecture — the link, and only the link: what the
-# prebuilt ONNX Runtime's own instructions are is the ISA sweep's question, and
-# it reads that object too.
+# filegroup cannot carry that. The voice pipeline's native libraries, OpenSSL and
+# ONNX Runtime, are proved to resolve for the unit's architecture by the payload
+# members that link them and by this test — the link, and only the link: what
+# the prebuilt ONNX Runtime's own instructions are is the ISA sweep's question,
+# and it reads that object too.
 #
 # `identity_check` is named for the third question about that runtime: which
 # release the aarch64 archive holds. Nothing else asks it — the closure test
@@ -779,6 +780,17 @@ speech-run: device-host require-bazel
 .PHONY: speech-fetch
 speech-fetch: device-host
 	tools/deploy-motion.sh $(REACHY_HOST) --speech-fetch $(SPEECH_RECORDS)
+
+# Play WAV into the unit's running voice host as its pod, and bring home what
+# the host did into SPEECH_RECORDS, beside the fetched runs of the same unit.
+# The unit's audio device is stopped for the replay and left stopped. Builds
+# and pushes nothing: it replays into the payload the unit already runs, which
+# must carry replay_pod. REPLAY_LINGER_MS is how long
+# replay_pod waits for the reply's end of audio.
+.PHONY: speech-replay
+speech-replay: device-host require-bazel
+	@[ -n "$(WAV)" ] || { echo "WAV is not set, so there is nothing to replay." >&2; exit 1; }
+	tools/deploy-motion.sh $(REACHY_HOST) --replay "$(WAV)" $(SPEECH_RECORDS) $(if $(REPLAY_LINGER_MS),--linger-ms $(REPLAY_LINGER_MS),)
 
 # ---------------------------------------------------------------------------
 # The recording session: the servos de-torqued, the operator's two hands on the

@@ -23,6 +23,7 @@
 #     reachy_pod                                        the audio device process
 #     reachy_ask                                        the harness's intent source
 #     reachy_bench                                      the recording session's pose stream
+#     replay_pod                                        plays a frame log into the running host (deploy-motion.sh --replay)
 #     cogs/robot_clk_exe                                the logger and the control loop
 #     driver/motord_params.textproto                    the driver's configuration
 #     host/host_params.textproto                        the operator's host configuration
@@ -174,6 +175,10 @@ record_config_target=//cogs:robotcpu_record.textproto
 # command is the recording config's third app. Named again here because its
 # output has to be told apart from the other Rust binaries' by basename.
 bench_target=//crates/reachy-bench:reachy_bench
+# A payload member for the replay harness. Named again here because its output
+# has to be told apart by basename, and that basename is the generated
+# `replay-pod__bin`.
+replay_target=//bazel/platform:replay_pod
 prelaunch_target=//cogs:clockwork_prelaunch_sh
 # The payload's one shared object. The voice host links ONNX Runtime
 # dynamically, so this file has to be staged beside it at the payload root: the
@@ -227,9 +232,6 @@ config_targets=(
 # deliberately.
 payload="${repo_root}/target/motion-arm64/release"
 
-# Where the audio device's link configuration goes under the payload root: the
-# path `pod/pod_launch.textproto` passes the pod as `--config`.
-link_conf_path=conf/audio.conf
 # Composed during resolution, before anything is staged, and installed by
 # `stage`: a refusal from the writer leaves the previous payload alone.
 link_conf_composed="${payload}.audio.conf"
@@ -456,6 +458,7 @@ payload_fixed_members=(
 	robotcpu_harness.textproto
 	robotcpu_record.textproto
 	reachy_bench
+	replay_pod
 	cogs/robot_clk_exe
 	clockwork/launch/clockwork_prelaunch.sh
 	"$provenance_name"
@@ -711,6 +714,9 @@ stage() {
 	# `pose-log`. Staged in every payload, because which config a unit runs is
 	# decided at the prompt and not at the build.
 	install -m 0755 -D -- "$bench_out" "${staging}/reachy_bench"
+	# Not a launcher app: `deploy-motion.sh --replay` runs it over ssh, and it is
+	# staged in every payload so any unit that fetched can take a replay.
+	install -m 0755 -D -- "$replay_out" "${staging}/replay_pod"
 	# Beside the host, because that is what its `$ORIGIN` runpath means.
 	install -m 0755 -D -- "$onnx_out" "${staging}/libonnxruntime.so.1"
 	install -m 0755 -D -- "$exe_out" "${staging}/cogs/robot_clk_exe"
@@ -726,9 +732,12 @@ stage() {
 		install -m 0644 -D -- "${entry%%$'\t'*}" "${staging}/${entry#*$'\t'}"
 	done
 
-	# The one member that may be absent, and one of the two staged 0600: it
-	# carries a bus token and this unit's link keys, so it is readable by the
-	# account that runs the payload and by nobody else on the machine.
+	# The one member that may be absent. Staged 0600, as every member below
+	# that carries a key or names this unit: that protects the staging tree on
+	# this workstation, and a pushed run's tree on the unit, which `rsync -a`
+	# carries at these modes and root runs. A fetched payload does not keep
+	# these modes, so a speech configuration carried in one must declare
+	# `secrets_posture = "payload"`.
 	if [ -f "$speech_config" ]; then
 		install -m 0600 -D -- "$speech_config" "${staging}/${speech_config_path}"
 	fi
@@ -747,26 +756,24 @@ stage() {
 	fi
 
 	# The other operator's file, staged the same way and refused above when it
-	# is not there: the host cannot start without it. 0600 for the reason the
-	# speech configuration is -- it names the machine this unit answers to, and
-	# a per-unit file is nobody else's on the machine to read.
+	# is not there: the host cannot start without it. 0600 for the reason
+	# above: it names the machine this unit answers to.
 	install -m 0600 -D -- "$host_params" "${staging}/${host_params_path}"
 
-	# The audio device's link, composed above: 0600 because it holds this
-	# unit's link key, as the key table does.
+	# The audio device's link, composed above. 0600 for the reason above: it
+	# holds this unit's link key.
 	if [ -n "$speech_source" ]; then
 		install -m 0600 -D -- "$link_conf_composed" "${staging}/${link_conf_path}"
 	fi
 
-	# Credentials (the pod's key table, the bus token): mode 0600 so only
-	# the payload's account reads them. `rsync -a` carries the mode to the
-	# unit.
+	# Credentials (the pod's key table, the bus token): 0600 for the reason
+	# above.
 	for entry in "${speech_credentials[@]}"; do
 		install -m 0600 -D -- "${entry%%$'\t'*}" "${staging}/${entry#*$'\t'}"
 	done
 
 	# The wake gate's phrase head, at 0644 like the build's own models. The
-	# 0600 above guards keys from other accounts on the unit; a head is
+	# 0600 above guards keys in the staging tree and a pushed run; a head is
 	# private in the publication sense and not the access-control one.
 	for entry in "${speech_models[@]}"; do
 		install -m 0644 -D -- "${entry%%$'\t'*}" "${staging}/${entry#*$'\t'}"
@@ -797,7 +804,7 @@ report() {
 	echo "${prog}: device payload  ${payload}  (${size})"
 	local file
 	for file in reachy_motord reachy_host reachy_pod reachy_ask reachy_bench \
-		libonnxruntime.so.1 cogs/robot_clk_exe simplelaunch; do
+		replay_pod libonnxruntime.so.1 cogs/robot_clk_exe simplelaunch; do
 		echo "${prog}: ${file}  $(sha256sum -- "${payload}/${file}" | cut -d' ' -f1)"
 	done
 	# The one member whose provenance a digest does not settle: reachy_pod was
@@ -872,12 +879,13 @@ compile
 built=$(bazel_files "$(union "$motord_target" "$host_target" "$ask_target" \
 	"$bench_target" "$exe_target" "$system_target" "$launcher_target" \
 	"$launch_config_target" "$harness_config_target" "$record_config_target" \
-	"$prelaunch_target")")
+	"$prelaunch_target" "$replay_target")")
 configs=$(bazel_files "$(union "${config_targets[@]}")")
 motord_out=$(bazel_named_in "$built" reachy_motord)
 host_out=$(bazel_named_in "$built" reachy_host)
 ask_out=$(bazel_named_in "$built" reachy_ask)
 bench_out=$(bazel_named_in "$built" reachy_bench)
+replay_out=$(bazel_named_in "$built" replay-pod__bin)
 exe_out=$(bazel_named_in "$built" robot_clk_exe)
 launcher_out=$(bazel_named_in "$built" simplelaunch)
 launch_config_out=$(bazel_named_in "$built" robotcpu.textproto)
@@ -991,6 +999,7 @@ verify_aarch64 "$host_out"
 verify_aarch64 "$pod_binary"
 verify_aarch64 "$ask_out"
 verify_aarch64 "$bench_out"
+verify_aarch64 "$replay_out"
 verify_aarch64 "$exe_out"
 verify_aarch64 "$launcher_out"
 verify_aarch64 "$onnx_out"

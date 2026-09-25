@@ -42,6 +42,9 @@ subject="${repo}/tools/assert-device-isa.sh"
 # The voice host, which the subject reads for its loader contract rather than
 # disassembling.
 : >"${repo}/bazel-out/bin/reachy_host"
+# The replay instrument, read for its loader contract the same way. The file is
+# named as the generated bin's output is.
+: >"${repo}/bazel-out/bin/replay-pod__bin"
 
 # The fetched shared object, at the path the stub's `info execution_root` and
 # `cquery` answers put it — outside the repo, which is the whole difference
@@ -91,6 +94,7 @@ cquery)
 	done
 	echo bazel-out/bin/reachy_motord
 	[ "${CQUERY_DROP:-}" = reachy_host ] || echo bazel-out/bin/reachy_host
+	[ "${CQUERY_DROP:-}" = replay-pod__bin ] || echo bazel-out/bin/replay-pod__bin
 	[ "${CQUERY_DROP:-}" = simplelaunch ] || echo bazel-out/bin/simplelaunch
 	[ "${CQUERY_DROP:-}" = robot_clk_exe ] || echo bazel-out/bin/robot_clk_exe
 	echo cogs/robot.clk
@@ -200,13 +204,29 @@ host_fixture() {
 	} >"${FIXTURES}/reachy_host"
 }
 
+# The replay instrument's dynamic section, in the same shape and with the same
+# default: the contract holding.
+replay_fixture() {
+	# shellcheck disable=SC2016 # `$ORIGIN` is the loader's syntax, written out
+	local runpath=${1-'$ORIGIN/../../_solib_local/onnxruntime:$ORIGIN'}
+	local needed=${2-libonnxruntime.so.1}
+	{
+		header replay-pod__bin
+		printf 'Dynamic Section:\n'
+		[ -z "$runpath" ] || printf '  RUNPATH      %s\n' "$runpath"
+		[ -z "$needed" ] || printf '  NEEDED       %s\n' "$needed"
+		printf '  NEEDED       libc.so.6\n'
+	} >"${FIXTURES}/replay-pod__bin"
+}
+
 # The green set: nothing but the guarded helpers in any of the three, and a
-# voice host whose loader contract holds.
+# voice host and replay instrument whose loader contracts hold.
 green() {
 	fixture simplelaunch
 	fixture robot_clk_exe
 	fixture libonnxruntime.so.1
 	host_fixture
+	replay_fixture
 }
 
 # ---------------------------------------------------------------------------
@@ -607,5 +627,72 @@ CQUERY_DROP=""
 assert_status "a host missing from the build is refused" 1 "$(status_of "$result")"
 assert_contains "naming what is missing" "$(output_of "$result")" \
 	"the build emits no reachy_host"
+
+# ---------------------------------------------------------------------------
+# The replay instrument's loader contract
+# ---------------------------------------------------------------------------
+#
+# `replay_pod` is a payload member linking the same host library, so it is held
+# to the host's contract whenever it names the shared object -- and whether it
+# does is the linker's answer, so naming none passes and says so.
+
+green
+result=$(run)
+assert_status "both loader contracts holding passes" 0 "$(status_of "$result")"
+assert_contains "the host's verdict" "$(output_of "$result")" \
+	"reachy_host: NEEDED libonnxruntime.so.1, runpath carries \$ORIGIN"
+assert_contains "and the replay instrument's" "$(output_of "$result")" \
+	"replay_pod: NEEDED libonnxruntime.so.1, runpath carries \$ORIGIN"
+
+green
+# shellcheck disable=SC2016 # the loader's syntax again
+replay_fixture '$ORIGIN' ''
+result=$(run)
+assert_status "a replay instrument naming no shared object passes" 0 \
+	"$(status_of "$result")"
+assert_contains "and says it stages none" "$(output_of "$result")" \
+	"replay_pod: no NEEDED libonnxruntime.so.1; it links no shared object the payload stages."
+
+green
+# shellcheck disable=SC2016 # the loader's syntax again
+replay_fixture '$ORIGIN/../../_solib_local/onnxruntime'
+result=$(run)
+assert_status "a replay instrument naming it without \$ORIGIN is refused" 1 \
+	"$(status_of "$result")"
+assert_contains "naming the binary" "$(output_of "$result")" \
+	"replay_pod has no \$ORIGIN"
+assert_contains "and what its runpath does say" "$(output_of "$result")" \
+	"_solib_local/onnxruntime"
+assert_contains "and where its flag lives" "$(output_of "$result")" \
+	"the speech-surface crate.annotation in MODULE.bazel"
+assert_lacks "not where the host's does" "$(output_of "$result")" \
+	"crates/reachy-host/BUILD.bazel"
+
+green
+replay_fixture ''
+result=$(run)
+assert_status "a replay instrument naming it with no runpath is refused" 1 \
+	"$(status_of "$result")"
+assert_contains "saying it has none" "$(output_of "$result")" "it reads 'nothing'"
+
+green
+{
+	header replay-pod__bin
+	printf 'Program Header:\n'
+} >"${FIXTURES}/replay-pod__bin"
+result=$(run)
+assert_status "a replay instrument with no dynamic section is refused" 1 \
+	"$(status_of "$result")"
+assert_contains "saying so" "$(output_of "$result")" \
+	"replay_pod has no dynamic section"
+
+green
+CQUERY_DROP=replay-pod__bin
+result=$(run)
+CQUERY_DROP=""
+assert_status "a replay instrument missing from the build is refused" 1 \
+	"$(status_of "$result")"
+assert_contains "naming what is missing" "$(output_of "$result")" \
+	"the build emits no replay-pod__bin"
 
 tally

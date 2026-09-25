@@ -85,8 +85,10 @@ unattended motion.
 
     make motion-release   # pack, publish, install now
 
-`motion-pack` packs the operator's build, speech configuration, pod link and
-all: the server admits only a unit presenting its provisioned certificate.
+`motion-pack` packs the operator's build, keys included: the server admits only
+a unit presenting its provisioned certificate. The unit unpacks it root-owned
+and, by the pack's modes, world-readable; `speech.toml` declares
+`secrets_posture = "payload"`.
 `motion-resync` makes the unit fetch the archive and restart
 `brenn-app.service`, which dances the idle playlist, `cogs/idle.json`, as
 `app` until stopped; a name absent from `cogs/library.names.json` keeps
@@ -113,7 +115,8 @@ The **assembly directory** (`REACHY_SPEECH_CONFIG`) is `speech.toml` plus the
 files it names, outside this tree, by the **payload-relative paths they will
 occupy**: `pod_psk_file = "secrets/pod-psk.toml"` is
 `<assembly>/secrets/pod-psk.toml`. Site values: loopback `listen_addr`;
-`[stt]`/`[tts]` URLs reachable *from the robot*, never `localhost`;
+`secrets_posture = "payload"`; `[stt]`/`[tts]` URLs reachable *from the robot*,
+never `localhost`;
 `[brenn.bridge]`'s `wss://` URL and `token_file`, absent for a bus-less
 pipeline; the build-staged `models/...` paths; `[wake] model`, your own head;
 `[wake] phrase` — a swap is both keys in both configurations plus the file;
@@ -142,8 +145,8 @@ drafts a clip, `--as-pose` a pose: `docs/pose-authoring.md`.
 ## Exit codes
 
 - **3**, **4** — `brenn-app.service`, `reachy-motiond.service` holds the bus.
-- **5** — no `provenance.txt` in the payload; push again.
-- **6** — the stamp could not be staged: a full or read-only store.
+- **5** — no `provenance.txt` in the payload.
+- **6** — the stamp could not be staged.
 - **7** — a step after the wipe failed; unfetched records are gone.
 - **8** — no launcher config for this run; push again.
 - **9** — no staged `host/speech.toml`.
@@ -153,8 +156,8 @@ drafts a clip, `--as-pose` a pose: `docs/pose-authoring.md`.
 - **14** — no staged `host/speech-record.toml`.
 - **15** — no staged `bench/reachy-bench.toml`.
 - **16** — `speech-record.toml` and `speech.toml` disagree on a shared key.
-- **17** — the boot fetch is still retrying; it installs the payload within 300 s.
-- **18** — `brenn-app-resync` failed; see its message.
+- **17** — the boot fetch is still retrying.
+- **18** — `brenn-app-resync` failed.
 - **19** — the unit's hostname is not `host_params`' `pod`.
 
 5–8, 13 and 17–19 are the remote chain's: a message and exit 1; past the

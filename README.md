@@ -72,8 +72,10 @@ in. So:
 - No async runtime on the control path. The bus is a blocking loop by design,
   because that is the shape every candidate host substrate wants at the wire,
   and the motion and control stack holds no runtime at all. The voice host
-  binary is the one exception and is quarantined off that path: it hosts tokio
-  for the network edges it owns, exactly as the driver hosts a serial port.
+  binary is the exception and is quarantined off that path: it hosts tokio for
+  the network edges it owns, exactly as the driver hosts a serial port; the
+  payload's replay instrument links the same host library and is off that path
+  too.
 
 ## Why it is written defensively
 

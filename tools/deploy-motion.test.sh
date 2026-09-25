@@ -181,6 +181,7 @@ export TOUR_TABLE_STATUS=0
 # that a command ran and that it did not.
 cat >"${stubs}/ssh" <<'STUB'
 #!/usr/bin/env bash
+[ -z "${SSH_REPLAY_STUB:-}" ] || exec "$SSH_REPLAY_STUB" "$@"
 printf 'ssh %s\n' "$*" >>"$CALLS"
 # A run's ssh is the one carrying a pty, and its status is the launcher's rather
 # than the probe's, so the two are separate knobs: a case can hold the bus for a
@@ -378,7 +379,10 @@ cat >"${stubs}/bazel" <<'STUB'
 printf 'bazel %s\n' "$*" >>"$CALLS"
 case " $* " in
 	*" cquery "*)
-		echo bazel-out/reachy_host
+		case " $* " in
+		*wav_import*) echo bazel-out/wav-import__bin ;;
+		*) echo bazel-out/reachy_host ;;
+		esac
 		exit 0
 		;;
 	*" build "*) exit "${BAZEL_BUILD_STATUS:-0}" ;;
@@ -3289,6 +3293,521 @@ assert_contains "Makefile exports the payload directory knob" \
 	"$(cat -- "$makefile")" "export REACHY_PAYLOAD_DIR"
 assert_contains "Makefile exports the payload URL knob" \
 	"$(cat -- "$makefile")" "export REACHY_PAYLOAD_URL"
+
+# ---------------------------------------------------------------------------
+# The replay harness
+# ---------------------------------------------------------------------------
+#
+# `--replay` plays a wav into the unit's running host as its pod. What is pinned
+# here: every refusal before the unit is written to, by message and by what did
+# not reach it; the key that reaches the unit is the table's row for the host's
+# pod and appears on no command line; the exact remote commands; the settle wait
+# and the slice, run for real over a fixture log; and the cleanup on every exit
+# after the key was written.
+#
+# The replay's ssh is its own stub, dispatched on the remote command. The
+# preflight runs for real over a fixture payload built from the environment,
+# with a `systemctl` that answers as told, so the subject's own questions and
+# their codes are what is tested. The three commands that read the host's log
+# do so as the payload's account, through `setpriv`; they are run here over a
+# fixture file with a `setpriv` that runs its command unchanged and a `sleep`
+# that returns at once, so the subject's own `stat`, settle wait and `tail` are
+# what is tested.
+
+replay_stub="${stubs}/replay-ssh"
+cat >"$replay_stub" <<'STUB'
+#!/usr/bin/env bash
+printf 'ssh %s\n' "$*" >>"$CALLS"
+cmd=${*: -1}
+if [ -n "${REPLAY_SSH_FAIL:-}" ] && [[ $cmd == *"$REPLAY_SSH_FAIL"* ]]; then
+	exit 255
+fi
+case $cmd in
+*"systemctl is-active --quiet brenn-app.service"*)
+	rm -rf -- "$REPLAY_CURRENT"
+	mkdir -p -- "${REPLAY_CURRENT}/host" "${REPLAY_CURRENT}/conf"
+	printf 'pod: "%s"\n' "${REPLAY_POD:-unit}" >"${REPLAY_CURRENT}/host/host_params.textproto"
+	[ -z "${REPLAY_PARAMS_ABSENT:-}" ] || rm -f -- "${REPLAY_CURRENT}/host/host_params.textproto"
+	[ "${REPLAY_MEMBER_STATUS:-0}" != 0 ] || install -m 0755 /dev/null "${REPLAY_CURRENT}/replay_pod"
+	[ -z "${REPLAY_LINK-x}" ] || printf '%s\nPSK=link-psk-must-not-travel\n' "${REPLAY_LINK-ADDR=127.0.0.1:7380}" >"${REPLAY_CURRENT}/conf/audio.conf"
+	cmd=${cmd//"/run/brenn-app/current"/"$REPLAY_CURRENT"}
+	PATH="${REPLAY_FAST}:$PATH" bash -c "$cmd"
+	exit
+	;;
+"rm -rf /run/brenn-replay") exit 0 ;;
+*"cat >"*)
+	path=${cmd##*>}
+	name=$(basename -- "$path")
+	if [ "$name" = "${REPLAY_WRITE_FAIL:-}" ]; then cat >/dev/null; exit 1; fi
+	cat >"${REPLAY_SENT}/${name}"
+	exit 0
+	;;
+*"pkill -x reachy_pod"*) exit "${REPLAY_POD_STOP_STATUS:-0}" ;;
+"/run/brenn-app/current/replay_pod "*)
+	[ -z "${REPLAY_HOST_LINES:-}" ] || printf '%s\n' "$REPLAY_HOST_LINES" >>"$REPLAY_HOST_LOG"
+	echo '{"event":"replay_complete","playback_rx":{"audio":3}}'
+	exit "${REPLAY_STATUS:-0}"
+	;;
+*voice_host_0.log*)
+	if [ -n "${REPLAY_SLICE_FAIL:-}" ] && [[ $cmd == "setpriv "*" tail -c +"* ]]; then exit 255; fi
+	log=/run/brenn-app/scratch/logs/launch/voice_host_0.log
+	cmd=${cmd//"$log"/"$REPLAY_HOST_LOG"}
+	PATH="${REPLAY_FAST}:$PATH" bash -c "$cmd"
+	exit
+	;;
+esac
+echo "unstubbed replay ssh: ${cmd}" >&2
+exit 99
+STUB
+chmod 0755 -- "$replay_stub"
+
+# A `sleep` that returns at once, for the commands run over the fixture log, a
+# `setpriv` that drops its options and runs the rest as the caller, for the log
+# reads made as the payload's account, and a `systemctl` that answers the
+# preflight's service question as told.
+export REPLAY_FAST="${work}/replay-fast"
+mkdir -p -- "$REPLAY_FAST"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${REPLAY_FAST}/sleep"
+cat >"${REPLAY_FAST}/setpriv" <<'STUB'
+#!/usr/bin/env bash
+while [ $# -gt 0 ]; do case $1 in --reuid|--regid) shift 2 ;; --*) shift ;; *) break ;; esac; done
+exec "$@"
+STUB
+# shellcheck disable=SC2016 # expanded by the stub, not here
+printf '#!/usr/bin/env bash\nexit "${REPLAY_SERVICE_STATUS:-0}"\n' >"${REPLAY_FAST}/systemctl"
+chmod 0755 -- "${REPLAY_FAST}/sleep" "${REPLAY_FAST}/setpriv" "${REPLAY_FAST}/systemctl"
+
+# The importer the subject builds and runs, at the path the bazel stub's cquery
+# answers for it.
+mkdir -p -- "${repo}/bazel-out"
+cat >"${repo}/bazel-out/wav-import__bin" <<'STUB'
+#!/usr/bin/env bash
+printf 'wav_import %s\n' "$*" >>"$CALLS"
+if [ "${WAV_IMPORT_STATUS:-0}" != 0 ]; then
+	echo '{"event":"import_error","detail":"not 16 kHz mono S16"}'
+	exit "$WAV_IMPORT_STATUS"
+fi
+out="" pod=""
+while [ $# -gt 0 ]; do
+	case $1 in
+	--output) out=$2; shift 2 ;;
+	--pod-id) pod=$2; shift 2 ;;
+	*) shift ;;
+	esac
+done
+printf 'frames-for-%s' "$pod" >"$out"
+echo '{"event":"wav_imported"}'
+STUB
+chmod 0755 -- "${repo}/bazel-out/wav-import__bin"
+
+# The assembly directory: a speech configuration naming its key table, and the
+# table holding a row for the unit's pod and one for another.
+replay_assembly="${work}/replay-assembly"
+mkdir -p -- "${replay_assembly}/secrets"
+hex_a=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+hex_b=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+printf 'pod_psk_file = "secrets/pod-psk.toml"\n' >"${replay_assembly}/speech.toml"
+printf '"unit" = "%s"\n"other" = "%s"\n' "$hex_a" "$hex_b" \
+	>"${replay_assembly}/secrets/pod-psk.toml"
+replay_wav="${work}/utterance.wav"
+printf 'RIFF not really' >"$replay_wav"
+
+saved_speech_config=${REACHY_SPEECH_CONFIG-unset}
+export REACHY_SPEECH_CONFIG="${replay_assembly}/speech.toml"
+export SSH_REPLAY_STUB="$replay_stub"
+export REPLAY_SENT="${work}/replay-sent"
+export REPLAY_HOST_LOG="${work}/replay-host.log"
+export REPLAY_HOST_LINES=""
+export REPLAY_CURRENT="${work}/replay-current"
+replay_records="${work}/replay-records"
+replay_cleanup_ssh="ssh -o BatchMode=yes root@unit rm -rf /run/brenn-replay"
+
+# Each case starts from a unit whose host log already carries an unresolved
+# suspension *before* the offset, so a subject that did not slice would be
+# refused by the empty-slice case.
+replay_case() {
+	rm -rf -- "$REPLAY_SENT" "$replay_records" "${repo}/.local/speech-logs"
+	mkdir -p -- "$REPLAY_SENT"
+	printf '%s\n' '{"kind":"idle_suspended","pre":1}' >"$REPLAY_HOST_LOG"
+}
+replay_suspended='{"kind":"idle_suspended","at":2}'
+replay_resumed='{"kind":"idle_resumed","at":3}'
+
+# Argument shape: every malformed invocation is the usage or a refusal of its
+# own, and none reaches the unit.
+replay_case
+result=$(deploy unit --replay)
+assert_status "a replay with no wav refuses" 1 "$(status_of "$result")"
+assert_contains "with the usage" "$(output_of "$result")" "usage:"
+assert_contains "which names the replay's grammar" "$(output_of "$result")" \
+	"--replay <wav> <records-dir> [--linger-ms N] [--settle-ms N]"
+assert_lacks "and reaches no unit" "$(calls)" "ssh "
+result=$(deploy unit --replay "$replay_wav")
+assert_status "a replay with no records directory refuses" 1 "$(status_of "$result")"
+assert_contains "with the usage" "$(output_of "$result")" "usage:"
+assert_lacks "and reaches no unit" "$(calls)" "ssh "
+result=$(deploy unit --replay "$replay_wav" --linger-ms 1000)
+assert_status "an option where the records directory belongs refuses" 1 "$(status_of "$result")"
+assert_contains "with the usage" "$(output_of "$result")" "usage:"
+assert_lacks "and reaches no unit" "$(calls)" "ssh "
+result=$(deploy unit --replay "$replay_wav" "$replay_records" --linger-ms x)
+assert_status "a linger that is not a number refuses" 1 "$(status_of "$result")"
+assert_contains "saying so" "$(output_of "$result")" \
+	"--linger-ms is 'x', which is not a positive whole number of milliseconds."
+assert_lacks "and reaches no unit" "$(calls)" "ssh "
+result=$(deploy unit --replay "$replay_wav" "$replay_records" --settle-ms 100)
+assert_status "a settle shorter than one poll refuses" 1 "$(status_of "$result")"
+assert_contains "saying so" "$(output_of "$result")" "so it must be at least 500"
+assert_lacks "and reaches no unit" "$(calls)" "ssh "
+result=$(deploy unit --replay "$replay_wav" "$replay_records" extra)
+assert_status "an extra positional refuses" 1 "$(status_of "$result")"
+assert_contains "with the usage" "$(output_of "$result")" "usage:"
+assert_lacks "and reaches no unit" "$(calls)" "ssh "
+result=$(deploy unit --replay "$replay_wav" "$replay_records" --linger-ms 1000 --linger-ms 2000)
+assert_status "a repeated option refuses" 1 "$(status_of "$result")"
+assert_contains "with the usage" "$(output_of "$result")" "usage:"
+result=$(deploy unit --replay "$replay_wav" "$replay_records" --settle-ms)
+assert_status "an option missing its value refuses" 1 "$(status_of "$result")"
+assert_contains "with the usage" "$(output_of "$result")" "usage:"
+assert_lacks "and reaches no unit" "$(calls)" "ssh "
+
+replay_case
+result=$(deploy unit --replay "${work}/no-such.wav" "$replay_records")
+assert_status "a missing wav refuses" 1 "$(status_of "$result")"
+assert_contains "saying there is nothing to replay" "$(output_of "$result")" \
+	"there is no readable wav at ${work}/no-such.wav"
+assert_lacks "and reaches no unit" "$(calls)" "ssh "
+
+replay_case
+result=$(REACHY_SPEECH_CONFIG=none deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "no speech configuration refuses" 1 "$(status_of "$result")"
+assert_contains "saying there is no key table" "$(output_of "$result")" \
+	"there is no speech configuration at (none)"
+assert_lacks "and reaches no unit" "$(calls)" "ssh "
+
+replay_case
+printf 'secrets_posture = "payload"\n' >"${work}/replay-no-psk.toml"
+result=$(REACHY_SPEECH_CONFIG="${work}/replay-no-psk.toml" deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a configuration naming no key table refuses" 1 "$(status_of "$result")"
+assert_contains "saying so" "$(output_of "$result")" "names no pod_psk_file"
+assert_lacks "and reaches no unit" "$(calls)" "ssh "
+mkdir -p -- "${work}/replay-no-table"
+printf 'pod_psk_file = "secrets/pod-psk.toml"\n' >"${work}/replay-no-table/speech.toml"
+result=$(REACHY_SPEECH_CONFIG="${work}/replay-no-table/speech.toml" deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a key table that is not there refuses" 1 "$(status_of "$result")"
+assert_contains "naming where it was looked for" "$(output_of "$result")" \
+	"there is no file at ${work}/replay-no-table/secrets/pod-psk.toml"
+assert_lacks "and reaches no unit" "$(calls)" "ssh "
+
+replay_case
+mkdir -p -- "${work}/replay-bad-key/secrets"
+printf 'pod_psk_file = "secrets/pod-psk.toml"\n' >"${work}/replay-bad-key/speech.toml"
+printf '"unit" = "%s"\n' "${hex_a:0:63}" >"${work}/replay-bad-key/secrets/pod-psk.toml"
+result=$(REACHY_SPEECH_CONFIG="${work}/replay-bad-key/speech.toml" deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a key row that is not 64 hex characters refuses" 1 "$(status_of "$result")"
+assert_contains "saying so" "$(output_of "$result")" "is not a 64-character hex key"
+assert_lacks "and writes nothing to the unit" "$(calls)" "cat >"
+assert_lacks "and stops no pod" "$(calls)" "pkill -x reachy_pod"
+assert_lacks "and imports nothing" "$(calls)" "wav_import"
+
+replay_case
+result=$(REPLAY_SERVICE_STATUS=3 deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "an inactive service refuses" 1 "$(status_of "$result")"
+assert_contains "saying there is no host to replay into" "$(output_of "$result")" \
+	"brenn-app.service is not active on unit"
+assert_lacks "and writes nothing to the unit" "$(calls)" "cat >"
+assert_lacks "and stops no pod" "$(calls)" "pkill"
+
+replay_case
+result=$(REPLAY_MEMBER_STATUS=1 deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a payload without the instrument refuses" 1 "$(status_of "$result")"
+assert_contains "saying to release one" "$(output_of "$result")" \
+	"carries no replay_pod; release one that does"
+assert_lacks "and writes nothing to the unit" "$(calls)" "cat >"
+
+replay_case
+result=$(REPLAY_PARAMS_ABSENT=1 deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a payload without the host configuration refuses" 1 "$(status_of "$result")"
+assert_contains "saying the pod is unknown" "$(output_of "$result")" \
+	"cannot read /run/brenn-app/current/host/host_params.textproto on unit"
+assert_lacks "and writes nothing to the unit" "$(calls)" "cat >"
+
+replay_case
+result=$(REPLAY_LINK='' deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a payload without a link configuration refuses" 1 "$(status_of "$result")"
+assert_contains "saying there is no link to replay into" "$(output_of "$result")" \
+	"carries no conf/audio.conf naming the pod's link address"
+assert_lacks "and writes nothing to the unit" "$(calls)" "cat >"
+assert_lacks "and imports nothing" "$(calls)" "wav_import"
+
+replay_case
+result=$(REPLAY_LINK='ADDR=127.0.0.1:7380;reboot' deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a link address that is not a host:port refuses" 1 "$(status_of "$result")"
+assert_contains "saying so" "$(output_of "$result")" "which is not a host:port"
+assert_lacks "and writes nothing to the unit" "$(calls)" "cat >"
+assert_lacks "and replays nothing" "$(calls)" "root@unit /run/brenn-app/current/replay_pod "
+
+replay_case
+result=$(REPLAY_POD=stranger deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a pod the table has no row for refuses" 1 "$(status_of "$result")"
+assert_contains "naming the table and the pod" "$(output_of "$result")" \
+	"${replay_assembly}/secrets/pod-psk.toml has no row for stranger"
+assert_lacks "and writes nothing to the unit" "$(calls)" "cat >"
+assert_lacks "so there is nothing to clean up there" "$(calls)" \
+	"rm -rf /run/brenn-replay"
+assert_lacks "and the key question precedes the import" "$(calls)" "wav_import"
+
+replay_case
+result=$(REPLAY_SSH_FAIL=systemctl deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "ssh failing refuses" 1 "$(status_of "$result")"
+assert_contains "as ssh's failure, not the question's answer" "$(output_of "$result")" \
+	"ssh to root@unit failed"
+
+replay_case
+result=$(WAV_IMPORT_STATUS=1 deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a wav the importer refuses refuses" 1 "$(status_of "$result")"
+assert_contains "with the importer's own line" "$(output_of "$result")" "import_error"
+assert_lacks "and writes nothing to the unit" "$(calls)" "cat >"
+
+replay_case
+result=$(BAZEL_BUILD_STATUS=1 deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "an importer that does not build refuses" 1 "$(status_of "$result")"
+assert_contains "saying so" "$(output_of "$result")" "wav_import did not build"
+assert_lacks "and writes nothing to the unit" "$(calls)" "cat >"
+assert_lacks "and runs no stale importer" "$(calls)" "wav_import --input"
+
+for replay_write in "psk.hex|key" "utterance.framelog|frame log"; do
+	replay_case
+	result=$(REPLAY_WRITE_FAIL=${replay_write%%|*} deploy unit --replay "$replay_wav" "$replay_records")
+	assert_status "a failed write of the ${replay_write#*|} refuses" 1 "$(status_of "$result")"
+	assert_contains "saying so" "$(output_of "$result")" \
+		"writing the replay's ${replay_write#*|} into /run/brenn-replay on unit failed"
+	assert_lacks "and stops no pod" "$(calls)" "pkill -x reachy_pod"
+	assert_eq "and the cleanup ran" "$replay_cleanup_ssh" "$(grep '^ssh ' -- "$CALLS" | tail -n 1)"
+done
+
+# The happy path: a turn that suspended the idle loop and resumed it.
+replay_case
+result=$(REPLAY_HOST_LINES="${replay_suspended}"$'\n'"${replay_resumed}" \
+	deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a replay whose host resumed succeeds" 0 "$(status_of "$result")"
+assert_contains "it builds the importer in the default configuration" "$(calls)" \
+	"bazel build -- //bazel/platform:wav_import"
+assert_contains "and imports the wav by its absolute path" "$(calls)" \
+	"wav_import --input ${replay_wav} --output "
+assert_contains "as the host's pod, from a fixed epoch" "$(calls)" \
+	"--pod-id unit --base-epoch-us 0"
+assert_eq "the key sent is the table's row for that pod" "$hex_a" \
+	"$(cat -- "${REPLAY_SENT}/psk.hex")"
+assert_lacks "and not another row" "$(cat -- "${REPLAY_SENT}/psk.hex")" "$hex_b"
+assert_lacks "the key is on no command line" "$(calls)" "$hex_a"
+assert_lacks "and in no output" "$(output_of "$result")" "$hex_a"
+assert_eq "the frame log sent is the import's" "frames-for-unit" \
+	"$(cat -- "${REPLAY_SENT}/utterance.framelog")"
+assert_contains "the key is written into a fresh owner-only directory" "$(calls)" \
+	"ssh -o BatchMode=yes root@unit rm -rf /run/brenn-replay && umask 077 && mkdir -p /run/brenn-replay && cat >/run/brenn-replay/psk.hex"
+# shellcheck disable=SC2016 # the remote shell's syntax, pinned verbatim
+replay_stop_cmd='pkill -x reachy_pod; n=0; until curl -sS -m 2 http://127.0.0.1:8080/ | tr -d '"' \n'"' | grep -o '"'{[^{}]*\"name\":\"pod\"[^{}]*}'"' | grep -Eq '"'\"state\":\"PROCESS_STATE_(EXITED|CRASHED)\"'"'; do [ "$n" -ge 10 ] && exit 1; n=$((n+1)); sleep 0.5; done'
+assert_contains "the pod is stopped and the launcher polled for it" "$(calls)" \
+	"ssh -o BatchMode=yes root@unit ${replay_stop_cmd}"
+replay_cmd="/run/brenn-app/current/replay_pod --connect 127.0.0.1:7380 --pod-id unit --psk-file /run/brenn-replay/psk.hex --pace realtime --linger-until-eoa --linger-timeout-ms 30000 --linger-playout-ms 2000 /run/brenn-replay/utterance.framelog"
+assert_contains "the replay is the instrument's own command" "$(calls)" \
+	"ssh -o BatchMode=yes root@unit ${replay_cmd}"
+assert_contains "the log's size is read as the payload's account" "$(calls)" \
+	"root@unit setpriv --reuid app --regid app --clear-groups stat -c %s /run/brenn-app/scratch/logs/launch/voice_host_0.log"
+assert_contains "the settle reads it as that account" "$(calls)" \
+	"until setpriv --reuid app --regid app --clear-groups tail -c +"
+assert_contains "and the slice" "$(calls)" \
+	"root@unit setpriv --reuid app --regid app --clear-groups tail -c +"
+assert_lacks "and root reads none of it" "$(calls)" "root@unit stat -c"
+assert_lacks "and root reads none of it" "$(calls)" "root@unit tail -c"
+pkill_at=$(grep -n 'pkill -x reachy_pod' -- "$CALLS" | head -n 1 | cut -d: -f1)
+stat_at=$(grep -n 'stat -c %s' -- "$CALLS" | head -n 1 | cut -d: -f1)
+replay_at=$(grep -n 'root@unit /run/brenn-app/current/replay_pod ' -- "$CALLS" | head -n 1 | cut -d: -f1)
+if [ -n "$pkill_at" ] && [ -n "$stat_at" ] && [ -n "$replay_at" ] &&
+	[ "$pkill_at" -lt "$replay_at" ] && [ "$stat_at" -lt "$replay_at" ]; then
+	pass "the pod is stopped and the offset taken before the replay"
+else
+	fail "the pod is stopped and the offset taken before the replay" "$(calls)"
+fi
+replay_host_files=$(find "$replay_records" -name 'replay-*.host.jsonl')
+assert_eq "one host slice is brought home" 1 "$(grep -c . <<<"$replay_host_files")"
+assert_contains "holding the replay's lines" "$(cat -- "$replay_host_files")" \
+	"$replay_resumed"
+assert_lacks "and not the lines before it" "$(cat -- "$replay_host_files")" '"pre":1'
+replay_own_files=$(find "$replay_records" -name 'replay-*.jsonl' ! -name '*.host.jsonl')
+assert_eq "one replay_pod record is brought home" 1 "$(grep -c . <<<"$replay_own_files")"
+assert_contains "holding its own lines" "$(cat -- "$replay_own_files")" "replay_complete"
+assert_no_file "and nothing lands in the tree's default" "${repo}/.local/speech-logs"
+assert_lacks "the link's key never leaves the unit" \
+	"$(output_of "$result")$(calls)$(cat -- "$replay_records"/*)" "link-psk-must-not-travel"
+replay_first_ssh=$(grep '^ssh ' -- "$CALLS" | head -n 1)
+assert_contains "the unit is asked its preconditions in one ssh" "$replay_first_ssh" \
+	"test -x /run/brenn-app/current/replay_pod"
+assert_contains "which reads the host configuration" "$replay_first_ssh" \
+	"cat /run/brenn-app/current/host/host_params.textproto"
+assert_contains "and the link configuration" "$replay_first_ssh" \
+	"/run/brenn-app/current/conf/audio.conf"
+assert_contains "and the next is the key's write" "$(grep '^ssh ' -- "$CALLS" | sed -n 2p)" \
+	"cat >/run/brenn-replay/psk.hex"
+assert_contains "the stop is said before it happens" "$(output_of "$result")" \
+	"stopping the audio device on unit: the host keeps one connection per pod id and the last Hello wins"
+assert_contains "the replay's record is named" "$(output_of "$result")" \
+	"replay_pod  ${replay_own_files}"
+assert_contains "and the host's" "$(output_of "$result")" "host        ${replay_host_files}"
+assert_contains "the closing lines say how to read the records" "$(output_of "$result")" \
+	"    ssh root@unit systemctl stop brenn-app.service"
+assert_contains "then fetch them" "$(output_of "$result")" "    make speech-fetch"
+assert_lacks "and names no restart" "$(output_of "$result")" "systemctl restart"
+assert_contains "it warns that the fetch comes first" "$(output_of "$result")" \
+	"  (run empties scratch/logs: fetch first, whenever the service is next"
+assert_contains "and names the start that follows" "$(output_of "$result")" \
+	"   started — ssh root@unit systemctl start brenn-app.service)"
+assert_eq "the last thing done on the unit is the cleanup" \
+	"$replay_cleanup_ssh" \
+	"$(grep '^ssh ' -- "$CALLS" | tail -n 1)"
+
+replay_case
+result=$(REPLAY_HOST_LINES="${replay_suspended}"$'\n'"${replay_resumed}" \
+	deploy unit --replay "$replay_wav" "$replay_records" --linger-ms 12000 --settle-ms 1000)
+assert_status "a replay with both options succeeds" 0 "$(status_of "$result")"
+assert_contains "the linger reaches the instrument" "$(calls)" "--linger-timeout-ms 12000"
+# shellcheck disable=SC2016 # the remote shell's syntax, pinned verbatim
+assert_contains "the settle bounds the wait" "$(calls)" '[ "$n" -ge 2 ] && exit 1'
+
+replay_case
+result=$(REPLAY_HOST_LINES="$replay_suspended" deploy unit --replay "$replay_wav" "$replay_records" --settle-ms 500)
+assert_status "a host still suspended refuses" 1 "$(status_of "$result")"
+assert_contains "saying how long it was given" "$(output_of "$result")" \
+	"the host is still suspended 2 s after the replay ended"
+assert_eq "its slice is still brought home" 1 \
+	"$(find "$replay_records" -name 'replay-*.host.jsonl' | wc -l)"
+assert_contains "and the closing lines still printed" "$(output_of "$result")" \
+	"    make speech-fetch"
+assert_eq "and the cleanup ran" \
+	"$replay_cleanup_ssh" \
+	"$(grep '^ssh ' -- "$CALLS" | tail -n 1)"
+
+replay_case
+result=$(REPLAY_HOST_LINES="${replay_suspended}"$'\n'"${replay_resumed}"$'\n''{"kind":"idle_suspended","at":4}' \
+	deploy unit --replay "$replay_wav" "$replay_records" --settle-ms 500)
+assert_status "a host suspended again after resuming refuses" 1 "$(status_of "$result")"
+assert_contains "saying how long it was given" "$(output_of "$result")" \
+	"the host is still suspended 2 s after the replay ended"
+
+# ssh failing after the unit was written: each is ssh's failure, named, not its
+# 255 passed through, and the key is still removed.
+replay_log=/run/brenn-app/scratch/logs/launch/voice_host_0.log
+for replay_fail in \
+	"REPLAY_SSH_FAIL=replay_pod --connect|ssh to root@unit failed; the replay's outcome is unknown." \
+	"REPLAY_SSH_FAIL=sleep 2; n=0|ssh to root@unit failed; the host's lines were not read." \
+	"REPLAY_SSH_FAIL=stat -c %s|cannot read the size of ${replay_log} on unit" \
+	"REPLAY_SLICE_FAIL=1|bringing the host's lines home from unit failed; the log is still there: ${replay_log}"; do
+	replay_case
+	result=$(export "${replay_fail%%|*}" &&
+		REPLAY_HOST_LINES="${replay_suspended}"$'\n'"${replay_resumed}" \
+			deploy unit --replay "$replay_wav" "$replay_records")
+	assert_status "${replay_fail%%|*} refuses" 1 "$(status_of "$result")"
+	assert_contains "saying so" "$(output_of "$result")" "${replay_fail#*|}"
+	assert_eq "and the cleanup ran" "$replay_cleanup_ssh" "$(grep '^ssh ' -- "$CALLS" | tail -n 1)"
+	case $replay_fail in
+	*"replay_pod --connect"*)
+		assert_eq "and the replay's own record survives" 1 \
+			"$(find "$replay_records" -name 'replay-*.jsonl' ! -name '*.host.jsonl' | wc -l)"
+		;;
+	*"stat -c %s"*)
+		assert_lacks "and nothing is replayed" "$(calls)" "root@unit /run/brenn-app/current/replay_pod "
+		;;
+	esac
+done
+
+replay_case
+result=$(REPLAY_LINK='ADDR=127.0.0.1:7391' REPLAY_HOST_LINES="${replay_suspended}"$'\n'"${replay_resumed}" \
+	deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a replay into another link address succeeds" 0 "$(status_of "$result")"
+assert_contains "dialling the address the unit's pod dials" "$(calls)" \
+	"root@unit /run/brenn-app/current/replay_pod --connect 127.0.0.1:7391 "
+
+replay_case
+result=$( cd -- "$work" && REPLAY_HOST_LINES="${replay_suspended}"$'\n'"${replay_resumed}" deploy unit --replay "$replay_wav" replay-rel )
+assert_status "a relative records directory succeeds" 0 "$(status_of "$result")"
+assert_eq "and the host slice lands under it" 1 \
+	"$(find "${work}/replay-rel" -name 'replay-*.host.jsonl' | wc -l)"
+rm -rf -- "${work}/replay-rel"
+
+replay_case
+result=$(REPLAY_HOST_LINES="" deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a wav that never woke the host passes at once" 0 "$(status_of "$result")"
+
+replay_case
+result=$(REPLAY_POD_STOP_STATUS=1 deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "a pod the launcher does not show gone refuses" 1 "$(status_of "$result")"
+assert_contains "saying what the launcher did not show" "$(output_of "$result")" \
+	"does not show pod PROCESS_STATE_EXITED or PROCESS_STATE_CRASHED 5 s after pkill"
+assert_lacks "and nothing is replayed" "$(calls)" "root@unit /run/brenn-app/current/replay_pod "
+assert_eq "and the key is removed" \
+	"$replay_cleanup_ssh" \
+	"$(grep '^ssh ' -- "$CALLS" | tail -n 1)"
+
+# Runs the pinned remote string against stubs — a `pkill` that matched nothing,
+# a `curl` returning a launcher list captured from a unit, a `sleep` that
+# records its calls — once per state the launcher reports for a gone pod, and
+# once per state a still-live pod shows, which is refused after the bounded
+# wait.
+replay_launcher="${work}/replay-launcher"
+mkdir -p -- "$replay_launcher"
+printf '#!/usr/bin/env bash\nexit 1\n' >"${replay_launcher}/pkill"
+cat >"${replay_launcher}/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$REPLAY_LAUNCHER_LIST"
+exit 0
+STUB
+cat >"${replay_launcher}/sleep" <<STUB
+#!/usr/bin/env bash
+echo "sleep \$*" >>'${work}/replay-launcher-sleeps'
+exit 0
+STUB
+chmod 0755 -- "${replay_launcher}/pkill" "${replay_launcher}/curl" "${replay_launcher}/sleep"
+replay_launcher_list='{"processInfo":[{"name":"voice_host","pid":4085,"state":"PROCESS_STATE_RUNNING"},{"name":"motord","pid":4086,"state":"PROCESS_STATE_RUNNING"},{"name":"pod","pid":4087,"state":"PROCESS_STATE_@STATE@"},{"name":"logger_proc","pid":4088,"state":"PROCESS_STATE_RUNNING"},{"name":"proc","pid":4089,"state":"PROCESS_STATE_RUNNING"}],"preLaunchInfo":[{"name":"clockwork_prelaunch","succeeded":true},{"name":"pod_reboot_chip","succeeded":true}]}'
+for state in CRASHED EXITED; do
+	rm -f -- "${work}/replay-launcher-sleeps"
+	rc=0
+	REPLAY_LAUNCHER_LIST=${replay_launcher_list//@STATE@/$state} \
+		PATH="${replay_launcher}:$PATH" bash -c "$replay_stop_cmd" || rc=$?
+	assert_status "a pod the launcher shows ${state} has stopped" 0 "$rc"
+	assert_no_file "on the first poll, with no wait" "${work}/replay-launcher-sleeps"
+done
+for state in RUNNING NOT_RUNNING; do
+	rm -f -- "${work}/replay-launcher-sleeps"
+	rc=0
+	REPLAY_LAUNCHER_LIST=${replay_launcher_list//@STATE@/$state} \
+		PATH="${replay_launcher}:$PATH" bash -c "$replay_stop_cmd" || rc=$?
+	assert_status "a pod the launcher shows ${state} is refused" 1 "$rc"
+	assert_eq "after ten half-second waits" 10 "$(grep -c '^sleep 0.5$' -- "${work}/replay-launcher-sleeps")"
+done
+list=${replay_launcher_list//@STATE@/RUNNING}
+list=${list/'"name":"voice_host","pid":4085,"state":"PROCESS_STATE_RUNNING"'/'"name":"voice_host","pid":4085,"state":"PROCESS_STATE_CRASHED"'}
+rm -f -- "${work}/replay-launcher-sleeps"
+rc=0
+REPLAY_LAUNCHER_LIST=$list PATH="${replay_launcher}:$PATH" bash -c "$replay_stop_cmd" || rc=$?
+assert_status "another app's CRASHED does not pass for the pod's" 1 "$rc"
+
+replay_case
+result=$(REPLAY_HOST_LINES="${replay_suspended}"$'\n'"${replay_resumed}" REPLAY_STATUS=4 \
+	deploy unit --replay "$replay_wav" "$replay_records")
+assert_status "the instrument's status is the replay's" 4 "$(status_of "$result")"
+assert_eq "its host slice is still brought home" 1 \
+	"$(find "$replay_records" -name 'replay-*.host.jsonl' | wc -l)"
+assert_contains "and the status is named as not the evidence" "$(output_of "$result")" \
+	"replay_pod exited 4"
+
+unset SSH_REPLAY_STUB
+if [ "$saved_speech_config" = unset ]; then
+	unset REACHY_SPEECH_CONFIG
+else
+	export REACHY_SPEECH_CONFIG="$saved_speech_config"
+fi
+rm -rf -- "${repo}/.local/speech-logs"
 
 # ---------------------------------------------------------------------------
 # The two doors: publish and resync

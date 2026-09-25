@@ -60,6 +60,12 @@ allowed_label() {
 	# gate exists to catch, so they are named and the package is not.
 	//bazel/platform:device_deployables) return 0 ;;
 	//bazel/platform:motion_payload) return 0 ;;
+	# brenn-pod's replay instrument, reaching tokio through the host library
+	# it is a bin of. A payload member that nothing on the unit starts except
+	# `deploy-motion.sh --replay`, and never on the control path.
+	//bazel/platform:replay_pod) return 0 ;;
+	# The replay harness's workstation half; in no payload.
+	//bazel/platform:wav_import) return 0 ;;
 	# The run report: an offline operator analyzer that shares the host
 	# library's reader types. It runs on a workstation over a fetched run and
 	# on no unit.
@@ -206,6 +212,8 @@ if [ -z "${TOKIO_QUARANTINE_FIXTURE:-}" ]; then
 		cat <<-'LABELS'
 			//bazel/platform:device_deployables
 			//bazel/platform:motion_payload
+			//bazel/platform:replay_pod
+			//bazel/platform:wav_import
 			//cogs:idle_run_report
 			//cogs:idle_run_report_test
 			//cogs:pose_session_report

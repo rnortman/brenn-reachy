@@ -15,6 +15,7 @@
 #   tools/deploy-motion.sh <host> --record <dir>
 #   tools/deploy-motion.sh <host> --record-preflight
 #   tools/deploy-motion.sh <host> --record-fetch <dir>
+#   tools/deploy-motion.sh <host> --replay <wav> <records-dir> [--linger-ms N] [--settle-ms N]
 #
 #   tools/deploy-motion.sh --publish
 #
@@ -111,6 +112,22 @@
 #   --record-fetch  bring a recording session's records back under the
 #                `record-log-` name, for the session whose terminal died or
 #                whose document is wanted a second time.
+#   --replay     play one 16 kHz mono wav into the running host on the unit as
+#                if the pod had heard it, through the same wake gate and
+#                pipeline as live audio. Stops the unit's audio device for the
+#                replay and leaves it stopped: the host keeps one connection per
+#                pod id and the last Hello wins, and the pod reconnects at once,
+#                so a running pod would take the link back mid-replay. Brings
+#                `replay_pod`'s own lines and the host's lines for the replay
+#                home under `<records-dir>/replay-<stamp>…`, then waits
+#                until the host has resumed its idle loop so a second replay
+#                can follow. Exits with `replay_pod`'s status, or 1 when the
+#                host is still suspended after `--settle-ms`. Needs the
+#                assembly directory the payload was built from, for the pod's
+#                key. `--linger-ms` (default 30000) is how long `replay_pod`
+#                waits for the reply's end of audio, and then holds the link
+#                2 s more while the reply plays out; `--settle-ms` (default
+#                30000) how long the host is given to resume.
 #   --publish    copy the packed archive (make motion-pack) to the payload
 #                server under its one stable name, motion.tar.zst, and print
 #                the URL, size and sha256. Takes no host: the server is named
@@ -388,6 +405,31 @@ record_launch_config=robotcpu_record.textproto
 # index is 0 because the log dir is emptied at the start of every run.
 voice_host_log=voice_host_0.log
 
+# The replay harness's places. `current` is what brenn-app.service runs, and so
+# the payload a replay plays into. The replay's working directory is RAM under
+# `/run`, which only root can write; it is made 0700 by root and removed at the
+# end of every replay, because it holds a pod's key. It is deliberately not
+# under `scratch`: the payload's account owns `scratch` and could swap a name
+# there under one of root's writes. The frame-log importer is a workstation
+# tool, built in the default configuration.
+current="${store_mount}/current"
+replay_dir=/run/brenn-replay
+wav_import_target=//bazel/platform:wav_import
+# The launcher's log and the directory it sits in belong to the payload's
+# account, so the replay reads them as that account. Read as root, a name the
+# payload swapped for a link would carry root's reading of any file to the
+# workstation.
+as_app="setpriv --reuid ${app_user} --regid ${app_user} --clear-groups"
+# How long `replay_pod` keeps the link after the host's end-of-audio, as a
+# device playing out its bank does. The host's pacer writes at most its lead
+# ahead of real time (1 s by default, brenn-pod's `PLAYBACK_BURST_LEAD_MS`; the
+# site sets no lead) and the device's playout hop is 240 ms
+# (`PLAYBACK_PLAYOUT_HOP_MS`), so the reply's end is heard within about 1.25 s
+# of the end-of-audio whatever the reply's length; 2 s covers that with room.
+# Closing sooner puts the FIN inside playout, and the host aborts the reply as a
+# lost stream.
+replay_playout_ms=2000
+
 # The pose recorder's console, in the same log dir and under the same rule: the
 # JSON pose stream the analyzer reads is this file, and a recording session tails
 # it beside the host's so the operator hears the read-back and sees the
@@ -430,7 +472,10 @@ check_target=//crates/reachy-host:reachy_host
 # the resync's, emitted on the unit and reaching an operator as `die`'s 1 the
 # way 5 to 8 do: the boot fetch still retrying, `brenn-app-resync` reporting
 # failure, and the unit's hostname not being the pod the staged host
-# configuration names.
+# configuration names. 20 to 23 are the replay's preflight, emitted on the unit
+# and reaching an operator as `die`'s 1: the service not active, the payload
+# carrying no `replay_pod`, no host configuration to read the pod from, and no
+# link address for the pod.
 rc_no_stamp=5
 rc_stamp_unstaged=6
 rc_post_wipe=7
@@ -445,6 +490,10 @@ rc_record_config_disagreement=16
 rc_fetch_in_flight=17
 rc_resync_failed=18
 rc_pod_not_hostname=19
+rc_replay_inactive=20
+rc_replay_no_member=21
+rc_replay_no_params=22
+rc_replay_no_link=23
 
 # What the remote chain prints when it is about to exec the launcher.
 #
@@ -749,7 +798,7 @@ staged_provenance="${store_mount}/motion-provenance.staged"
 # call and the runbook says so; this script pushes and nothing more.
 
 usage() {
-	die "usage: ${prog} <host> --push [--stale-ok]|--run <dir>|--tour <dir>|--script <records-dir> FILE [--settle-evidence]|--probe <dir> <motion>|--fetch <dir>|--resync|--speech <dir>|--speech-preflight|--speech-fetch <dir>|--record <dir>|--record-preflight|--record-fetch <dir>" \
+	die "usage: ${prog} <host> --push [--stale-ok]|--run <dir>|--tour <dir>|--script <records-dir> FILE [--settle-evidence]|--probe <dir> <motion>|--fetch <dir>|--resync|--speech <dir>|--speech-preflight|--speech-fetch <dir>|--record <dir>|--record-preflight|--record-fetch <dir>|--replay <wav> <records-dir> [--linger-ms N] [--settle-ms N]" \
 		"       ${prog} --publish"
 }
 
@@ -2196,6 +2245,206 @@ supervised_run() {
 	esac
 }
 
+# Die when an ssh of the replay's failed as ssh, rather than as the remote
+# question answering no.
+#
+#   replay_ssh_failed <rc> <what did not happen>
+#
+# 255 is ssh's own failure; any other status is the remote command's answer,
+# which the caller reads. Not `bus_refusal`: none of the replay's remote
+# commands is the bus probe, and their statuses mean what their caller says
+# they mean.
+replay_ssh_failed() {
+	[ "$1" != 255 ] || die "ssh to root@${host} failed; $2."
+}
+
+# The replay preflight's four refusals, emitted by its one remote command.
+#
+#   replay_refusal <rc>
+#
+# Kept apart from `resync_refusal` and `chain_refusal`: the preflight runs
+# neither of their remote commands, so a code of theirs arriving from a replay
+# would be a bug, not a message. Returns without saying anything for a code
+# that is not one of the four.
+replay_refusal() {
+	local rc=$1
+	case "$rc" in
+	"$rc_replay_inactive")
+		die "${service} is not active on ${host}, so there is no voice host to replay into." \
+			"Start it: ssh root@${host} systemctl start ${service}"
+		;;
+	"$rc_replay_no_member")
+		die "the current payload on ${host} carries no replay_pod; release one that does: make motion-release"
+		;;
+	"$rc_replay_no_params")
+		die "cannot read ${current}/${host_params_path} on ${host}, so the pod its running host answers for is unknown."
+		;;
+	"$rc_replay_no_link")
+		die "the current payload on ${host} carries no ${link_conf_path} naming the pod's link address, so there is no voice link to replay into; nothing was replayed." \
+			"A payload built without a speech configuration has no link: release one built from the assembly directory, REACHY_SPEECH_CONFIG=<assembly>/speech.toml"
+		;;
+	esac
+}
+
+# Remove the replay's scratch directory on the unit, then the local one. Runs on
+# every exit once the unit has been written to: the directory holds the pod's
+# key.
+replay_cleanup() {
+	ssh_root "rm -rf ${replay_dir}" </dev/null >/dev/null 2>&1 ||
+		echo "${prog}: could not remove ${replay_dir} on ${host}; it holds ${pod}'s key in RAM until the next reboot: ssh root@${host} rm -rf ${replay_dir}" >&2
+	rm -rf -- "$tmp"
+}
+
+# Play one wav into the running host on the unit as its pod.
+#
+#   replay_utterance <wav> <records dir> <linger ms> <settle ms>
+#
+# Local refusals first, then read-only questions of the unit, then the local
+# work that needs the unit's pod; only after all of those is the unit written
+# to, and from that point the cleanup trap owns the exit. The key never reaches
+# a command line: it goes to the unit on ssh's stdin.
+replay_utterance() {
+	local wav=$1 records=$2 linger_ms=$3 settle_ms=$4
+	local host_log="${launch_logs}/${voice_host_log}"
+	local entries psk_table key listing wav_import rc offset read_from link_addr
+
+	wav=$(absolute_path "$wav")
+	records=$(absolute_path "$records")
+	[ -f "$wav" ] && [ -r "$wav" ] ||
+		die "there is no readable wav at ${wav}, so there is nothing to replay."
+	[ -n "$speech_config" ] && [ -f "$speech_config" ] ||
+		die "there is no speech configuration at ${speech_config:-(none)}, so there is no key table to take the pod's key from." \
+			"The replay authenticates as the running host's pod with the key the payload was built with, which is the assembly directory's: REACHY_SPEECH_CONFIG=<assembly>/speech.toml"
+	entries=$(speech_credential_paths "$speech_config") || exit 1
+	psk_table=$(awk -F'\t' '$1 == "pod_psk_file" { print $3 }' <<<"$entries")
+	[ -n "$psk_table" ] ||
+		die "${speech_config} names no pod_psk_file, so there is no key to replay with."
+	[ -f "$psk_table" ] ||
+		die "${speech_config} names pod_psk_file, and there is no file at ${psk_table}."
+
+	tmp=$(mktemp -d)
+	trap 'rm -rf -- "$tmp"' EXIT
+	# Every precondition is asked of the unit in one ssh, with a code per
+	# refusal; on success it prints the link address and
+	# then the host configuration. The address is the one the unit's own pod
+	# dials, read from the payload's link configuration, because the replay
+	# stands in for that pod on the same unit.
+	local preflight
+	preflight="systemctl is-active --quiet ${service} || exit ${rc_replay_inactive}"
+	preflight="${preflight}; test -x ${current}/replay_pod || exit ${rc_replay_no_member}"
+	preflight="${preflight}; [ -r ${current}/${host_params_path} ] || exit ${rc_replay_no_params}"
+	preflight="${preflight}; addr=\$(sed -n 's/^ADDR=//p' ${current}/${link_conf_path} 2>/dev/null | head -n 1); [ -n \"\$addr\" ] || exit ${rc_replay_no_link}"
+	preflight="${preflight}; printf '%s\n' \"\$addr\" && cat ${current}/${host_params_path}"
+	rc=0
+	ssh_root "$preflight" </dev/null >"${tmp}/preflight" || rc=$?
+	replay_ssh_failed "$rc" "nothing was replayed"
+	replay_refusal "$rc"
+	[ "$rc" = 0 ] ||
+		die "asking ${host} whether it can take a replay failed (exit ${rc}); its own error is above, and nothing was replayed."
+	tail -n +2 -- "${tmp}/preflight" >"${tmp}/host_params.textproto"
+	link_addr=$(head -n 1 -- "${tmp}/preflight")
+	[[ $link_addr =~ ^[][A-Za-z0-9._:-]+:[0-9]+$ ]] ||
+		die "${current}/${link_conf_path} on ${host} gives the pod's link address as '${link_addr}', which is not a host:port; nothing was replayed."
+	pod=$(textproto_string "${tmp}/host_params.textproto" pod) || exit 1
+	plain_name "${host}'s running pod" "$pod"
+
+	key=$(toml_table_value "$psk_table" "" "$pod") || exit 1
+	[ -n "$key" ] ||
+		die "${psk_table} has no row for ${pod}, the pod ${host}'s running host answers for." \
+			"Its table came from another assembly directory, or this row was minted after the release: point REACHY_SPEECH_CONFIG at the directory the payload was built from, or release again."
+	[[ $key =~ ^[0-9a-fA-F]{64}$ ]] ||
+		die "the row for ${pod} in ${psk_table} is not a 64-character hex key."
+
+	"$bazel" build "${build_flags[@]}" -- "$wav_import_target" >&2 ||
+		die "wav_import did not build; bazel's own output is above."
+	listing=$(bazel_files "$wav_import_target")
+	wav_import=$(bazel_named_in "$listing" wav-import__bin)
+	# A fixed base epoch, so the same wav is the same log.
+	"$wav_import" --input "$wav" --output "${tmp}/utterance.framelog" \
+		--pod-id "$pod" --base-epoch-us 0 >&2 ||
+		die "wav_import refused ${wav}; its own line is above." \
+			"The replay takes a 16 kHz mono S16 wav, and nothing here resamples one."
+
+	trap replay_cleanup EXIT
+	printf '%s\n' "$key" |
+		ssh_root "rm -rf ${replay_dir} && umask 077 && mkdir -p ${replay_dir} && cat >${replay_dir}/psk.hex" ||
+		die "writing the replay's key into ${replay_dir} on ${host} failed; nothing was replayed."
+	ssh_root "umask 077 && cat >${replay_dir}/utterance.framelog" <"${tmp}/utterance.framelog" ||
+		die "writing the replay's frame log into ${replay_dir} on ${host} failed; nothing was replayed."
+
+	echo "${prog}: stopping the audio device on ${host}: the host keeps one connection per pod id and the last Hello wins, and the pod reconnects the moment its link drops, so it would take the link back mid-replay. It stays stopped until ${service} is restarted." >&2
+	# `pkill` finding nothing is not a failure: the launcher's process list is
+	# the check either way, ten half-second waits for it to say the pod exited
+	# — `EXITED` or `CRASHED`, the launcher's word for a signalled child.
+	local stop_pod
+	stop_pod=$(cat <<'REMOTE'
+pkill -x reachy_pod; n=0; until curl -sS -m 2 http://127.0.0.1:8080/ | tr -d ' \n' | grep -o '{[^{}]*"name":"pod"[^{}]*}' | grep -Eq '"state":"PROCESS_STATE_(EXITED|CRASHED)"'; do [ "$n" -ge 10 ] && exit 1; n=$((n+1)); sleep 0.5; done
+REMOTE
+	)
+	rc=0
+	ssh_root "$stop_pod" </dev/null || rc=$?
+	replay_ssh_failed "$rc" "nothing was replayed"
+	[ "$rc" = 0 ] ||
+		die "the launcher on ${host} does not show pod PROCESS_STATE_EXITED or PROCESS_STATE_CRASHED 5 s after pkill -x reachy_pod, so nothing was replayed." \
+			"A replay beside a running pod is a fight over one pod id. Read the launcher: ssh root@${host} curl -s 127.0.0.1:8080/"
+
+	# `tail -c +N` is 1-based: byte offset+1 is the first one written after
+	# this point.
+	offset=$(ssh_root "${as_app} stat -c %s ${host_log}" </dev/null) && [[ $offset =~ ^[0-9]+$ ]] ||
+		die "cannot read the size of ${host_log} on ${host}, so the host's lines for this replay cannot be told from earlier ones; nothing was replayed."
+	read_from=$((offset + 1))
+
+	local stamp replay_out host_out settle_rc max
+	stamp=$(date -u +%Y%m%dT%H%M%SZ)
+	mkdir -p -- "$records"
+	replay_out="${records}/replay-${stamp}.jsonl"
+	host_out="${records}/replay-${stamp}.host.jsonl"
+	echo "${prog}: replaying ${wav} into ${host}'s voice host as ${pod}" >&2
+	rc=0
+	ssh_root "${current}/replay_pod --connect ${link_addr} --pod-id ${pod} --psk-file ${replay_dir}/psk.hex --pace realtime --linger-until-eoa --linger-timeout-ms ${linger_ms} --linger-playout-ms ${replay_playout_ms} ${replay_dir}/utterance.framelog" \
+		</dev/null >"$replay_out" || rc=$?
+	cat -- "$replay_out"
+	[ "$rc" != 255 ] || replay_ssh_failed 255 "the replay's outcome is unknown"
+
+	# The host is done with the turn when every `idle_suspended` in the slice
+	# has an `idle_resumed` after it: the state after the last of either line.
+	# A slice with neither is a wav that never woke the host, and passes at
+	# once. From 2 s after the replay, because a wake that lands after the last
+	# frame is still in flight.
+	max=$((settle_ms / 500))
+	local settle
+	settle=$(cat <<'REMOTE'
+sleep 2; n=0; until @AS_APP@ tail -c +@FROM@ @LOG@ | awk '/"kind":"idle_suspended"/ { s = 1 } /"kind":"idle_resumed"/ { s = 0 } END { exit s }'; do [ "$n" -ge @MAX@ ] && exit 1; n=$((n+1)); sleep 0.5; done
+REMOTE
+	)
+	settle=${settle//@FROM@/$read_from}
+	settle=${settle//@LOG@/$host_log}
+	settle=${settle//@MAX@/$max}
+	settle=${settle//@AS_APP@/$as_app}
+	settle_rc=0
+	ssh_root "$settle" </dev/null || settle_rc=$?
+	[ "$settle_rc" != 255 ] || replay_ssh_failed 255 "the host's lines were not read"
+
+	ssh_root "${as_app} tail -c +${read_from} ${host_log}" </dev/null >"$host_out" ||
+		die "bringing the host's lines home from ${host} failed; the log is still there: ${host_log}"
+	cat -- "$host_out"
+
+	echo "${prog}: replay_pod  ${replay_out}"
+	echo "${prog}: host        ${host_out}"
+	echo "${prog}: the pod is stopped and the records are still on ${host}; read them in this order:"
+	echo "    ssh root@${host} systemctl stop ${service}"
+	echo "    make speech-fetch"
+	echo "  (run empties scratch/logs: fetch first, whenever the service is next"
+	echo "   started — ssh root@${host} systemctl start ${service})"
+
+	[ "$settle_rc" = 0 ] ||
+		die "the host is still suspended $(((settle_ms + 2000) / 1000)) s after the replay ended." \
+			"Its lines since the replay began are above and in ${host_out}."
+	[ "$rc" = 0 ] ||
+		echo "${prog}: replay_pod exited ${rc}; the host's lines above are the evidence, not this status" >&2
+	exit "$rc"
+}
+
 # The publish is the one mode with no unit in it: it talks to the payload
 # server, so it takes no host and is dispatched ahead of the <host> <mode>
 # grammar every other mode shares.
@@ -2653,6 +2902,42 @@ case "$mode" in
 		# payload. The rest of `--speech`'s preflights need the staged
 		# payload and stay where they are.
 		require_speech_tty
+		;;
+
+	--replay)
+		wav=${1:-}
+		case $wav in
+		'' | -*) usage ;;
+		esac
+		shift
+		records=${1:-}
+		case $records in
+		'' | -*) usage ;;
+		esac
+		shift
+		linger_ms=30000 settle_ms=30000 linger_seen="" settle_seen=""
+		while [ $# -gt 0 ]; do
+			case $1 in
+			--linger-ms)
+				[ -z "$linger_seen" ] && [ $# -ge 2 ] || usage
+				linger_seen=1 linger_ms=$2
+				shift 2
+				;;
+			--settle-ms)
+				[ -z "$settle_seen" ] && [ $# -ge 2 ] || usage
+				settle_seen=1 settle_ms=$2
+				shift 2
+				;;
+			*) usage ;;
+			esac
+		done
+		[[ $linger_ms =~ ^[1-9][0-9]*$ ]] ||
+			die "--linger-ms is '${linger_ms}', which is not a positive whole number of milliseconds."
+		[[ $settle_ms =~ ^[1-9][0-9]*$ ]] ||
+			die "--settle-ms is '${settle_ms}', which is not a positive whole number of milliseconds."
+		[ "$settle_ms" -ge 500 ] ||
+			die "--settle-ms is ${settle_ms}; the host is asked every 500 ms, so it must be at least 500."
+		replay_utterance "$wav" "$records" "$linger_ms" "$settle_ms"
 		;;
 
 	--speech-fetch)

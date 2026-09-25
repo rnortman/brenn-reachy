@@ -259,7 +259,7 @@ crate.spec(
 # read.
 BRENN_POD_GIT = "https://github.com/rnortman/brenn-pod.git"
 
-BRENN_POD_REV = "17cd3ff5f69f8ccc88f72b8fb0a40fa9a1517209"
+BRENN_POD_REV = "7283854b643dd1d5940aa67cebf048b3786acb5b"
 
 # Developing a seam that lands on both sides of this dependency arrow: replace
 # each spec's `git`/`rev` pair with `path = "../brenn-pod/<crate path>"` to
@@ -277,7 +277,9 @@ BRENN_POD_REV = "17cd3ff5f69f8ccc88f72b8fb0a40fa9a1517209"
 # each pushed ref's tip carries, is the gate that catches an overlay reaching
 # one of them.
 #
-# The host library the robot's voice process is a composition of. reachy-host.
+# The host library the robot's voice process is a composition of. reachy-host,
+# and the replay harness's two bins (`//bazel/platform:replay_pod`,
+# `:wav_import`).
 crate.spec(
     git = BRENN_POD_GIT,
     package = "speech-surface",
@@ -460,6 +462,28 @@ crate.annotation(
     crate = "ort-sys",
     gen_build_script = "off",
     link_deps = ["@@//bazel/third_party/onnxruntime:onnxruntime"],
+)
+
+# The replay harness's two bins, brenn-pod's own: `replay-pod` plays a pod frame
+# log into a running voice host over the real TLS-PSK pod link, and `wav-import`
+# turns a 16 kHz mono S16 wav into such a log. Both take only the crate's own
+# dependencies, so naming them resolves nothing new. `//bazel/platform:replay_pod`
+# is a payload member, `//bazel/platform:wav_import` a workstation tool, and
+# `tools/deploy-motion.sh --replay` drives both.
+#
+# `replay-pod` names `libonnxruntime.so.1`, which the payload stages at its root
+# beside it, so its runpath must carry `$ORIGIN` as the host's does. `$$`
+# because Bazel expands make variables in this attribute. The flags reach every
+# target generated for the crate, the library included, where a link argument
+# is inert because producing an rlib links nothing. `tools/assert-device-isa.sh`
+# asks the built binary.
+crate.annotation(
+    crate = "speech-surface",
+    gen_binaries = [
+        "replay-pod",
+        "wav-import",
+    ],
+    rustc_flags = ["-Clink-arg=-Wl,-rpath,$$ORIGIN"],
 )
 
 crate.from_specs(name = "brenn_reachy_crates")

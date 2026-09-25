@@ -910,6 +910,10 @@ host_params=${REACHY_HOST_PARAMS:-${repo_root}/.local/host_params.textproto}
 # why the launcher entry passes no `--config` at all.
 host_params_path=host/host_params.textproto
 
+# Where the audio device's link configuration goes under the payload root: the
+# path `pod/pod_launch.textproto` passes the pod as `--config`.
+link_conf_path=conf/audio.conf
+
 # One quoted-string scalar out of a protobuf-text file.
 #
 #   textproto_string <file> <field>

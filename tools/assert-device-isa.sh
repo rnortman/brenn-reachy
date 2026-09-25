@@ -6,9 +6,12 @@
 #   tools/assert-device-isa.sh
 #
 # Two checks over one build, sharing one disassembler. The first is the ISA
-# sweep below. The second is the voice host's loader contract, at the bottom:
-# both are the class of defect that builds green, stages green, pushes green,
-# and shows up as a process that dies on a powered unit.
+# sweep below. The second, at the bottom, is the loader contract of the
+# payload's binaries that link the speech pipeline: the host, whose `NEEDED` on
+# ONNX Runtime is required, and `replay_pod`, which may carry one and must then
+# resolve it the same way. Both checks are the class of defect that builds
+# green, stages green, pushes green, and shows up as a process that dies on a
+# powered unit.
 #
 # The unit is a Cortex-A72: ARMv8.0-A plus CRC32. The pinned Clockwork drop's
 # toolchain compiles at `-march=armv8.2-a+fp16+simd+dotprod+ssbs` unless
@@ -43,7 +46,8 @@
 # Reads the two binaries out of the same `//bazel/platform:device_deployables`
 # filegroup `make check-device` builds, so it cannot check a different set than
 # the gate builds or a deploy ships, plus the prebuilt ONNX Runtime the voice
-# host loads. The loader check reads the voice host out of the same filegroup.
+# host loads. The loader check reads the voice host and `replay_pod` out of the
+# same filegroup.
 # It builds nothing: run it after that build.
 #
 # Knobs, environment only:
@@ -54,7 +58,7 @@
 #                    make check-device clears it and uses the pinned drop's
 #                    own llvm-objdump
 #
-# Exits 0 with a per-binary count and the host's loader contract, or non-zero
+# Exits 0 with a per-binary count and each loader contract, or non-zero
 # naming the binary and what is wrong with it.
 
 set -euo pipefail
@@ -90,46 +94,61 @@ binaries=(simplelaunch robot_clk_exe)
 shared_object_target=//bazel/third_party/onnxruntime:shared_object
 shared_object_name=libonnxruntime.so.1
 
-# The voice host, and what its exec depends on. The speech pipeline links ONNX
-# Runtime dynamically, so the host carries a `NEEDED` for the shared object and
-# a runpath ending in `$ORIGIN`; the payload stages the two side by side and the
-# launcher runs the host from that directory. Three files state that in prose --
-# the crate's BUILD file, the build script's staging, the deploy script's
-# preflight -- and until this check nothing asked the binary itself. A dropped
-# `rustc_flags` line, a rules_rust change in how link args reach the linker, or
-# a linker default that stops writing the tag produces a payload that passes
-# every other gate and a host that dies at exec with a loader message and no
-# narration at all.
-loader_binary=reachy_host
+# What the exec of a payload binary linking the speech pipeline depends on. The
+# pipeline links ONNX Runtime dynamically, so the voice host carries a `NEEDED`
+# for the shared object and a runpath ending in `$ORIGIN`; the payload stages
+# the two side by side and the launcher runs the host from that directory. This
+# check asks the binary itself. A dropped `rustc_flags` line, a rules_rust change in how
+# link args reach the linker, or a linker default that stops writing the tag
+# produces a payload that passes every other gate and a host that dies at exec
+# with a loader message and no narration at all.
+#
+# `replay_pod` is held to the same contract conditionally: the bin never names
+# `ort`, so whether the linker keeps the entry is the linker's answer, not this
+# tree's. A binary that keeps it and lacks `$ORIGIN` dies at exec on a unit
+# after `verify_aarch64` passed.
 loader_needed=libonnxruntime.so.1
 # shellcheck disable=SC2016 # `$ORIGIN` is the loader's own syntax, not this shell's
 loader_runpath='$ORIGIN'
 
-# The host's dynamic section, checked against that contract. Reports the first
-# thing wrong and nothing after it: either half missing is the same fix.
+# check_loader_contract <name> <path> <required|conditional> <where the flag lives>
+#
+# One binary's dynamic section, checked against that contract. `required` dies
+# when the `NEEDED` is missing; `conditional` passes and says so. Reports the
+# first thing wrong and nothing after it: either half missing is the same fix.
 check_loader_contract() {
-	local path=$1 dynamic
+	local name=$1 path=$2 mode=$3 flag_home=$4 dynamic
 	dynamic=$("$objdump" -p "$path" 2>/dev/null) ||
 		die "${objdump} cannot read ${path}, so the loader contract was not checked."
-	grep -q 'Dynamic Section' <<<"$dynamic" ||
-		die "${loader_binary} has no dynamic section, so it links nothing dynamically." \
+	if ! grep -q 'Dynamic Section' <<<"$dynamic"; then
+		# A device binary linked against the unit's libc always has one, so none
+		# is a file this misread, in either mode.
+		[ "$mode" = required ] ||
+			die "${name} has no dynamic section, so this cannot say what it loads at exec."
+		die "${name} has no dynamic section, so it links nothing dynamically." \
 			"The voice host is expected to load ${loader_needed} at run time."
-	grep -qE "^[[:space:]]*NEEDED[[:space:]]+${loader_needed}\$" <<<"$dynamic" || die \
-		"${loader_binary} carries no NEEDED entry for ${loader_needed}." \
-		"The payload stages that shared object beside the binary for this and nothing else;" \
-		"a host that does not name it is one whose ONNX Runtime came from somewhere else."
+	fi
+	if ! grep -qE "^[[:space:]]*NEEDED[[:space:]]+${loader_needed}\$" <<<"$dynamic"; then
+		if [ "$mode" = conditional ]; then
+			echo "${name}: no NEEDED ${loader_needed}; it links no shared object the payload stages."
+			return 0
+		fi
+		die "${name} carries no NEEDED entry for ${loader_needed}." \
+			"The payload stages that shared object beside the binary for this and nothing else;" \
+			"a host that does not name it is one whose ONNX Runtime came from somewhere else."
+	fi
 	# The tag Bazel writes names a path inside the build tree, which is nowhere
-	# on a unit; the crate appends `$ORIGIN` to it. So what has to hold is that
+	# on a unit; the build appends `$ORIGIN` to it. So what has to hold is that
 	# `$ORIGIN` is one of the colon-separated entries, not that it is the whole
 	# value.
 	local paths
 	paths=$(awk '$1 == "RUNPATH" || $1 == "RPATH" { print $2 }' <<<"$dynamic")
 	tr ':' '\n' <<<"$paths" | grep -Fxq -- "$loader_runpath" || die \
-		"${loader_binary} has no ${loader_runpath} in its runpath (it reads '${paths:-nothing}')." \
+		"${name} has no ${loader_runpath} in its runpath (it reads '${paths:-nothing}')." \
 		"The payload puts ${loader_needed} beside the binary and nowhere the loader searches by" \
-		"default, so without it the host dies at exec." \
-		"Check the rustc_flags in crates/reachy-host/BUILD.bazel."
-	echo "${loader_binary}: NEEDED ${loader_needed}, runpath carries ${loader_runpath}."
+		"default, so without it the binary dies at exec." \
+		"Check the rustc_flags in ${flag_home}."
+	echo "${name}: NEEDED ${loader_needed}, runpath carries ${loader_runpath}."
 }
 
 # The LSE atomic families, by mnemonic: compare-and-swap, swap, and the
@@ -264,6 +283,9 @@ done
 
 # Last, after the sweep has said what it found: the two checks are independent,
 # and a run that reports both is worth more than one that stops at the first.
-check_loader_contract "$(bazel_named_in "$listing" "$loader_binary")"
+check_loader_contract reachy_host "$(bazel_named_in "$listing" reachy_host)" \
+	required crates/reachy-host/BUILD.bazel
+check_loader_contract replay_pod "$(bazel_named_in "$listing" replay-pod__bin)" \
+	conditional "the speech-surface crate.annotation in MODULE.bazel"
 
 exit "$status"

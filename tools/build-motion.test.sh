@@ -125,6 +125,7 @@ export MOTORD_MACHINE=183
 export HOST_MACHINE=183
 export ASK_MACHINE=183
 export BENCH_MACHINE=183
+export REPLAY_MACHINE=183
 export EXE_MACHINE=183
 export LAUNCHER_MACHINE=183
 export ONNX_MACHINE=183
@@ -247,6 +248,7 @@ case "$sub" in
 		elf bazel-out/bin/reachy_host "$HOST_MACHINE"
 		elf bazel-out/bin/reachy_ask "$ASK_MACHINE"
 		elf bazel-out/bin/reachy_bench "$BENCH_MACHINE"
+		elf bazel-out/bin/replay-pod__bin "$REPLAY_MACHINE"
 		elf bazel-out/bin/simplelaunch "$LAUNCHER_MACHINE"
 		# A knob rather than a fixture the case moves aside: this arm runs on
 		# every build, so a file removed between builds would be written back.
@@ -415,6 +417,7 @@ CONFIG
 				echo bazel-out/bin/reachy_host
 				echo bazel-out/bin/reachy_ask
 				echo bazel-out/bin/reachy_bench
+				echo bazel-out/bin/replay-pod__bin
 				echo bazel-out/bin/robot_clk_exe
 				echo bazel-out/bin/simplelaunch
 				echo bazel-out/bin/robotcpu.textproto
@@ -702,6 +705,15 @@ assert_file "the intent source is beside it" "${payload}/reachy_ask"
 # A launcher app in the recording config alone, and staged in every payload
 # because which config a unit runs is decided at the prompt.
 assert_file "the bench is beside them" "${payload}/reachy_bench"
+# The replay instrument: no launcher config names it, and every payload carries
+# it so any unit that fetched can take a replay. Staged under its payload name,
+# not the generated bin's.
+assert_file "the replay instrument is beside them" "${payload}/replay_pod"
+assert_eq "and executable" 755 "$(stat -c %a -- "${payload}/replay_pod")"
+assert_no_file "under its payload name, not the generated one" \
+	"${payload}/replay-pod__bin"
+assert_contains "and the report states its digest" "$(output_of "$result")" \
+	"replay_pod  $(sha256sum -- "${payload}/replay_pod" | cut -d' ' -f1)"
 assert_file "the launcher is in the payload" "${payload}/simplelaunch"
 # Beside the host and not under a lib directory: the binary's runpath ends in
 # `$ORIGIN`, and the payload root is where that resolves.
@@ -814,7 +826,7 @@ assert_lacks "the configuration is not spelled out here" "$(calls)" \
 assert_contains "the build builds the deployables the gate names" "$(calls)" \
 	"build --config=device -- //bazel/platform:motion_payload"
 assert_contains "one cquery names every built output" "$(calls)" \
-	"//crates/reachy-motord:reachy_motord + //crates/reachy-host:reachy_host + //crates/reachy-ask:reachy_ask + //crates/reachy-bench:reachy_bench + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:robotcpu_harness.textproto + //cogs:robotcpu_record.textproto + //cogs:clockwork_prelaunch_sh"
+	"//crates/reachy-motord:reachy_motord + //crates/reachy-host:reachy_host + //crates/reachy-ask:reachy_ask + //crates/reachy-bench:reachy_bench + //cogs:robot_clk_exe + //cogs:system_robot_clk + @clockwork//jewels/simplelaunch:simplelaunch + //cogs:robotcpu.textproto + //cogs:robotcpu_harness.textproto + //cogs:robotcpu_record.textproto + //cogs:clockwork_prelaunch_sh + //bazel/platform:replay_pod"
 assert_contains "one cquery names the configuration" "$(calls)" \
 	"//cogs:library.names.json + //cogs:idle.json + //cogs:robot_config_files + //driver:motord_params.textproto"
 assert_lacks "and does not name the host's own configuration, which Bazel does not supply" \
@@ -920,6 +932,15 @@ assert_contains "the refusal names that binary" "$(output_of "$result")" \
 	"reachy_ask is an ELF"
 assert_unstaged "and that one stages nothing either"
 ASK_MACHINE=183
+
+mark_payload
+REPLAY_MACHINE=62
+result=$(build)
+assert_status "a replay instrument for the wrong machine refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names the generated bin" "$(output_of "$result")" \
+	"replay-pod__bin is an ELF"
+assert_unstaged "and that one stages nothing either"
+REPLAY_MACHINE=183
 
 # The pod binary's refusals. It is the one binary in the payload this tree does
 # not compile, and the one whose source used to be whatever the other repo's last
@@ -2609,11 +2630,14 @@ labels_of() {
 	' "${real_repo}/bazel/platform/BUILD.bazel" | sort
 }
 
-script_labels=$(grep -E '^(motord_target|host_target|ask_target|bench_target|exe_target|system_target|launcher_target|launch_config_target|harness_config_target|record_config_target|prelaunch_target|onnx_target|models_target)=' \
+script_labels=$(grep -E '^(motord_target|host_target|ask_target|bench_target|replay_target|exe_target|system_target|launcher_target|launch_config_target|harness_config_target|record_config_target|prelaunch_target|onnx_target|models_target)=' \
 	"${real_repo}/tools/build-motion.sh" | sed 's/^[a-z_]*=//' | sort)
 
+# A member in the filegroup's own package is spelled package-relative there and
+# absolute in the script.
+payload_labels=$(labels_of motion_payload | sed 's#^:#//bazel/platform:#' | sort)
 assert_eq "the payload's members are exactly the labels this script cqueries" \
-	"$(labels_of motion_payload)" "$script_labels"
+	"$payload_labels" "$script_labels"
 assert_contains "the gate's list carries the payload" \
 	"$(labels_of device_deployables)" ":motion_payload"
 assert_contains "and the gate builds that list" \
@@ -2915,6 +2939,29 @@ for target in speech-run speech-fetch pose-record pose-fetch; do
 	assert_contains "and the runbook names make ${target}" "$runbook" \
 		"make ${target}"
 done
+# The replay reads a payload the unit already runs, so it builds and pushes
+# nothing, and the empty-WAV refusal comes before anything reaches the unit. Not
+# in the runbook loop above: the mode prints its own closing instructions.
+replay_recipe=$(sed -n '/^speech-replay:/,/^$/p' -- "${real_repo}/Makefile")
+assert_contains "speech-replay checks the host" "${replay_recipe%%$'\n'*}" "device-host"
+assert_contains "and bazel" "${replay_recipe%%$'\n'*}" "require-bazel"
+# shellcheck disable=SC2016
+replay_step='tools/deploy-motion.sh $(REACHY_HOST) --replay "$(WAV)" $(SPEECH_RECORDS)'
+assert_contains "and runs the replay mode" "$replay_recipe" "$replay_step"
+# shellcheck disable=SC2016
+assert_contains "passing the linger through when it is set" "$replay_recipe" \
+	'--linger-ms $(REPLAY_LINGER_MS)'
+replay_guard_at=${replay_recipe%%"WAV is not set"*}
+replay_step_at=${replay_recipe%%"$replay_step"*}
+if [ "${#replay_guard_at}" -lt "${#replay_step_at}" ]; then
+	pass "and refuses an unset WAV before it"
+else
+	fail "and refuses an unset WAV before it" "$replay_recipe"
+fi
+assert_lacks "and pushes nothing" "$replay_recipe" "motion-deploy"
+assert_contains "the help text offers make speech-replay" "$makefile_help" \
+	"make speech-replay"
+
 # The link travels in the payload, so there is no target that pushes it.
 assert_lacks "the help text offers no speech-provision" "$makefile_help" "speech-provision"
 assert_lacks "and neither does the runbook" "$runbook" "speech-provision"

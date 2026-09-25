@@ -16,6 +16,12 @@ Nothing has been released.
   configuration, `conf/audio.conf`, built from the speech configuration, and
   the audio device is started pointing at it. The separate provisioning step,
   `make speech-provision`, is gone.
+- **A spoken turn can be driven without a person.** `make speech-replay WAV=<file>`
+  plays a 16 kHz mono wav into the unit's running voice host as if its audio
+  device had heard it — through the same wake gate and pipeline as live
+  audio — and brings home what the host did into `SPEECH_RECORDS`. The unit's
+  audio device is stopped for the replay and stays stopped until
+  `brenn-app.service` is restarted. The payload carries the `replay_pod` instrument for it.
 - **The robot can answer when speech recognition is unreachable.** A speech
   configuration may name an offline reply clip, `[stt] unreachable_clip`; the
   build stages it beside the configuration and a push refuses a payload
@@ -400,6 +406,14 @@ Nothing has been released.
 
 ### Fixed
 
+- **A fetched payload's voice host starts.** The robot's voice host refused
+  its own key table ("psk file mode 0644 is group/world-accessible") because a
+  fetched payload is unpacked world-readable on the unit, so a robot started
+  from its fetched payload danced but never heard anything. The speech
+  configuration now declares `secrets_posture = "payload"`, which brenn-pod
+  accepts for a read-only, world-readable tree; brenn-pod is pinned to the
+  release that understands that setting. Without this, the "power-cycled unit
+  hears without being provisioned" change above did not work on a real unit.
 - **`reachy-ask --script` deadline and stale-row handling.** The sender window
   was anchored before the blocking read, so however long that read blocked —
   up to a 250 ms poll — was spent before the offer was posted, and every
