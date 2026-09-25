@@ -33,6 +33,8 @@
 #     models/oww/*.onnx                                 the wake gate's two front graphs
 #     models/silero/silero_vad.onnx                     the endpointer's graph
 #     wherever `[wake] model` puts it                   the wake gate's phrase head
+#     wherever `[stt] unreachable_clip` puts it         the offline reply
+#     conf/audio.conf                                   the audio device's link, composed by brenn-pod's writer
 #     cogs/*.textproto                                  the cogs' configuration
 #     cogs/*_event_logger_config.tachyon                which channels are written
 #     cogs/*.proc.tachyon, *.logger_proc.tachyon        the two process descriptions
@@ -76,8 +78,11 @@
 #
 #   REACHY_BAZEL           the bazel to run (default bazel)
 #   BRENN_POD_DIR          the brenn-pod checkout the audio-device binary is
-#                          built in (default: ../brenn-pod; a relative value is
-#                          relative to this repository's root)
+#                          built in and whose writer composes the pod's link
+#                          (default: ../brenn-pod; a relative value is
+#                          relative to this repository's root). A build that
+#                          stages a speech configuration needs it even with
+#                          REACHY_POD_BINARY
 #   REACHY_POD_BINARY      an audio-device binary built elsewhere to stage
 #                          instead, which skips that build and its checks
 #                          (default: the one BRENN_POD_DIR's build leaves)
@@ -85,10 +90,11 @@
 #                          (default: the gitignored host/speech.toml of this
 #                          tree; a payload built without one carries no speech
 #                          configuration, which is a host that narrates and does
-#                          not listen). The credential files it names, and the
-#                          wake head its `[wake] model` names, are staged with
-#                          it, from beside it — see the assembly directory
-#                          below.
+#                          not listen). The credential files it names, the
+#                          wake head its `[wake] model` names and the offline
+#                          clip its `[stt] unreachable_clip` names are staged
+#                          with it, from beside it — see the assembly
+#                          directory below.
 #   REACHY_RECORD_SPEECH_CONFIG  the same for a recording session's voice half,
 #                          which transcribes with no wake word and reads each
 #                          transcript back (default: the gitignored
@@ -102,13 +108,15 @@
 #                          without one is refused by `--record` the same way)
 #
 # A speech configuration is not one file but a small directory: the TOML, the
-# credential files it names — the pod's key table, the bus token — and the wake
-# gate's phrase head, beside it. The TOML names them by the payload-relative
-# paths they will occupy, which are also the paths the host resolves at run
-# time, because the launcher starts it with the payload root as its working
-# directory. This script stages them into the payload for the reason it stages
+# credential files it names — the pod's key table, the bus token — the wake
+# gate's phrase head and the offline clip, beside it. The TOML names them by the
+# payload-relative paths they will occupy, which are also the paths the host
+# resolves at run time, because the launcher starts it with the payload root as
+# its working directory. This script stages them into the payload for the reason it stages
 # `reachy_pod` there: a payload member that arrived by a different route would
-# be the one file whose freshness, machine and digest nothing checked.
+# be the one file whose freshness, machine and digest nothing checked. The pod's
+# half of the link is composed from the same TOML, by brenn-pod's writer, and
+# staged beside it.
 #
 # The head is in that directory and not in the fetch table because it is the one
 # model that is site policy: which phrase this machine answers to. The other
@@ -219,6 +227,19 @@ config_targets=(
 # deliberately.
 payload="${repo_root}/target/motion-arm64/release"
 
+# Where the audio device's link configuration goes under the payload root: the
+# path `pod/pod_launch.textproto` passes the pod as `--config`.
+link_conf_path=conf/audio.conf
+# Composed during resolution, before anything is staged, and installed by
+# `stage`: a refusal from the writer leaves the previous payload alone.
+link_conf_composed="${payload}.audio.conf"
+# The speech configuration every site file is derived from -- the pod's link,
+# the credentials, the wake head, the offline clip -- chosen by
+# `choose_speech_source`; empty when no speech configuration is staged. The
+# pod the link was composed for, likewise empty then.
+speech_source=
+link_pod_id=
+
 # The generated files a process reads, by basename: two process descriptions and
 # the writer's channel set. Everything else the system target emits is for the
 # channel spy or the diagnostics database, neither of which this payload starts;
@@ -324,7 +345,8 @@ check_pod_launch() {
 	[ "$found" = "$wanted" ] || die \
 		"${config##*/} starts the pod as '${found:-nothing}'; expected '${wanted:-nothing}'." \
 		"Reboot the audio chip as a blocking pre-launch step, then attach without" \
-		"another reset; a reset under servo commissioning parks the machine."
+		"another reset; a reset under servo commissioning parks the machine," \
+		"and name its link configuration, --config ${link_conf_path}, which this build stages."
 }
 
 # Everything Bazel knows about where the payload's files are, in two questions
@@ -417,10 +439,11 @@ resolve_models() {
 #
 # They are listed for one purpose — deciding whether a site file the speech
 # configuration names would land on top of one of them. Their one reader is
-# `refuse_payload_collision`, asked by both site-file resolvers (the credentials
-# and the wake head); the members themselves are installed by `stage` by name,
-# because an unlabelled argument list is where two cross-built binaries get
-# transposed.
+# `refuse_payload_collision`, asked by all three site-file resolvers (the
+# credentials, the wake head and the offline clip); the members themselves are
+# installed by `stage` by name, because an unlabelled argument list is where two
+# cross-built binaries get transposed. The audio device's link is installed by
+# name too.
 payload_fixed_members=(
 	run
 	reachy_motord
@@ -440,6 +463,7 @@ payload_fixed_members=(
 	"$record_speech_config_path"
 	"$bench_config_path"
 	"$host_params_path"
+	"$link_conf_path"
 	"$build_commit_name"
 )
 
@@ -451,6 +475,10 @@ speech_credentials=()
 # gate's phrase head -- in the same shape.
 speech_models=()
 
+# The clips the staged speech configuration supplies itself -- the offline
+# reply -- in the same shape.
+speech_clips=()
+
 # Refuse a site file that would land on a payload member.
 #
 #   refuse_payload_collision <key> <value> <noun>
@@ -458,7 +486,8 @@ speech_models=()
 # A site path that lands on a model, a cog's configuration or another site file
 # is a file the payload carries under a name something else reads, with the
 # loser decided by install order. Asked against everything resolved so far: the
-# named members, the resolved plan and models, and both classes of site file —
+# named members, the resolved plan and models, and every class of site file
+# (credentials, wake head, offline clip) —
 # including the class being resolved right now, whose own list is still empty
 # while its first entry is checked. So the answer does not depend on which
 # resolver runs first, and a new class of site file is covered by adding its
@@ -472,9 +501,10 @@ refuse_payload_collision() {
 	for entry in "${payload_fixed_members[@]}" \
 		"${plan_files[@]}" "${model_files[@]}" \
 		${speech_credentials[@]+"${speech_credentials[@]}"} \
-		${speech_models[@]+"${speech_models[@]}"}; do
+		${speech_models[@]+"${speech_models[@]}"} \
+		${speech_clips[@]+"${speech_clips[@]}"}; do
 		[ "${entry#*$'\t'}" = "$value" ] || continue
-		die "${key} in ${speech_config} is ${value}, which is a payload member's own path." \
+		die "${key} in ${speech_source} is ${value}, which is a payload member's own path." \
 			"The ${noun} would be installed over ${value}, or under it; name it something" \
 			"the payload does not already carry."
 	done
@@ -490,22 +520,59 @@ refuse_payload_collision() {
 # The source is beside the configuration, because the configuration names the
 # path the file will occupy in the payload rather than the path it occupies now.
 # That is the assembly-directory convention: one directory holds the TOML and
-# its credentials, and it is also what brenn-pod's provisioning is pointed at,
-# so the two sides of the pod's key link keep deriving from one source.
+# its credentials, and it is the speech source the pod's link is composed from
+# and where that composition files the pod's key, so the two sides
+# of the pod's key link keep deriving from one source.
 resolve_speech_credentials() {
 	local listing key value src
 	speech_credentials=()
-	listing=$(speech_credential_paths "$speech_config") || exit 1
+	listing=$(speech_credential_paths "$speech_source") || exit 1
 	while IFS=$'\t' read -r key value src; do
 		[ -n "$key" ] || continue
 		refuse_payload_collision "$key" "$value" credential
 		[ -f "$src" ] ||
-			die "${speech_config} names ${key} = ${value} and there is no file at ${src}." \
+			die "${speech_source} names ${key} = ${value} and there is no file at ${src}." \
 				"The credential files a speech configuration names live beside it, under the" \
 				"payload-relative paths it spells: that is the directory the payload is staged" \
-				"from and the one brenn-pod's provisioning writes the key table into."
+				"from and the one the build files the pod's key into."
 		speech_credentials+=("${src}"$'\t'"${value}")
 	done <<<"$listing"
+}
+
+# Choose the configuration the payload's site files come from.
+#
+# One configuration is the source of everything the build derives from a
+# speech configuration: the pod's link, the credentials it names, the wake
+# head and the offline clip, so they all come out of one directory. The site's
+# wins when both are staged; the push's agreement check
+# holds the recording configuration's link and wake head to it, and a file the
+# recording configuration names that the site's does not stage is refused by
+# the `--check` preflight `--record` runs over the staged copy.
+choose_speech_source() {
+	speech_source=
+	if [ -f "$speech_config" ]; then
+		speech_source=$speech_config
+	elif [ -f "$record_speech_config" ]; then
+		speech_source=$record_speech_config
+	fi
+}
+
+# Compose the audio device's link configuration, through brenn-pod's writer,
+# from the speech source, for the pod `host_params.textproto` names -- which is
+# the pod's identity, its hostname, and the name the host addresses scripts to.
+#
+# Run before `resolve_speech_credentials`, because on a first build it is what
+# files the pod's key into the table beside the speech source, which that step
+# then stages. A payload with no speech configuration composes nothing and does
+# not look for the writer.
+compose_link_conf() {
+	rm -f -- "$link_conf_composed"
+	link_pod_id=
+	[ -n "$speech_source" ] || return 0
+	link_pod_id=$(textproto_string "$host_params" pod) || exit 1
+	mkdir -p -- "$(dirname -- "$link_conf_composed")"
+	"${repo_root}/tools/pod-conf.sh" "$link_pod_id" "$speech_source" "$link_conf_composed" ||
+		exit 1
 }
 
 # Resolve the wake head, and refuse everything about it that cannot be staged.
@@ -514,22 +581,46 @@ resolve_speech_credentials() {
 # before `stage` for the same one. Which of the two site-file resolvers runs
 # first does not matter: `refuse_payload_collision` reads both lists.
 #
-# Only the site's configuration is read. The recording configuration names its
-# own `[wake] model` and is held equal to this one by the push's agreement
-# check, so the head this stages is the head a recording session loads.
+# Read from the speech source. When that is the site's configuration, the
+# recording one names its own `[wake] model` and the push's agreement check
+# holds it equal to this one, so the head this stages is the head a recording
+# session loads.
 resolve_speech_models() {
 	local listing key value src
 	speech_models=()
-	listing=$(speech_model_paths "$speech_config") || exit 1
+	listing=$(speech_model_paths "$speech_source") || exit 1
 	while IFS=$'\t' read -r key value src; do
 		[ -n "$key" ] || continue
 		refuse_payload_collision "$key" "$value" "wake model"
 		[ -f "$src" ] ||
-			die "${speech_config} names ${key} = ${value} and there is no file at ${src}." \
+			die "${speech_source} names ${key} = ${value} and there is no file at ${src}." \
 				"The wake head a speech configuration names lives beside it, under the" \
 				"payload-relative path it spells: the head is a site's own file, not one this" \
 				"build fetches, so the assembly directory is the only place it can come from."
 		speech_models+=("${src}"$'\t'"${value}")
+	done <<<"$listing"
+}
+
+# Resolve the offline clip, and refuse everything about it that cannot be
+# staged.
+#
+# Reads the speech source, as the head does. The host loads the clip at startup
+# whenever its configuration names one, whatever its wake mode, and does not
+# start without it.
+resolve_speech_clips() {
+	local listing key value src
+	speech_clips=()
+	listing=$(speech_clip_paths "$speech_source") || exit 1
+	while IFS=$'\t' read -r key value src; do
+		[ -n "$key" ] || continue
+		refuse_payload_collision "$key" "$value" "offline clip"
+		[ -f "$src" ] ||
+			die "${speech_source} names ${key} = ${value} and there is no file at ${src}." \
+				"The clip a speech configuration names lives beside it, under the payload-relative" \
+				"path it spells: it is the line this machine speaks when its transcriber is" \
+				"unreachable, a site's own file, so the assembly directory is the only place it" \
+				"can come from."
+		speech_clips+=("${src}"$'\t'"${value}")
 	done <<<"$listing"
 }
 
@@ -661,6 +752,12 @@ stage() {
 	# a per-unit file is nobody else's on the machine to read.
 	install -m 0600 -D -- "$host_params" "${staging}/${host_params_path}"
 
+	# The audio device's link, composed above: 0600 because it holds this
+	# unit's link key, as the key table does.
+	if [ -n "$speech_source" ]; then
+		install -m 0600 -D -- "$link_conf_composed" "${staging}/${link_conf_path}"
+	fi
+
 	# Credentials (the pod's key table, the bus token): mode 0600 so only
 	# the payload's account reads them. `rsync -a` carries the mode to the
 	# unit.
@@ -675,6 +772,11 @@ stage() {
 		install -m 0644 -D -- "${entry%%$'\t'*}" "${staging}/${entry#*$'\t'}"
 	done
 
+	# The offline clip, at 0644: content, not a secret, as the wake head is.
+	for entry in "${speech_clips[@]}"; do
+		install -m 0644 -D -- "${entry%%$'\t'*}" "${staging}/${entry#*$'\t'}"
+	done
+
 	stamp_build_commit "${staging}/${build_commit_name}"
 
 	if [ -e "$payload" ]; then
@@ -682,6 +784,7 @@ stage() {
 	fi
 	mv -- "$staging" "$payload"
 	rm -rf -- "$previous"
+	rm -f -- "$link_conf_composed"
 }
 
 # The digests are how a person tells two payloads apart at the bench; for
@@ -729,6 +832,13 @@ report() {
 	else
 		echo "${prog}: ${bench_config_path}  absent; this payload cannot record a session"
 	fi
+	# The audio device's link, which decides whether the pod has a voice host
+	# to dial at all.
+	if [ -f "${payload}/${link_conf_path}" ]; then
+		echo "${prog}: ${link_conf_path}  staged for ${link_pod_id} from ${speech_source}"
+	else
+		echo "${prog}: ${link_conf_path}  absent; no speech configuration is staged, so the audio device has no link to read"
+	fi
 	# Said without a digest for the same reason, and always present: the build
 	# refuses without it, so there is no absent case to report.
 	echo "${prog}: host params staged from ${host_params}"
@@ -747,6 +857,12 @@ report() {
 	for entry in "${speech_models[@]}"; do
 		member=${entry#*$'\t'}
 		echo "${prog}: ${member}  staged from ${entry%%$'\t'*}  $(sha256sum -- "${payload}/${member}" | cut -d' ' -f1)"
+	done
+	# And the offline clip, with a digest for the head's reason: a re-rendered
+	# line arrives under the name of the one before it.
+	for entry in "${speech_clips[@]}"; do
+		member=${entry#*$'\t'}
+		echo "${prog}: ${member}  offline clip staged from ${entry%%$'\t'*}  $(sha256sum -- "${payload}/${member}" | cut -d' ' -f1)"
 	done
 }
 
@@ -861,7 +977,7 @@ resolve_models
 check_launcher_apps "$launch_config_out" "${launcher_apps[@]}"
 check_launcher_apps "$harness_config_out" "${harness_apps[@]}"
 check_launcher_apps "$record_config_out" "${record_apps[@]}"
-pod_steps=$'app pod reachy_pod run --chip-rebooted\npre_launch pod_reboot_chip reachy_pod reboot-chip'
+pod_steps=$'app pod reachy_pod run --chip-rebooted --config '"${link_conf_path}"$'\npre_launch pod_reboot_chip reachy_pod reboot-chip'
 check_pod_launch "$launch_config_out" "$pod_steps"
 check_pod_launch "$harness_config_out" ""
 check_pod_launch "$record_config_out" "$pod_steps"
@@ -879,7 +995,10 @@ verify_aarch64 "$exe_out"
 verify_aarch64 "$launcher_out"
 verify_aarch64 "$onnx_out"
 plan "$built" "$configs"
+choose_speech_source
+compose_link_conf
 resolve_speech_credentials
 resolve_speech_models
+resolve_speech_clips
 stage
 report

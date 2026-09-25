@@ -646,6 +646,56 @@ assert_lacks "and pushes nothing" "$(calls)" "rsync"
 touch -d "@$((after + 60))" -- "${payload}/models/wake/head.onnx"
 rm -rf -- "${repo}/host/models"
 
+# The offline clip travels the way the wake head does: staged from beside the
+# configuration under the path it names, dated against the file there, and
+# asked of the payload whatever the override says.
+mkdir -p -- "${repo}/host/clips" "${payload}/clips"
+cat >"$speech_source" <<'TOML'
+listen_addr = "127.0.0.1:7380"
+
+[stt]
+unreachable_clip = "clips/offline.wav"
+TOML
+cp -- "$speech_source" "${payload}/host/speech.toml"
+: >"${repo}/host/clips/offline.wav"
+: >"${payload}/clips/offline.wav"
+touch -d "@${after}" -- "$speech_source" "${repo}/host/clips/offline.wav"
+touch -d "@$((after + 60))" -- "${payload}/host/speech.toml" \
+	"${payload}/clips/offline.wav"
+result=$(deploy unit --push)
+assert_status "a clip no newer than its staged copy pushes" 0 "$(status_of "$result")"
+
+touch -d "@$((after + 3600))" -- "${repo}/host/clips/offline.wav"
+result=$(deploy unit --push)
+assert_status "a clip re-rendered since the build refuses" 1 "$(status_of "$result")"
+assert_contains "the refusal names it by the payload path its configuration spells" \
+	"$(output_of "$result")" "offline clip clips/offline.wav"
+assert_contains "and says which copy would be shipped" "$(output_of "$result")" \
+	"newer than the copy in the payload"
+assert_lacks "and pushes nothing" "$(calls)" "rsync"
+
+result=$(deploy unit --push --stale-ok)
+assert_status "--stale-ok covers the clip too" 0 "$(status_of "$result")"
+
+rm -f -- "${payload}/clips/offline.wav"
+result=$(deploy unit --push --stale-ok)
+assert_status "a clip the payload never staged refuses under --stale-ok too" 1 \
+	"$(status_of "$result")"
+assert_contains "and the refusal names the path the staged configuration spells" \
+	"$(output_of "$result")" "no offline clip clips/offline.wav"
+assert_lacks "and pushes nothing" "$(calls)" "rsync"
+: >"${payload}/clips/offline.wav"
+rm -rf -- "${repo}/host/clips" "${payload}/clips"
+cat >"$speech_source" <<'TOML'
+listen_addr = "127.0.0.1:7380"
+
+[wake]
+model = "models/wake/head.onnx"
+TOML
+cp -- "$speech_source" "${payload}/host/speech.toml"
+touch -d "@${after}" -- "$speech_source"
+touch -d "@$((after + 60))" -- "${payload}/host/speech.toml"
+
 # A configuration this reader cannot read is a refused push, not a push that
 # skipped a credential it could not name.
 printf 'pod_psk_file = "secrets/pod-psk.toml\n' >"$speech_source"
@@ -2203,7 +2253,7 @@ assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
 assert_lacks "and nothing was built for it either" "$(calls)" "bazel"
 
 # The same question asked alone, which is what `make speech-run` asks before it
-# provisions the unit and builds a payload: one spelling of the refusal, and the
+# builds a payload: one spelling of the refusal, and the
 # only preflight that needs neither.
 result=$(deploy unit --speech-preflight)
 assert_status "the preflight alone refuses with the run's own code" 10 \
@@ -2237,7 +2287,7 @@ assert_contains "the configuration is checked before any device is touched" "$ra
 assert_contains "the checker is built in the default configuration" "$ran" \
 	"bazel build -- //crates/reachy-host:reachy_host"
 assert_contains "the bus question, the pipeline's preflights and the launcher are one invocation" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8000/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8001/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/scratch/logs/launch && mkdir -p -- /run/brenn-app/scratch/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/scratch/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/scratch/logs/launch; rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; curl -sS --max-time 5 -o /dev/null http://speaches.example:8000/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8001/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; rm -rf -- /run/brenn-app/scratch/logs/launch && mkdir -p -- /run/brenn-app/scratch/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/scratch/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; ./simplelaunch robotcpu.textproto --logdir /run/brenn-app/scratch/logs/launch; rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
 assert_contains "the run gets a pty, so a ^C reaches the unit" "$ran" \
 	"ssh -t -o BatchMode=yes root@unit"
 # The voice host's console reaches the operator while the run is happening, not
@@ -2381,73 +2431,12 @@ assert_contains "and says the configuration went unchecked" "$(output_of "$resul
 assert_lacks "and nothing reaches the device either" "$(calls)" "ssh -t"
 BAZEL_BUILD_STATUS=0
 
-# The unit's two preflights, each answered by the code the chain emits for it.
-SSH_RUN_STATUS=12
-# The assembly configuration this run was built from, so the refusal can be
-# checked against the real path rather than against a placeholder.
-mkdir -p -- "${work}/assembly"
-cp -- "${payload}/host/speech.toml" "${work}/assembly/speech.toml"
-REACHY_SPEECH_CONFIG="${work}/assembly/speech.toml"
-export REACHY_SPEECH_CONFIG
-result=$(deploy_tty unit --speech "${work}/speech-noaudioconf")
-assert_status "a unit with no link credentials refuses" 1 "$(status_of "$result")"
-assert_contains "the refusal names the file" "$(output_of "$result")" \
-	"/run/brenn-app/conf/audio.conf"
-# The lead is the target that writes the file for you. Reaching this refusal at
-# all means either this script was invoked directly or the unit lost its tmpfs
-# since the provisioning ran, and the first is far the likelier — so the remedy
-# offered first is the one command that covers both.
-assert_contains "and leads with the target that provisions it" "$(output_of "$result")" \
-	"make speech-run"
-assert_contains "and the other repo's command that writes it" "$(output_of "$result")" \
-	"make -C firmware reachy-provision"
-assert_contains "and says the pod would have parked silently" "$(output_of "$result")" \
-	"park silently"
-# The flag is required for a loopback listen address; without it in the
-# message the operator hits a second refusal.
-assert_contains "and the opt-in that command needs for an on-unit host" \
-	"$(output_of "$result")" "ON_UNIT=1"
-# A command the operator must edit before running is one more thing to get wrong
-# while already blocked, so the configuration this run knows about is in it —
-# quoted, because it is pasted as it stands and a path with a space in it splits
-# into two arguments the other repo's make cannot read.
-assert_contains "and the configuration to point that command at" \
-	"$(output_of "$result")" "SPEECH_CONFIG=\"${work}/assembly/speech.toml\""
-# And the unit, which needs no confirming dance — this refusal came from it.
-# Omitted, the remediation command may target a different unit, and this one
-# refuses again identically.
-assert_contains "and the unit the command has to provision" \
-	"$(output_of "$result")" "REACHY_HOST=unit"
-assert_lacks "and nothing is fetched from a run that never started" "$(calls)" "rsync"
-
-# The variable is read here, at deploy time; the payload was staged by an
-# earlier build. A named configuration that is not the one the payload carries
-# is not named at all: provisioning from it derives the pod's address and key
-# from a file the host never loads, and the next run composes and sits deaf —
-# the failure this refusal exists to head off, arriving by the refusal's own
-# advice.
-cp -- "${work}/assembly/speech.toml" "${work}/assembly/other.toml"
-printf 'ident = "somewhere else"\n' >>"${work}/assembly/other.toml"
-REACHY_SPEECH_CONFIG="${work}/assembly/other.toml"
-result=$(deploy_tty unit --speech "${work}/speech-otherconfig")
-assert_lacks "a configuration that is not the payload's is not handed back" \
-	"$(output_of "$result")" "other.toml"
-assert_contains "the placeholder goes back in instead" "$(output_of "$result")" \
-	"SPEECH_CONFIG=\"<assembly>/speech.toml\""
-assert_contains "and says why the path is the operator's to supply" \
-	"$(output_of "$result")" "could not confirm"
-unset REACHY_SPEECH_CONFIG
-
-# The same with the variable unset: the default is this tree's gitignored
-# host/speech.toml, which a payload built elsewhere has nothing to do with and
-# which need not exist at all. Naming a file that is not there is a second dead
-# end at the one moment the message is meant to unblock somebody.
-result=$(deploy_tty unit --speech "${work}/speech-defaultconfig")
-assert_contains "an unnamed configuration is the placeholder too" \
-	"$(output_of "$result")" "SPEECH_CONFIG=\"<assembly>/speech.toml\""
-assert_lacks "and this tree's default is not passed off as the payload's" \
-	"$(output_of "$result")" "${repo}/host/speech.toml"
-
+# The unit's preflight, answered by the code the chain emits for it. The chain
+# asks nothing about the pod's link: that file is a payload member the build
+# composes, covered by the payload digest.
+assert_lacks "the chain probes nothing under the unit's conf directory" "$ran" \
+	"/run/brenn-app/conf"
+assert_lacks "and emits no code for a missing link" "$ran" "exit 12"
 SSH_RUN_STATUS=13
 result=$(deploy_tty unit --speech "${work}/speech-unreachable")
 assert_status "a speech service the robot cannot reach refuses" 1 "$(status_of "$result")"
@@ -2590,8 +2579,8 @@ TOML
 result=$(deploy_tty unit --speech "${work}/speech-noservices")
 assert_status "a configuration naming no services runs" 0 "$(status_of "$result")"
 assert_lacks "and the unit is asked to reach nothing" "$(calls)" "curl"
-assert_contains "while the link credentials are still asked about" "$(calls)" \
-	"[ -s /run/brenn-app/conf/audio.conf ]"
+assert_lacks "nor about a link file outside the payload" "$(calls)" \
+	"/run/brenn-app/conf"
 
 # A configuration whose endpoint is not one this can pass on: the value is
 # pasted into a command run on the unit as root, so it is refused where it is
@@ -2716,8 +2705,8 @@ assert_contains "and names the one knob both payloads read" "$(output_of "$resul
 assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
 stage_record_configs
 
-# The pod is provisioned from the site's configuration and the session's voice
-# host loads its own, so a pair that disagrees about the address or the key table
+# The pod's link is composed from the site's configuration and the session's
+# voice host loads its own, so a pair that disagrees about the address or the key table
 # is a session with no microphone — refused here, by name, rather than found out
 # by a person with both hands on the head.
 for key in listen_addr pod_psk_file; do
@@ -2831,8 +2820,8 @@ assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
 cp -- "${script_dir}/deploy-motion.sh" "$subject"
 
 # A payload carrying no site configuration is asked nothing about agreement:
-# there is nothing to disagree with, and the pod on such a unit was provisioned
-# from a file this deploy cannot see.
+# there is nothing to disagree with, and the build composed the pod's link on
+# such a payload from the recording configuration itself.
 rm -f -- "${payload}/host/speech.toml"
 result=$(deploy_tty unit --record "${work}/record-nosite")
 assert_status "a recording session with no site configuration beside it still runs" 0 \
@@ -2841,7 +2830,7 @@ stage_speech_config
 
 # This suite's stdin is a pipe, and a recording session is ended by the
 # operator's ^C too: one spelling of the refusal, asked by the run and asked
-# alone by `make pose-record` before it provisions and builds.
+# alone by `make pose-record` before it builds.
 result=$(deploy unit --record "${work}/record-notty")
 assert_status "a recording session with no terminal refuses with the speech run's code" 10 \
 	"$(status_of "$result")"
@@ -2856,8 +2845,8 @@ assert_lacks "and nothing reaches the device" "$(calls)" "ssh"
 assert_lacks "and nothing is built" "$(calls)" "bazel"
 
 # The three refusals a first recording session is likeliest to hit are asked of
-# the operator's own files here, before `make pose-record` provisions the unit
-# and cross-builds a payload: told after the build, an operator who has not
+# the operator's own files here, before `make pose-record` cross-builds a
+# payload: told after the build, an operator who has not
 # written `speech-record.toml` yet pays for the whole build twice.
 record_source="${repo}/host/speech-record.toml"
 bench_source="${repo}/.local/reachy-bench.toml"
@@ -2904,7 +2893,7 @@ assert_lacks "and nothing is built" "$(calls)" "bazel"
 stage_record_sources
 
 # The agreement, over the same pair of files the operator edits. The site file
-# is what the pod is provisioned from, so a preflight run in a tree that has
+# is what the pod's link is composed from, so a preflight run in a tree that has
 # none is asked nothing.
 result=$(deploy_tty unit --record-preflight)
 assert_status "with no site configuration in the tree the preflight asks nothing about agreement" 0 \
@@ -2944,7 +2933,7 @@ assert_contains "the session's own configuration is what is checked" "$ran" \
 assert_lacks "and not the site's, which no host in this composition loads" "$ran" \
 	"--speech-config host/speech.toml"
 assert_contains "the chain asks the robot for the recording pipeline's own endpoints, starts the recording config and tails both consoles" "$ran" \
-	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_record.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; [ -s /run/brenn-app/conf/audio.conf ] || exit 12; curl -sS --max-time 5 -o /dev/null http://speaches.example:8100/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8101/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/host || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; cp -- /run/brenn-app/releases/motion/host/speech-record.toml /run/brenn-app/logs/testing/config/host/speech-record.toml || exit 7; rm -rf -- /run/brenn-app/scratch/logs/launch && mkdir -p -- /run/brenn-app/scratch/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/scratch/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; tail -F /run/brenn-app/scratch/logs/launch/recorder_0.log 2>/dev/null & tail_pids=\"\$tail_pids \$!\"; ./simplelaunch robotcpu_record.textproto --logdir /run/brenn-app/scratch/logs/launch; rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
+	"systemctl is-active --quiet brenn-app.service && exit 3; systemctl is-active --quiet reachy-motiond.service && exit 4; [ -f /run/brenn-app/releases/motion/robotcpu_record.textproto ] || exit 8; [ -f /run/brenn-app/releases/motion/provenance.txt ] || exit 5; curl -sS --max-time 5 -o /dev/null http://speaches.example:8100/v1/models || exit 13; curl -sS --max-time 5 -o /dev/null http://speaches.example:8101/v1/models || exit 13; cp -- /run/brenn-app/releases/motion/provenance.txt /run/brenn-app/motion-provenance.staged || exit 6; rm -rf -- /run/brenn-app/logs/testing && mkdir -p -- /run/brenn-app/logs/testing || exit 7; mv -- /run/brenn-app/motion-provenance.staged /run/brenn-app/logs/testing/provenance.txt || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/cogs || exit 7; mkdir -p -- /run/brenn-app/logs/testing/config/host || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_profile.textproto /run/brenn-app/logs/testing/config/cogs/servo_profile.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/servo_gains.textproto /run/brenn-app/logs/testing/config/cogs/servo_gains.textproto || exit 7; cp -- /run/brenn-app/releases/motion/cogs/mover_params.textproto /run/brenn-app/logs/testing/config/cogs/mover_params.textproto || exit 7; cp -- /run/brenn-app/releases/motion/host/speech-record.toml /run/brenn-app/logs/testing/config/host/speech-record.toml || exit 7; rm -rf -- /run/brenn-app/scratch/logs/launch && mkdir -p -- /run/brenn-app/scratch/logs/launch || exit 7; cd /run/brenn-app/releases/motion || exit 7; echo ---brenn-launcher-starting; tail -F /run/brenn-app/scratch/logs/launch/voice_host_0.log 2>/dev/null & tail_pids=\$!; tail -F /run/brenn-app/scratch/logs/launch/recorder_0.log 2>/dev/null & tail_pids=\"\$tail_pids \$!\"; ./simplelaunch robotcpu_record.textproto --logdir /run/brenn-app/scratch/logs/launch; rc=\$?; kill \$tail_pids 2>/dev/null; exit \$rc"
 # The recorder's console is the pose stream itself, so a session that cannot
 # tail it is one where a refused recorder — a torqued servo, a busy port — is
 # invisible until the fetch. Both tails, and one kill covering both.
@@ -3443,13 +3432,21 @@ assert_contains "and says how it is used" "$(output_of "$result")" "usage:"
 
 rc_codes=$(grep -o '^rc_[a-z_]*=[0-9]*' -- "${script_dir}/deploy-motion.sh" | cut -d= -f2)
 assert_eq "every exit code in the table is distinct" "" "$(sort <<<"$rc_codes" | uniq -d)"
-for code in 17 18; do
+for code in 17 18 19; do
 	assert_contains "the table assigns ${code}" $'\n'"${rc_codes}"$'\n' $'\n'"${code}"$'\n'
 done
+assert_lacks "and no code for a link file the payload now carries" \
+	"$(cat -- "${script_dir}/deploy-motion.sh")" "rc_no_audio_conf"
 for code in 3 4 255 124 125 126 127 137; do
 	assert_lacks "the table misses ${code}, which is someone else's" \
 		$'\n'"${rc_codes}"$'\n' $'\n'"${code}"$'\n'
 done
+
+# The staged host configuration names the pod the payload's link key is filed
+# under; the test host is `unit`, and so is its hostname.
+staged_params="${payload}/host/host_params.textproto"
+mkdir -p -- "${payload}/host"
+printf 'pod: "unit"\n' >"$staged_params"
 
 result=$(deploy unit --resync)
 assert_status "a resync on a free unit succeeds" 0 "$(status_of "$result")"
@@ -3464,6 +3461,21 @@ assert_contains "it asks the boot fetch's state" "$resync_line" \
 assert_contains "and refuses while it is retrying" "$resync_line" "activating"
 assert_contains "with its own code" "$resync_line" "exit 17"
 assert_contains "it runs the unit's resync" "$resync_line" "brenn-app-resync || exit 18"
+# The unit's hostname is the pod's TLS-PSK identity and the name scripts are
+# addressed to, so a payload built for another name is refused before anything
+# is installed.
+# The remote command's own text, quoted so this shell leaves it alone.
+# shellcheck disable=SC2016
+hostname_check='[ "$(cat /proc/sys/kernel/hostname)" = unit ] || exit 19'
+assert_contains "it holds the unit's hostname to the staged pod" "$resync_line" \
+	"$hostname_check"
+hostname_at=${resync_line%%"$hostname_check"*}
+resync_at=${resync_line%%"brenn-app-resync"*}
+if [ "${#hostname_at}" -lt "${#resync_at}" ]; then
+	pass "before anything is resynced"
+else
+	fail "before anything is resynced" "in: ${resync_line}"
+fi
 assert_lacks "an active brenn-app.service is not refused" "$resync_line" "brenn-app.service && exit 3"
 assert_lacks "nothing is streamed" "$resync_line" "tar "
 assert_lacks "no archive is named" "$resync_line" "payload.tar.zst"
@@ -3487,6 +3499,13 @@ result=$(deploy unit --resync)
 assert_status "a failed unit resync is refused" 1 "$(status_of "$result")"
 assert_contains "and names the unit's resync" "$(output_of "$result")" "brenn-app-resync on unit failed"
 assert_contains "and says nothing changed" "$(output_of "$result")" "still runs what it ran before"
+SSH_PREPARE_STATUS=19
+result=$(deploy unit --resync)
+assert_status "a unit whose hostname is not the staged pod is refused" 1 "$(status_of "$result")"
+for needle in "unit's hostname is not unit" "nothing was resynced" "make motion-release" "This build files"; do
+	assert_contains "and says so: ${needle}" "$(output_of "$result")" "$needle"
+done
+SSH_PREPARE_STATUS=0
 SSH_PREPARE_STATUS=255
 result=$(deploy unit --resync)
 assert_status "an unreachable unit is refused" 1 "$(status_of "$result")"
@@ -3499,6 +3518,22 @@ SSH_PREPARE_STATUS=0
 result=$(deploy unit --resync extra)
 assert_status "a resync takes no arguments" 1 "$(status_of "$result")"
 assert_contains "and says how it is used" "$(output_of "$result")" "usage:"
+assert_lacks "and reaches no unit" "$(calls)" "ssh"
+
+printf 'pod: "bad name"\n' >"$staged_params"
+result=$(deploy unit --resync)
+assert_status "a staged pod that is not a plain name is refused" 1 "$(status_of "$result")"
+assert_contains "by the screen every pasted value goes through" "$(output_of "$result")" \
+	"which is not a plain path or name"
+assert_lacks "and reaches no unit" "$(calls)" "ssh"
+
+rm -f -- "$staged_params"
+result=$(deploy unit --resync)
+assert_status "a payload with no staged host configuration is refused" 1 "$(status_of "$result")"
+assert_contains "saying so" "$(output_of "$result")" "no staged host configuration"
+assert_contains "and how to stage one" "$(output_of "$result")" "make motion-build"
+assert_contains "and names what the check compares" "$(output_of "$result")" "this build's host configuration"
+assert_lacks "and does not claim a resync installs this build" "$(output_of "$result")" "packed from this build"
 assert_lacks "and reaches no unit" "$(calls)" "ssh"
 
 # ---------------------------------------------------------------------------

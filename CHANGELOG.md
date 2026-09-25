@@ -11,6 +11,15 @@ Nothing has been released.
 
 ### Added
 
+- **A power-cycled unit hears without being provisioned.** The motion payload
+  (the bundle a unit fetches and runs) now carries the audio device's link
+  configuration, `conf/audio.conf`, built from the speech configuration, and
+  the audio device is started pointing at it. The separate provisioning step,
+  `make speech-provision`, is gone.
+- **The robot can answer when speech recognition is unreachable.** A speech
+  configuration may name an offline reply clip, `[stt] unreachable_clip`; the
+  build stages it beside the configuration and a push refuses a payload
+  missing it or holding a stale copy.
 - **The robot dances between conversations.** The voice host now runs an
   *idle loop*: while nobody is speaking it plays clips from a committed
   playlist, `cogs/idle.json`, handing each one off to the next just before it
@@ -28,6 +37,8 @@ Nothing has been released.
   checks the loop's handoffs, refusals and gaps in the sample stream.
   `speech_run_report` now separates the loop's scripts from speech's before it
   judges anything.
+- **`--resync` refuses a unit whose hostname is not the staged host
+  configuration's `pod`** (exit 19).
 
 ### Changed
 
@@ -95,6 +106,22 @@ Nothing has been released.
   motion through a reply, and withhold a stow while one plays. The
   re-resolution moved `cc` 1.4.6 to 1.4.7, `find-msvc-tools` 0.1.12 to
   0.1.13, and `unicode-ident` 1.0.25 to 1.0.26.
+
+- **The brenn-pod pin advances to `17cd3ff`.** The audio device takes
+  `run --config PATH`, which the launcher uses to name the payload's
+  `conf/audio.conf`. The voice host accepts `[stt] unreachable_clip`, a clip
+  it plays as a closed turn when a wake's transcription fails, and it refuses
+  to start over a missing or non-conforming clip. `reachy_host --check` now
+  reports a clip the payload does not carry. The re-resolution moved `cc`
+  1.4.7 to 1.5.1, `find-msvc-tools` 0.1.13 to 0.1.14, `glam` 0.33.7 to
+  0.33.10, `hmac-sha256` 1.1.14 to 1.1.15, `hyper-util` 0.1.20 to 0.1.21,
+  `smallvec` 1.16.1 to 1.16.2, `thiserror` and `thiserror-impl` 2.0.20 to
+  2.0.21, and `zerocopy` and `zerocopy-derive` 0.8.57 to 0.8.59.
+
+### Removed
+
+- **`make speech-provision`, `tools/provision-speech.sh`, and the speech run's
+  exit 12.** The audio device's link now travels in the payload.
 
 ### Added
 

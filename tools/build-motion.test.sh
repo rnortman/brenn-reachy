@@ -46,7 +46,8 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 repo="${work}/repo"
 mkdir -p -- "${repo}/tools" "${repo}/cogs" "${repo}/driver" "${repo}/host"
-cp -- "${script_dir}/build-motion.sh" "${script_dir}/lib.sh" "${script_dir}/payload-run.sh" "${repo}/tools/"
+cp -- "${script_dir}/build-motion.sh" "${script_dir}/lib.sh" "${script_dir}/payload-run.sh" \
+	"${script_dir}/pod-conf.sh" "${repo}/tools/"
 
 subject="${repo}/tools/build-motion.sh"
 payload="${repo}/target/motion-arm64/release"
@@ -292,6 +293,8 @@ app {
   executable: "reachy_pod"
   args: "run"
   args: "--chip-rebooted"
+  args: "--config"
+  args: "conf/audio.conf"
 }
 pre_launch {
   name: "clockwork_prelaunch"
@@ -308,6 +311,10 @@ CONFIG
 		fi
 		if [ -n "${POD_BARE_RUN:-}" ]; then
 			sed -i '/args: "--chip-rebooted"/d' bazel-out/bin/robotcpu.textproto
+		fi
+		if [ -n "${POD_NO_LINK:-}" ]; then
+			sed -i -e '/args: "--config"/d' -e '/args: "conf\/audio.conf"/d' \
+				bazel-out/bin/robotcpu.textproto
 		fi
 		cat >bazel-out/bin/robotcpu_harness.textproto <<CONFIG
 app {
@@ -367,6 +374,8 @@ app {
   executable: "reachy_pod"
   args: "run"
   args: "--chip-rebooted"
+  args: "--config"
+  args: "conf/audio.conf"
 }
 pre_launch {
   name: "pod_reboot_chip"
@@ -625,6 +634,34 @@ stage_module_pin "$POD_GIT_HEAD"
 
 # A revision that is not the checkout's, for every case about two of them.
 other_rev=fedcba9876543210fedcba9876543210fedcba98
+
+# The fifth stub, and the other one standing in for brenn-pod: the writer that
+# composes the pod's link, at the path in the checkout the subject spells. It
+# prints what `--emit` prints -- the file, on stdout -- and, asked to, mints the
+# pod's key into the configuration's key table the way the real one files a
+# missing row, so a first build against a fresh assembly directory can be told
+# from a later one.
+writer_script="${work}/brenn-pod/firmware/tools/provision-reachy-pod.sh"
+export WRITER_STATUS=""
+export WRITER_MINTS=""
+cat >"$writer_script" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'writer %s\n' "$*" >>"$CALLS"
+[ -z "${WRITER_STATUS:-}" ] || {
+	echo "provision-reachy-pod.sh: stub refusal" >&2
+	exit "$WRITER_STATUS"
+}
+pod_id=$3
+config=$4
+table="$(dirname -- "$config")/secrets/pod-psk.toml"
+if [ -n "${WRITER_MINTS:-}" ] && [ ! -f "$table" ]; then
+	mkdir -p -- "$(dirname -- "$table")"
+	printf '"%s" = "minted"\n' "$pod_id" >"$table"
+fi
+printf 'ADDR=127.0.0.1:7380\nPSK=key-for-%s\n' "$pod_id"
+STUB
+chmod 0755 -- "$writer_script"
 
 build() {
 	: >"$CALLS"
@@ -1396,6 +1433,12 @@ assert_contains "and the report says the knob is why" "$(output_of "$result")" \
 	"REACHY_SPEECH_CONFIG=none"
 assert_contains "for both knobs" "$(output_of "$result")" \
 	"REACHY_RECORD_SPEECH_CONFIG=none"
+# With no speech configuration of either kind there is no link to compose, and
+# the writer is not looked for at all.
+assert_no_file "and no link for the audio device" "${payload}/conf/audio.conf"
+assert_contains "which the report says" "$(output_of "$result")" \
+	"conf/audio.conf  absent"
+assert_lacks "and the writer is never run" "$(calls)" "writer"
 unset REACHY_SPEECH_CONFIG REACHY_RECORD_SPEECH_CONFIG
 rm -rf -- "$speech_default" "${repo}/host/secrets" "${repo}/host/speech-record.toml"
 result=$(build)
@@ -1589,15 +1632,17 @@ assembly_config="${assembly}/speech.toml"
 # The whole assembly, rewritten by each case so a refusal leaves nothing behind
 # for the next one. `psk`, `token` and `model` are the payload-relative paths
 # the TOML names; an empty one leaves that key out of the file entirely, and an
-# absent third argument leaves out the `[wake]` table altogether.
+# absent third argument leaves out the `[wake]` table altogether. A fourth, the
+# offline clip, goes into the `[stt]` table when it is given.
 stage_assembly() {
-	local psk=$1 token=$2 model=${3:-}
+	local psk=$1 token=$2 model=${3:-} clip=${4:-}
 	rm -rf -- "$assembly"
 	mkdir -p -- "${assembly}/secrets"
 	{
 		printf 'listen_addr = "127.0.0.1:7380"\n'
 		[ -z "$psk" ] || printf 'pod_psk_file = "%s"\n' "$psk"
 		printf '\n[stt]\nurl = "http://speaches.example:8000"\n'
+		[ -z "$clip" ] || printf 'unreachable_clip = "%s"\n' "$clip"
 		if [ -n "$token" ]; then
 			printf '\n[brenn.bridge]\ntoken_file = "%s"\n' "$token"
 		fi
@@ -1624,6 +1669,13 @@ stage_wake_model() {
 	local at="${assembly}/$1"
 	mkdir -p -- "$(dirname -- "$at")"
 	printf 'an onnx graph\n' >"$at"
+}
+
+# The offline clip beside the configuration, for the same reason again.
+stage_clip() {
+	local at="${assembly}/$1"
+	mkdir -p -- "$(dirname -- "$at")"
+	printf 'a wav\n' >"$at"
 }
 
 REACHY_SPEECH_CONFIG="$assembly_config"
@@ -1711,7 +1763,8 @@ listing=$(cd -- "$payload" && find . -type f | sed 's|^\./||' | sort)
 fixed=$(sed -n '/^payload_fixed_members=(/,/^)/p' -- "${script_dir}/build-motion.sh" |
 	sed -e '1d' -e '$d' -e 's/^[[:space:]]*//' -e 's/"//g' \
 		-e "s|^\$build_commit_name\$|build-commit.txt|" \
-		-e "s|^\$speech_config_path\$|host/speech.toml|")
+		-e "s|^\$speech_config_path\$|host/speech.toml|" \
+		-e "s|^\$link_conf_path\$|conf/audio.conf|")
 unaccounted=""
 while read -r member; do
 	[ -n "$member" ] || continue
@@ -1726,6 +1779,159 @@ while read -r member; do
 done <<<"$listing"
 assert_eq "every payload member is one the site-file collision check knows about" \
 	"" "$unaccounted"
+
+# The audio device's link, composed by brenn-pod's writer from the same
+# configuration and staged beside it: the pod reads it through `--config`, so a
+# payload that carries it is a unit that hears from power with nobody
+# provisioning anything.
+assert_file "the pod's link is staged where the launcher names it" \
+	"${payload}/conf/audio.conf"
+assert_eq "readable by the payload's account and nobody else" 600 \
+	"$(stat -c %a -- "${payload}/conf/audio.conf")"
+assert_eq "and it is the writer's output, for the pod host_params names" \
+	"$(printf 'ADDR=127.0.0.1:7380\nPSK=key-for-example-reachy')" \
+	"$(cat -- "${payload}/conf/audio.conf")"
+assert_contains "composed on-unit, to stdout, from the staged configuration" "$(calls)" \
+	"writer --on-unit --emit example-reachy ${assembly}/speech.toml"
+assert_contains "and the report says for whom" "$(output_of "$result")" \
+	"conf/audio.conf  staged for example-reachy"
+assert_no_file "and the composition's scratch file is gone" "${payload}.audio.conf"
+
+# The pod id is the operator's host configuration's, read from the source file.
+cp -- "$host_params_default" "${host_params_default}.aside"
+printf 'pod: "reachy07"\n' >"$host_params_default"
+result=$(build)
+assert_status "a build for another pod succeeds" 0 "$(status_of "$result")"
+assert_contains "and composes for that pod" "$(calls)" \
+	"writer --on-unit --emit reachy07 ${assembly}/speech.toml"
+assert_eq "whose key the link carries" \
+	"$(printf 'ADDR=127.0.0.1:7380\nPSK=key-for-reachy07')" \
+	"$(cat -- "${payload}/conf/audio.conf")"
+mv -- "${host_params_default}.aside" "$host_params_default"
+
+# With only the recording session's configuration staged, the link is composed
+# from that: it is the payload's speech source.
+link_record="${work}/link-record/speech-record.toml"
+mkdir -p -- "$(dirname -- "$link_record")"
+printf 'listen_addr = "127.0.0.1:7380"\n' >"$link_record"
+result=$(REACHY_SPEECH_CONFIG=none REACHY_RECORD_SPEECH_CONFIG="$link_record" build)
+assert_status "a build with only a recording configuration succeeds" 0 \
+	"$(status_of "$result")"
+assert_contains "and composes the link from it" "$(calls)" \
+	"writer --on-unit --emit example-reachy ${link_record}"
+assert_contains "which the report names" "$(output_of "$result")" \
+	"conf/audio.conf  staged for example-reachy from ${link_record}"
+assert_file "and the link is staged" "${payload}/conf/audio.conf"
+rm -rf -- "$(dirname -- "$link_record")"
+
+# A record-only build stages every file the recording configuration names from
+# beside it: the key table the link was composed with, the wake head and the
+# offline clip the host loads at startup.
+record_only_dir="${work}/record-only"
+record_only="${record_only_dir}/speech-record.toml"
+write_record_only() {
+	mkdir -p -- "$record_only_dir"
+	printf '%s\n' \
+		'listen_addr = "127.0.0.1:7380"' \
+		'pod_psk_file = "secrets/pod-psk.toml"' \
+		'[stt]' \
+		'url = "http://speaches.example:8000"' \
+		"unreachable_clip = \"$1\"" \
+		'[wake]' \
+		'mode = "oww"' \
+		'phrase = "hey cogsworth"' \
+		'model = "models/wake/head.onnx"' >"$record_only"
+	mkdir -p -- "${record_only_dir}/models/wake" "${record_only_dir}/clips"
+	printf 'head\n' >"${record_only_dir}/models/wake/head.onnx"
+	printf 'clip\n' >"${record_only_dir}/clips/offline.wav"
+}
+write_record_only clips/offline.wav
+result=$(WRITER_MINTS=1 REACHY_SPEECH_CONFIG=none \
+	REACHY_RECORD_SPEECH_CONFIG="$record_only" build)
+assert_status "a record-only build naming its own site files succeeds" 0 \
+	"$(status_of "$result")"
+assert_file "and stages the key table beside the recording configuration" \
+	"${payload}/secrets/pod-psk.toml"
+assert_eq "readable by the payload's account and nobody else" 600 \
+	"$(stat -c %a -- "${payload}/secrets/pod-psk.toml")"
+assert_eq "and it is the table the link was composed with, minted row and all" \
+	'"example-reachy" = "minted"' "$(cat -- "${payload}/secrets/pod-psk.toml")"
+assert_file "and the wake head it names" "${payload}/models/wake/head.onnx"
+assert_file "and the offline clip it names" "${payload}/clips/offline.wav"
+assert_contains "which the report names" "$(output_of "$result")" \
+	"clips/offline.wav  offline clip staged from ${record_only_dir}/clips/offline.wav"
+assert_contains "as it does the key table" "$(output_of "$result")" \
+	"secrets/pod-psk.toml  staged from ${record_only_dir}/secrets/pod-psk.toml"
+rm -rf -- "$record_only_dir"
+
+# A clip the recording configuration names and does not carry is refused in
+# that configuration's name, before anything is staged.
+write_record_only clips/missing.wav
+mark_payload
+result=$(WRITER_MINTS=1 REACHY_SPEECH_CONFIG=none \
+	REACHY_RECORD_SPEECH_CONFIG="$record_only" build)
+assert_status "a record-only build naming a missing clip refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "naming the recording configuration it read" "$(output_of "$result")" \
+	"${record_only_dir}/speech-record.toml names unreachable_clip = clips/missing.wav"
+assert_unstaged "and stages nothing"
+rm -rf -- "$record_only_dir"
+
+# A speech build with no writer in the brenn-pod checkout is refused in this
+# repository's words: REACHY_POD_BINARY names a binary, not the checkout.
+mark_payload
+mv -- "$writer_script" "${writer_script}.aside"
+result=$(build)
+assert_status "a speech build with no writer refuses" 1 "$(status_of "$result")"
+assert_contains "naming the writer it looked for" "$(output_of "$result")" \
+	"provision-reachy-pod.sh"
+assert_contains "and the knob that moves it" "$(output_of "$result")" "BRENN_POD_DIR"
+assert_unstaged "and stages nothing"
+result=$(REACHY_SPEECH_CONFIG=none build)
+assert_status "while a build with no speech configuration needs no writer" 0 \
+	"$(status_of "$result")"
+mv -- "${writer_script}.aside" "$writer_script"
+result=$(build)
+assert_status "and with the writer back the speech build is too" 0 "$(status_of "$result")"
+
+# The writer refusing is this build's refusal, and nothing is staged.
+mark_payload
+result=$(WRITER_STATUS=2 build)
+assert_status "a writer that refuses refuses the build" 1 "$(status_of "$result")"
+assert_contains "saying so" "$(output_of "$result")" "refused to compose"
+assert_unstaged "and stages nothing"
+
+# A first build against a fresh assembly directory: the table the configuration
+# names does not exist until the writer files the pod's key into it, so the
+# composition has to run before the credentials are resolved.
+stage_assembly secrets/pod-psk.toml ""
+result=$(WRITER_MINTS=1 build)
+assert_status "a first build with no key table yet succeeds" 0 "$(status_of "$result")"
+assert_file "and stages the table the writer filed the key into" \
+	"${payload}/secrets/pod-psk.toml"
+assert_eq "which is the minted one" '"example-reachy" = "minted"' \
+	"$(cat -- "${payload}/secrets/pod-psk.toml")"
+
+# The link's path is a payload member's own, so no site file may land on it.
+mark_payload
+stage_assembly conf/audio.conf ""
+stage_credential conf/audio.conf
+result=$(build)
+assert_status "a credential over the pod's link refuses" 1 "$(status_of "$result")"
+assert_contains "as a payload member's own path" "$(output_of "$result")" \
+	"a payload member's own path"
+assert_unstaged "and stages nothing"
+
+# The launcher has to hand the pod its link, or the pod waits for a file at its
+# compiled-in path that nothing on a Reachy writes.
+mark_payload
+stage_assembly secrets/pod-psk.toml ""
+stage_credential secrets/pod-psk.toml
+result=$(POD_NO_LINK=1 build)
+assert_status "a production pod started without its link refuses" 1 "$(status_of "$result")"
+assert_contains "naming how it starts the pod" "$(output_of "$result")" "starts the pod as"
+assert_contains "and what it should pass" "$(output_of "$result")" "--config conf/audio.conf"
+assert_unstaged "and stages nothing"
 
 # A configuration with no [brenn.bridge] is a voiced, bus-less pipeline. Legal,
 # and the payload carries no token: the host composes without alerts.
@@ -1961,17 +2167,19 @@ assert_contains "and the refusal is about wake models" "$(output_of "$result")" 
 	"the payload carries its own copy of every wake model"
 assert_unstaged "and stages nothing"
 
-# The head the build stages is the site configuration's, and the recording
-# configuration is not read for it. That configuration names its own
-# `[wake] model` and is held equal to the site's by the push; reading both here
-# would be a second staging path and a collision case nobody needs.
-stage_assembly secrets/pod-psk.toml "" models/wake/head.onnx
+# When both are staged, the site's configuration is the speech source: its head
+# and clip are staged, and the recording configuration is not read for either.
+# The push holds the recording configuration's head to the site's, and
+# `--check` refuses a staged recording configuration naming a file the payload
+# does not carry.
+stage_assembly secrets/pod-psk.toml "" models/wake/head.onnx clips/offline.wav
 stage_credential secrets/pod-psk.toml
 stage_wake_model models/wake/head.onnx
+stage_clip clips/offline.wav
 record_assembly="${work}/record-assembly"
 rm -rf -- "$record_assembly"
 mkdir -p -- "$record_assembly"
-printf 'listen_addr = "127.0.0.1:7380"\n\n[wake]\nmode = "oww"\nphrase = "hey cogsworth"\nmodel = "models/wake/other.onnx"\n' \
+printf 'listen_addr = "127.0.0.1:7380"\n\n[wake]\nmode = "oww"\nphrase = "hey cogsworth"\nmodel = "models/wake/other.onnx"\n\n[stt]\nunreachable_clip = "clips/other.wav"\n' \
 	>"${record_assembly}/speech-record.toml"
 REACHY_RECORD_SPEECH_CONFIG="${record_assembly}/speech-record.toml"
 export REACHY_RECORD_SPEECH_CONFIG
@@ -1981,6 +2189,8 @@ assert_status "a recording configuration naming its own head does not refuse the
 assert_file "the site configuration's head is staged" "${payload}/models/wake/head.onnx"
 assert_no_file "and the recording configuration's is not" \
 	"${payload}/models/wake/other.onnx"
+assert_file "the site configuration's clip is staged" "${payload}/clips/offline.wav"
+assert_no_file "nor the recording configuration's clip" "${payload}/clips/other.wav"
 unset REACHY_RECORD_SPEECH_CONFIG
 
 # `models/wake/` is a convention and nothing enforces it: the checks are about
@@ -1994,6 +2204,63 @@ result=$(build)
 assert_status "a head outside models/ stages as readily" 0 "$(status_of "$result")"
 assert_file "at the path the configuration spells" "${payload}/wake/head.onnx"
 assert_no_file "and nowhere else" "${payload}/models/wake/head.onnx"
+
+# ---------------------------------------------------------------------------
+# The offline clip that configuration names
+# ---------------------------------------------------------------------------
+#
+# The line the host speaks when a wake's transcription fails. It travels as the
+# wake head does, on its own key list and in its own noun, so a refusal about
+# it sends the operator to the `[stt]` line and not to the head.
+
+stage_assembly secrets/pod-psk.toml "" models/wake/head.onnx clips/offline.wav
+stage_credential secrets/pod-psk.toml
+stage_wake_model models/wake/head.onnx
+stage_clip clips/offline.wav
+result=$(build)
+assert_status "a build with an offline clip succeeds" 0 "$(status_of "$result")"
+assert_file "the clip lands where the configuration names it" \
+	"${payload}/clips/offline.wav"
+assert_eq "at the mode content carries" 644 \
+	"$(stat -c %a -- "${payload}/clips/offline.wav")"
+assert_contains "and the report names it as the offline clip, with its digest" \
+	"$(output_of "$result")" \
+	"clips/offline.wav  offline clip staged from ${assembly}/clips/offline.wav  $(sha256sum -- "${payload}/clips/offline.wav" | cut -d' ' -f1)"
+
+mark_payload
+stage_assembly secrets/pod-psk.toml "" "" clips/offline.wav
+stage_credential secrets/pod-psk.toml
+result=$(build)
+assert_status "a named clip that is not beside the configuration refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "the refusal names the key and its value" "$(output_of "$result")" \
+	"unreachable_clip = clips/offline.wav"
+assert_contains "and the path it looked at" "$(output_of "$result")" \
+	"${assembly}/clips/offline.wav"
+assert_contains "and says what the clip is for" "$(output_of "$result")" \
+	"the line this machine speaks when its transcriber is"
+assert_unstaged "and stages nothing"
+
+mark_payload
+stage_assembly secrets/pod-psk.toml "" "" models/silero/silero_vad.onnx
+stage_credential secrets/pod-psk.toml
+stage_clip models/silero/silero_vad.onnx
+result=$(build)
+assert_status "a clip over a fetched model refuses" 1 "$(status_of "$result")"
+assert_contains "and says it is the clip that would land there" \
+	"$(output_of "$result")" "The offline clip would be installed over"
+assert_unstaged "and stages nothing"
+
+mark_payload
+stage_assembly secrets/pod-psk.toml "" models/wake/head.onnx models/wake/head.onnx
+stage_credential secrets/pod-psk.toml
+stage_wake_model models/wake/head.onnx
+result=$(build)
+assert_status "a clip named at the wake head's path refuses" 1 "$(status_of "$result")"
+assert_contains "as a collision" "$(output_of "$result")" "a payload member's own path"
+assert_contains "naming the clip as what would land there" "$(output_of "$result")" \
+	"The offline clip would be installed over"
+assert_unstaged "and stages nothing"
 
 # Back to the ordinary case, so what follows builds against a payload with no
 # speech configuration at all.
@@ -2516,9 +2783,9 @@ done
 
 deploy_src=$(cat -- "${real_repo}/tools/deploy-motion.sh")
 for code in rc_no_speech_config:9 rc_no_tty:10 rc_check_refused:11 \
-	rc_no_audio_conf:12 rc_service_unreachable:13 rc_no_record_config:14 \
+	rc_service_unreachable:13 rc_no_record_config:14 \
 	rc_no_bench_config:15 rc_record_config_disagreement:16 \
-	rc_fetch_in_flight:17 rc_resync_failed:18; do
+	rc_fetch_in_flight:17 rc_resync_failed:18 rc_pod_not_hostname:19; do
 	name=${code%%:*}
 	number=${code#*:}
 	assert_contains "${name} is still ${number} in the deploy script" "$deploy_src" \
@@ -2526,6 +2793,10 @@ for code in rc_no_speech_config:9 rc_no_tty:10 rc_check_refused:11 \
 	assert_contains "and the runbook tabulates ${number}" "$runbook" \
 		"- **${number}** —"
 done
+# 12 is retired: it stays unassigned rather than reused.
+assert_lacks "the runbook tabulates no 12" "$runbook" "- **12** —"
+assert_lacks "and the deploy script has no code for a link it cannot see" \
+	"$deploy_src" "rc_no_audio_conf"
 assert_contains "the runbook names the speech run's section" "$runbook" \
 	"## The speech run"
 assert_contains "and the recording session's" "$runbook" \
@@ -2536,74 +2807,51 @@ assert_contains "and the fetch that recovers its records" "$runbook" \
 assert_contains "and the assembly directory's payload-relative naming" "$runbook" \
 	"pod_psk_file"
 
-# The provisioning step, which no operator types and which therefore has to be
-# ordered by the Makefile rather than by a runbook sentence. On a first run
-# against a fresh assembly directory, provisioning is what writes the PSK table
-# the build then stages, so a build that ran first would refuse a
-# named-but-missing credential — and prerequisites are unordered under `-j`,
-# where two recipe lines are not.
+# The pod's link is composed by the build, so neither recipe runs a step of
+# its own for it. The push is a recipe line rather than a prerequisite,
+# because recipe lines are ordered where prerequisites are not under `-j`.
 speech_recipe=$(sed -n '/^speech-run:/,/^$/p' -- "${real_repo}/Makefile")
 # Make syntax, quoted so this shell leaves it alone.
 # shellcheck disable=SC2016
-provision_step='$(MAKE) speech-provision'
-# shellcheck disable=SC2016
 deploy_step='$(MAKE) motion-deploy'
-assert_contains "speech-run provisions the pod's half of the link" \
-	"$speech_recipe" "$provision_step"
+assert_lacks "speech-run runs no provisioning step" "$speech_recipe" "speech-provision"
 assert_contains "and pushes the payload" "$speech_recipe" "$deploy_step"
-for step in speech-provision motion-deploy; do
-	assert_lacks "with ${step} not left as a prerequisite, which -j may reorder" \
-		"${speech_recipe%%$'\n'*}" "$step"
-done
-provision_at=${speech_recipe%%"$provision_step"*}
+assert_lacks "with motion-deploy not left as a prerequisite, which -j may reorder" \
+	"${speech_recipe%%$'\n'*}" "motion-deploy"
 deploy_at=${speech_recipe%%"$deploy_step"*}
-if [ "${#provision_at}" -lt "${#deploy_at}" ]; then
-	pass "and provisions before it builds, which is what a first run needs"
-else
-	fail "and provisions before it builds, which is what a first run needs" \
-		"$speech_recipe"
-fi
 
 # And the cheapest refusal is the first thing asked. A stdin with no terminal
-# refuses the run whatever else is true, so it is asked before the provisioning
-# writes to the unit and before the build spends minutes on a payload nobody
-# will run.
+# refuses the run whatever else is true, so it is asked before the build spends
+# minutes on a payload nobody will run.
 preflight_step="--speech-preflight"
 assert_contains "speech-run asks the terminal question of its own" \
 	"$speech_recipe" "$preflight_step"
 preflight_at=${speech_recipe%%"$preflight_step"*}
-if [ "${#preflight_at}" -lt "${#provision_at}" ]; then
-	pass "and asks it before it touches the unit or builds anything"
+if [ "${#preflight_at}" -lt "${#deploy_at}" ]; then
+	pass "and asks it before it builds anything"
 else
-	fail "and asks it before it touches the unit or builds anything" \
-		"$speech_recipe"
+	fail "and asks it before it builds anything" "$speech_recipe"
 fi
 
-# `pose-record`'s recipe is `speech-run`'s, for the same reasons: the same
-# provisioning writes the PSK table the build stages, the terminal question is
-# the cheapest refusal there is, and recipe lines are ordered where prerequisites
-# are not under `-j`. Asserted separately rather than folded into the loop above,
-# because the two recipes are allowed to diverge and this is the join that says
-# they have not.
+# `pose-record`'s recipe is `speech-run`'s, for the same reasons: the terminal
+# question is the cheapest refusal there is, and recipe lines are ordered where
+# prerequisites are not under `-j`. Asserted separately rather than folded into
+# the case above, because the two recipes are allowed to diverge and this is the
+# join that says they have not.
 record_recipe=$(sed -n '/^pose-record:/,/^$/p' -- "${real_repo}/Makefile")
-assert_contains "pose-record provisions the pod's half of the link too" \
-	"$record_recipe" "$provision_step"
+assert_lacks "pose-record runs no provisioning step either" "$record_recipe" \
+	"speech-provision"
 assert_contains "and pushes the payload" "$record_recipe" "$deploy_step"
 assert_contains "and asks the terminal question of its own" "$record_recipe" \
 	"--record-preflight"
-for step in speech-provision motion-deploy; do
-	assert_lacks "with ${step} not left as a prerequisite here either" \
-		"${record_recipe%%$'\n'*}" "$step"
-done
-record_provision_at=${record_recipe%%"$provision_step"*}
+assert_lacks "with motion-deploy not left as a prerequisite here either" \
+	"${record_recipe%%$'\n'*}" "motion-deploy"
 record_deploy_at=${record_recipe%%"$deploy_step"*}
 record_preflight_at=${record_recipe%%"--record-preflight"*}
-if [ "${#record_preflight_at}" -lt "${#record_provision_at}" ] &&
-	[ "${#record_provision_at}" -lt "${#record_deploy_at}" ]; then
-	pass "in that order: the refusal, the provisioning, then the build"
+if [ "${#record_preflight_at}" -lt "${#record_deploy_at}" ]; then
+	pass "in that order: the refusal, then the build"
 else
-	fail "in that order: the refusal, the provisioning, then the build" \
-		"$record_recipe"
+	fail "in that order: the refusal, then the build" "$record_recipe"
 fi
 
 # The pack packs the operator's build, whatever `.local/reachy.conf` names. A
@@ -2657,29 +2905,21 @@ else
 	fail "in that order: pack, publish, resync" "$release_recipe"
 fi
 
-# The step `speech-run` delegates to, which is also a target of its own. Its
-# recipe is one line, and every part of that line is load-bearing: the shim is
-# where both refusals live, the host is what the other repository provisions,
-# and `device-host` is what refuses an unnamed one before the shim hands an
-# empty value across. A drop here surfaces only mid-run against hardware.
-provision_recipe=$(sed -n '/^speech-provision:/,/^$/p' -- "${real_repo}/Makefile")
-assert_contains "speech-provision runs this repo's shim" "$provision_recipe" \
-	"tools/provision-speech.sh"
-# shellcheck disable=SC2016
-assert_contains "and passes it the unit" "$provision_recipe" '$(REACHY_HOST)'
-assert_contains "and asks for a named unit first" "${provision_recipe%%$'\n'*}" \
-	"device-host"
-
 # The help text is where a person learns a target exists, and the runbook is
 # where they learn what it does: a target offered in one and absent from the
 # other is a command nobody can follow through.
 makefile_help=$(sed -n '/^help:/,/^$/p' -- "${real_repo}/Makefile")
-for target in speech-run speech-fetch speech-provision pose-record pose-fetch; do
+for target in speech-run speech-fetch pose-record pose-fetch; do
 	assert_contains "the help text offers make ${target}" "$makefile_help" \
 		"make ${target}"
 	assert_contains "and the runbook names make ${target}" "$runbook" \
 		"make ${target}"
 done
+# The link travels in the payload, so there is no target that pushes it.
+assert_lacks "the help text offers no speech-provision" "$makefile_help" "speech-provision"
+assert_lacks "and neither does the runbook" "$runbook" "speech-provision"
+assert_lacks "and the Makefile has no such target" \
+	"$(cat -- "${real_repo}/Makefile")" $'\nspeech-provision:'
 
 # The local configuration file, which is what lets a session type `make
 # speech-run` with no variables at all. The strings below are tripwires — cheap,
@@ -2715,8 +2955,8 @@ assert_contains "the speech configuration is exported to the scripts" \
 assert_contains "the host configuration is exported too" \
 	"$makefile_src" 'export REACHY_HOST_PARAMS'
 # The other repository's location: one knob for one physical fact, read by
-# `tools/lib.sh` for both the pod binary it stages and the provisioning it
-# invokes, and therefore exported like the speech configuration.
+# `tools/lib.sh` for both the pod binary it stages and the writer that composes
+# the pod's link, and therefore exported like the speech configuration.
 assert_contains "the brenn-pod checkout has a default" "$makefile_src" \
 	'BRENN_POD_DIR ?='
 assert_contains "and is exported to the scripts that read it" "$makefile_src" \

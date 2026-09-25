@@ -81,7 +81,7 @@ endif
 
 # The brenn-pod checkout, read for two things a speech run needs: the
 # audio-device binary, which the payload build compiles there and stages, and the
-# provisioning target that writes the pod's link credentials onto the unit. The
+# writer that composes the pod's half of the voice link into the payload. The
 # default is the sibling layout the two repos are worked on in.
 #
 # Exported for the same reason the speech configuration is: `tools/lib.sh` reads
@@ -122,8 +122,7 @@ help:
 	@echo "  make library-run     play every motion in the library on the unit and judge it"
 	@echo "  make motion-probe    play one motion (MOTION=...) on the unit and judge it"
 	@echo "  make motion-script SCRIPT=... [SETTLE_EVIDENCE=1]  rehearse one supplied script on the unit"
-	@echo "  make speech-run      provision, build, push, run the voice pipeline; ^C ends it"
-	@echo "  make speech-provision  the pod's link credentials alone, via brenn-pod"
+	@echo "  make speech-run      build, push, run the voice pipeline; ^C ends it"
 	@echo "  make speech-fetch    bring a speech run's records back, timestamped"
 	@echo "  make pose-record     de-torqued, hands on the head: record poses and speech"
 	@echo "  make pose-fetch      bring a recording session's streams back, timestamped"
@@ -613,7 +612,9 @@ motion-publish:
 # Have the unit fetch the published payload now and restart brenn-app.service
 # into it: no reboot, no flash. Refuses while the boot fetch is still retrying
 # (it installs the payload itself) or while reachy-motiond.service holds the
-# bus. The payload's `run` tours the library as `app` on start.
+# bus. The payload's `run` tours the library as `app` on start. Refuses a unit
+# whose hostname is not the pod this build's host configuration names, so it
+# needs a build.
 .PHONY: motion-resync
 motion-resync: device-host
 	tools/deploy-motion.sh $(REACHY_HOST) --resync
@@ -746,16 +747,7 @@ motion-fetch: device-host
 # of run it came off.
 SPEECH_RECORDS ?= .local/speech-logs
 
-# The pod's half of the voice link: brenn-pod's provisioning, invoked from here
-# with the arrangement a speech run implies. A real target an operator can run
-# alone, and the point of it is that nobody has to — `speech-run` runs it first,
-# every time. It is idempotent and cheap, and `audio.conf` lives on tmpfs, so a
-# rebooted unit is indistinguishable from a warm one at the prompt.
-.PHONY: speech-provision
-speech-provision: device-host
-	tools/provision-speech.sh $(REACHY_HOST)
-
-# Provision, build, push, preflight, run, fetch, judge. The preflights are the
+# Build, push, preflight, run, fetch, judge. The preflights are the
 # migration errors this arrangement invites — a speech configuration the payload
 # does not carry, one the host itself would refuse, a speech service the robot
 # cannot reach — and each is refused before the launcher starts rather than
@@ -764,22 +756,20 @@ speech-provision: device-host
 # Needs a reachable unit and bazel: the configuration check and the report both
 # run here.
 #
-# The steps are recipe lines rather than prerequisites, and their order is
-# load-bearing: on a first run against a fresh assembly directory, provisioning
-# is what *writes* the PSK table the build then stages, and a build that ran
-# first would refuse a named-but-missing credential. Make guarantees left-to-
-# right prerequisite execution only for a serial make — under `-j`, typed or
-# inherited through MAKEFLAGS, two prerequisites are independent goals that can
-# race — while recipe lines run in order under any `-j`.
+# The build composes the pod's half of the link from the same speech
+# configuration, and on a first run against a fresh assembly directory files the
+# pod's key into it.
 #
-# The terminal check leads, ahead of the provisioning that writes to the unit
-# and the build that takes minutes: a run started from something with no
-# terminal is refused whatever else happened, so it is refused before anything
-# else happens.
+# The steps are recipe lines rather than prerequisites because their order is
+# load-bearing, and recipe lines run in order under any `-j` where prerequisites
+# may race.
+#
+# The terminal check leads, ahead of the build that takes minutes: a run started
+# from something with no terminal is refused whatever else happened, so it is
+# refused before anything else happens.
 .PHONY: speech-run
 speech-run: device-host require-bazel
 	tools/deploy-motion.sh $(REACHY_HOST) --speech-preflight
-	$(MAKE) speech-provision
 	$(MAKE) motion-deploy
 	tools/deploy-motion.sh $(REACHY_HOST) --speech $(SPEECH_RECORDS)
 
@@ -812,16 +802,13 @@ speech-fetch: device-host
 # run it came off.
 POSE_RECORDS ?= .local/pose-sessions
 
-# Provision, build, push, preflight, record, fetch, analyze. The steps and their
-# order are `speech-run`'s, for `speech-run`'s reasons — the terminal check
-# leads because a session nobody can end is refused whatever else happened, and
-# provisioning precedes the build because on a fresh assembly directory it is
-# what writes the PSK table the build then stages.
+# Build, push, preflight, record, fetch, analyze. The steps and their order are
+# `speech-run`'s, for `speech-run`'s reasons — the terminal check leads because
+# a session nobody can end is refused whatever else happened.
 #
-# The pod's half is provisioned from the site's speech configuration, which is
-# the same provisioning a speech run does; the recording session's own
-# configuration is the voice host's half, and `--record` refuses a pair that
-# would put the two on different addresses.
+# The pod's link is composed from the site's speech configuration by the build;
+# the recording session's own configuration is the voice host's half, and
+# `--record` refuses a pair that would put the two on different addresses.
 # What survives the pose-record console filter: the lines a person with both
 # hands on the head acts on, plus anything that refuses. The transcript line is
 # matched by its em dash and a '.' where the utterance number's mark is: a literal
@@ -831,7 +818,6 @@ POSE_RECORD_SIGNAL := utterance .[0-9]+ —|playback started|playback finished|c
 .PHONY: pose-record
 pose-record: device-host require-bazel
 	tools/deploy-motion.sh $(REACHY_HOST) --record-preflight
-	$(MAKE) speech-provision
 	$(MAKE) motion-deploy
 	@# The recorder streams a pose sample every 20ms and the voice host puts its
 	@# JSONL event stream on the same stdout as its console lines, so the tail is

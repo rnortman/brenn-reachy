@@ -21,8 +21,8 @@ Imaging: brenn-pod's `docs/runbooks/reachy-end-to-end.md`. Safety:
   node.
 - **A sibling brenn-pod checkout** (`BRENN_POD_DIR=<path>` otherwise) at
   `BRENN_POD_REV`, plus **podman with qemu-aarch64 binfmt**, for
-  `make motion-build`'s audio binary and `make speech-run`'s provisioning;
-  `REACHY_POD_BINARY=<file>` skips both.
+  `make motion-build`'s audio binary and pod link; `REACHY_POD_BINARY=<file>`
+  skips only the binary.
 - For a speech run, the mic array.
 
 ## Where things live
@@ -33,7 +33,6 @@ Imaging: brenn-pod's `docs/runbooks/reachy-end-to-end.md`. Safety:
 | `.local/motion-logs/`, `.local/speech-logs/`, `.local/pose-sessions/` | fetched runs, timestamped, with `.console` and `provenance.txt` |
 | `/run/brenn-app/releases/motion/` | a root run's payload; a resync or boot fetch installs `releases/fetch-<stamp>`; `/run/brenn-app/current` names the active one |
 | `/run/brenn-app/scratch/logs/motion/`, `scratch/logs/launch/` | `.olog` directories; consoles |
-| `/run/brenn-app/conf/audio.conf` | pod link credentials |
 | `/var/lib/brenn-app/` | bench configuration and self-test record |
 
 All RAM: nothing touches the eMMC; a reboot clears it.
@@ -86,15 +85,15 @@ unattended motion.
 
     make motion-release   # pack, publish, install now
 
-`motion-pack` packs the operator's build, speech configuration and all: the
-server admits only a unit presenting its provisioned certificate.
+`motion-pack` packs the operator's build, speech configuration, pod link and
+all: the server admits only a unit presenting its provisioned certificate.
 `motion-resync` makes the unit fetch the archive and restart
 `brenn-app.service`, which dances the idle playlist, `cogs/idle.json`, as
 `app` until stopped; a name absent from `cogs/library.names.json` keeps
-`voice_host` from starting. Every boot fetches the same URL:
-**publish only a build you would let a power cycle start.** `make motion-fetch`
-brings the records home; `//cogs:idle_run_report` judges them. Reboot between
-a root run and a fetched run: they cannot share log roots.
+`voice_host` from starting. Every boot fetches the same URL, so a speech build
+listens from power: **publish only a build you would let a power cycle start.**
+`make motion-fetch` brings the records home; `//cogs:idle_run_report` judges
+them. Reboot between a root run and a fetched run: they cannot share log roots.
 
 ## The hold test, and tuning
 
@@ -104,11 +103,11 @@ every run read so far: `docs/servo-tuning.md`.
 
 ## The speech run
 
-    make speech-run     # provision, build, push, preflight, run, fetch, judge
+    make speech-run     # build, push, preflight, run, fetch, judge
     make speech-fetch   # recover a run whose terminal died
 
-Provisioning is brenn-pod's `reachy-provision`, every time (`audio.conf` is
-tmpfs; `make speech-provision` runs it alone). Ctrl-C ends it.
+The build composes the pod's link (`provision-reachy-pod.sh --emit`), minting
+`pod_psk_file`'s first key. Ctrl-C ends it.
 
 The **assembly directory** (`REACHY_SPEECH_CONFIG`) is `speech.toml` plus the
 files it names, outside this tree, by the **payload-relative paths they will
@@ -118,13 +117,14 @@ occupy**: `pod_psk_file = "secrets/pod-psk.toml"` is
 `[brenn.bridge]`'s `wss://` URL and `token_file`, absent for a bus-less
 pipeline; the build-staged `models/...` paths; `[wake] model`, your own head;
 `[wake] phrase` — a swap is both keys in both configurations plus the file;
+`[stt] unreachable_clip`, 16 kHz mono, never the wake phrase;
 `[jsonl] sink = "stdout"`.
 
 However it ends, the run is fetched; `speech_run_report` judges.
 
 ## Recording poses
 
-    make pose-record    # provision, build, push, preflight, record, fetch
+    make pose-record    # build, push, preflight, record, fetch
     make pose-fetch     # recover a session whose terminal died
 
 Stop `reachy-motiond`; if the servos may hold torque, take the head's weight
@@ -149,15 +149,15 @@ drafts a clip, `--as-pose` a pose: `docs/pose-authoring.md`.
 - **9** — no staged `host/speech.toml`.
 - **10** — stdin is not a terminal.
 - **11** — `reachy_host --check` refused the staged configuration.
-- **12** — `audio.conf` absent or empty; provisioning never landed.
 - **13** — a speech service the config names is unreachable from the unit.
 - **14** — no staged `host/speech-record.toml`.
 - **15** — no staged `bench/reachy-bench.toml`.
 - **16** — `speech-record.toml` and `speech.toml` disagree on a shared key.
-- **17** — the boot fetch is still retrying and installs the payload itself within 300 s.
+- **17** — the boot fetch is still retrying; it installs the payload within 300 s.
 - **18** — `brenn-app-resync` failed; see its message.
+- **19** — the unit's hostname is not `host_params`' `pod`.
 
-5–8, 12, 13, 17 and 18 are the remote chain's: a message and exit 1; past the
+5–8, 13 and 17–19 are the remote chain's: a message and exit 1; past the
 sentinel line, the launcher's.
 
 ## Open observations

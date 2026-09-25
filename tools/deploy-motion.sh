@@ -67,24 +67,26 @@
 #                the payload itself) and refuses while reachy-motiond.service
 #                holds the bus; an active brenn-app.service is what the resync
 #                replaces and is not refused. On success the unit runs `run` as
-#                `app`, which tours the library: eyes on the machine.
+#                `app`, which tours the library: eyes on the machine. It first
+#                checks that the unit's hostname is the pod this build's host
+#                configuration names -- under `make motion-release` that is the
+#                payload just published -- so it needs a built payload.
 #   --speech     start the production launcher config — the voice host and the
 #                audio device beside the motion stack — with no budget at all,
 #                and stop when the operator does. Preflights the staged speech
 #                configuration here (it must be in the payload, and
 #                `reachy_host --check` must pass over it with the payload root
-#                as its working directory) and the unit's side of it there (the
-#                pod's link credentials present, and every speech service the
-#                configuration names reachable *from the robot*). Refuses a
-#                stdin that is not a terminal: a run with no budget is ended by
-#                the person watching it, so one that cannot receive a ^C is not
-#                started. Fetches and reports however the launcher ended —
+#                as its working directory) and the unit's side of it there
+#                (every speech service the configuration names reachable
+#                *from the robot*). Refuses a stdin that is not a terminal: a
+#                run with no budget is ended by the person watching it, so one
+#                that cannot receive a ^C is not started. Fetches and reports however the launcher ended —
 #                which of the ways it did is the report's question, not this
 #                script's.
 #   --speech-preflight  the terminal refusal above, alone and before anything
-#                else: `make speech-run` provisions the unit and builds and
-#                pushes a payload, and none of that is worth doing for a run
-#                that will be refused for a session property knowable first.
+#                else: `make speech-run` builds and pushes a payload, and
+#                none of that is worth doing for a run that will be refused
+#                for a session property knowable first.
 #                Touches nothing, on either machine.
 #   --speech-fetch  what --fetch is to --run: bring a speech run's records back
 #                under the `speech-log-` name, for the run whose terminal died
@@ -101,7 +103,7 @@
 #                beside it, and both consoles tailed onto the operator's
 #                terminal rather than the host's alone.
 #   --record-preflight  the refusals answerable before anything is
-#                provisioned, built or pushed, for the reason
+#                built or pushed, for the reason
 #                `--speech-preflight` exists: the terminal, and the recording
 #                session's two configurations and their agreement, asked of the
 #                operator's own files. The staged copies are what `--record`
@@ -392,17 +394,6 @@ voice_host_log=voice_host_0.log
 # recorder's `started`, `refused`, `still` and `moving` lines.
 recorder_log=recorder_0.log
 
-# The pod's link credentials on the unit, written by brenn-pod's provisioning
-# and read by the audio device at start. Checked here and never written: that
-# file's format, its compiled-in path, and the key generation and secret
-# delivery behind it are brenn-pod's, and a second writer of it in this repo
-# would be the drift its own header warns about. Its absence is a pod that parks
-# silently and a run that looks deaf, so a speech run asks first. A backstop
-# rather than a prompt: `make speech-run` provisions the file before it gets
-# here, so the ways to reach this refusal are a direct invocation of this script
-# and a unit that lost its tmpfs in between.
-audio_conf="${store_mount}/conf/audio.conf"
-
 # What the reachability preflight asks each speech service for, on the unit.
 # The OpenAI-compatible listing route: a plain GET that a speaches instance
 # answers without doing any work.
@@ -431,14 +422,15 @@ check_target=//crates/reachy-host:reachy_host
 #
 # 5 to 8 are the preparation chain's, emitted on the unit by both run modes; 9,
 # 10 and 11 are the speech run's local refusals and are what the script itself
-# exits with; 12 and 13 are the speech run's own remote steps and reach an
-# operator as `die`'s 1, the way 5 to 8 do. 14 to 16 are the recording session's
-# local refusals, which is why they are three: which of the two configurations a
+# exits with; 13 is the speech run's own remote step and reaches an operator as
+# `die`'s 1, the way 5 to 8 do. 14 to 16 are the recording session's local
+# refusals, which is why they are three: which of the two configurations a
 # payload is missing, and a pair that would put the pod and the host on
-# different addresses, are three different things to go and fix. 17 and 18 are
+# different addresses, are three different things to go and fix. 17 to 19 are
 # the resync's, emitted on the unit and reaching an operator as `die`'s 1 the
-# way 5 to 8 do: the boot fetch still retrying, and `brenn-app-resync`
-# reporting failure.
+# way 5 to 8 do: the boot fetch still retrying, `brenn-app-resync` reporting
+# failure, and the unit's hostname not being the pod the staged host
+# configuration names.
 rc_no_stamp=5
 rc_stamp_unstaged=6
 rc_post_wipe=7
@@ -446,13 +438,13 @@ rc_no_launch_config=8
 rc_no_speech_config=9
 rc_no_tty=10
 rc_check_refused=11
-rc_no_audio_conf=12
 rc_service_unreachable=13
 rc_no_record_config=14
 rc_no_bench_config=15
 rc_record_config_disagreement=16
 rc_fetch_in_flight=17
 rc_resync_failed=18
+rc_pod_not_hostname=19
 
 # What the remote chain prints when it is about to exec the launcher.
 #
@@ -540,14 +532,14 @@ chain_refusal() {
 	esac
 }
 
-# The resync's two refusals, emitted by its remote command and nothing else.
+# The resync's three refusals, emitted by its remote command and nothing else.
 #
 #   resync_refusal <rc>
 #
 # Kept apart from `chain_refusal`: the resync runs none of the preparation
 # chain, so none of that chain's parameters mean anything here, and a code
 # of the chain's arriving from a resync would be a bug, not a message.
-# Returns without saying anything for a code that is not one of the two.
+# Returns without saying anything for a code that is not one of the three.
 resync_refusal() {
 	local rc=$1
 	case "$rc" in
@@ -563,6 +555,14 @@ resync_refusal() {
 			"unit or its certificate not chaining to the unit's anchor, or the server refusing the unit's" \
 			"client certificate; no app/fetch.conf in the unit's generation; a served file that is not an" \
 			"archive; an archive with no run at its root."
+		;;
+	"$rc_pod_not_hostname")
+		die "${host}'s hostname is not ${unit_pod}, the pod ${host_params_path} in this build names, so nothing was resynced." \
+			"This build files the audio device's link key under ${unit_pod} and addresses every speech" \
+			"script to it; the pod presents the unit's hostname, so the voice host would refuse its link" \
+			"and the edge would drop each script. Every boot installs the archive already published," \
+			"so fix it and release again: set pod in ${host_params} to the unit's hostname" \
+			"(ssh root@${host} hostname), then make motion-release."
 		;;
 	esac
 }
@@ -842,35 +842,23 @@ publish_payload() {
 		"${prog} <host> --resync installs it on a running unit now."
 }
 
-# A scalar out of the staged protobuf text. One field per line and quoted
-# strings, which is the whole of the syntax this file is written in; a field this
-# cannot find is a refusal, because every caller below writes the answer into a
-# command that has to be right.
+# A scalar out of the staged logger configuration, read through
+# `textproto_string`: one field per line, quoted strings, leading whitespace
+# allowed, and a missing file, an absent field and an empty value each refused
+# in its own words. A field this cannot find is a refusal, because every caller
+# below writes the answer into a command that has to be right.
 #
-# Leading whitespace is allowed: the pattern is line-oriented either way, but
-# refusing an indented field would make the file's formatting load-bearing, so a
-# submessage or a formatter that indents would turn every command here into a
-# refusal for a reason that has nothing to do with the values.
+# The staged file's own absence is refused here first, because the remedy is
+# the build.
 #
 # Every value goes through `plain_name`, so the callers below can interpolate
 # what they get plainly.
-#
-# An empty value is refused in its own words. `field: ""` and a missing field are
-# the same thing to every caller and both are stops, but they are different edits
-# to make.
 config_string() {
-	local field=$1 line value
+	local field=$1 value
 	[ -f "$logger_config" ] || die \
 		"no logger configuration at ${logger_config}" \
 		"That file is staged by the build, so build the payload first: make motion-build"
-	line=$(sed -n "s/^[[:space:]]*\\(${field}: \".*\"\\)\$/\\1/p" -- "$logger_config" | head -n 1)
-	[ -n "$line" ] ||
-		die "${logger_config} states no ${field}, so the command that needs it cannot be built." \
-			"If the field was renamed, this script and the runbook both name the old one."
-	value=${line#*: \"}
-	value=${value%\"}
-	[ -n "$value" ] ||
-		die "${logger_config} states an empty ${field}, so the command that needs it would name nothing."
+	value=$(textproto_string "$logger_config" "$field") || exit 1
 	plain_name "${logger_config}'s ${field}" "$value"
 	echo "$value"
 }
@@ -1872,7 +1860,7 @@ speech_preflight() {
 # run nobody can end.
 #
 # One spelling, asked twice: `--speech-preflight` asks it before `make
-# speech-run` provisions and builds, and `--speech` asks it again for a direct
+# speech-run` builds, and `--speech` asks it again for a direct
 # invocation that skipped the target.
 require_speech_tty() {
 	[ -t 0 ] ||
@@ -1905,8 +1893,8 @@ absolute_path() {
 #   require_record_config_agreement
 #
 # The recording session has its own speech configuration — bypassed wake gate,
-# the parrot brain, no bridge — and the pod is provisioned from the site's,
-# because provisioning is what writes the PSK table both builds stage. So the
+# the parrot brain, no bridge — and the pod's link is composed from the site's,
+# and that composition writes the PSK table both builds stage. So the
 # two files are independent operator files that have to agree on exactly the
 # scalars the link is made of: the address the pod dials, and the key table it
 # authenticates against.
@@ -1917,8 +1905,8 @@ absolute_path() {
 # was working.
 #
 # A payload with no site configuration is asked nothing — there is nothing to
-# disagree with, and the pod on such a unit was provisioned from a file this
-# deploy cannot see.
+# disagree with, and the build staged such a payload's link and every file it
+# names from the recording configuration itself.
 require_record_config_agreement() {
 	record_config_agreement \
 		"${payload}/${record_speech_config_path}" "staged ${record_speech_config_path}" \
@@ -1930,13 +1918,13 @@ require_record_config_agreement() {
 #   record_config_agreement <recording file> <its name> <site file> <its name>
 #
 # Two callers and one comparison: the preflight asks it of the operator's own
-# files before anything is provisioned or built, and `--record` asks it of the
+# files before anything is built, and `--record` asks it of the
 # staged copies, which are what a session actually runs. The names are what the
 # refusal calls them, so an operator reading it knows which pair to go and fix.
 #
-# A file that is not there is asked nothing: the site's absence is a unit
-# provisioned from a file this deploy cannot see, and the recording one's is the
-# refusal its own caller makes.
+# A file that is not there is asked nothing: the site's absence is a build that
+# staged the link and every site file from the recording configuration itself,
+# and the recording one's is the refusal its own caller makes.
 #
 # Each row is `<table>\t<key>\t<reason>`, and the reason is the row's own: it
 # selects the paragraph that says why *that key* has to agree, rather than the
@@ -1989,9 +1977,9 @@ record_config_agreement() {
 			;;
 		link)
 			why=(
-				"The pod is provisioned from the site's configuration and the recording session's"
+				"The pod's link is composed from the site's configuration and the recording session's"
 				"voice host loads its own, so the two have to name one address and one key table:"
-				"a pod dialling the address it was provisioned with would find nothing listening,"
+				"a pod dialling the address its link was composed with would find nothing listening,"
 				"and a session with no pod is a session with no microphone and no speaker."
 			)
 			;;
@@ -2029,7 +2017,7 @@ record_config_agreement() {
 # refused a payload that cannot run this kind at all.
 supervised_run() {
 	local kind=$1 dest=$2
-	local config_path launcher prefix fetch_flag noun entry_target push_line
+	local config_path launcher prefix fetch_flag noun push_line
 	local opening closing tailed pids_named=no
 	local tails=() extra_config=()
 	case $kind in
@@ -2039,7 +2027,6 @@ supervised_run() {
 		prefix=speech-log
 		fetch_flag=--speech-fetch
 		noun="speech run"
-		entry_target="make speech-run"
 		tails=("$voice_host_log")
 		push_line="The production config is pushed with the payload, so push again:"
 		opening="running the pipeline"
@@ -2051,7 +2038,6 @@ supervised_run() {
 		prefix=record-log
 		fetch_flag=--record-fetch
 		noun="recording session"
-		entry_target="make pose-record"
 		tails=("$voice_host_log" "$recorder_log")
 		# The endpointer values every utterance's interval is derived
 		# from are in this file, so it travels home with the session.
@@ -2085,14 +2071,6 @@ supervised_run() {
 	remote="$(bus_probe)"
 	remote="${remote}; [ -f ${release}/${launcher} ] || exit ${rc_no_launch_config}"
 	remote="${remote}; [ -f ${release}/${provenance_name} ] || exit ${rc_no_stamp}"
-	# The pod's link credentials, before anything is emptied. A pod
-	# that cannot read them parks silently, and what that looks like
-	# to a person talking to the robot is a machine that is simply
-	# deaf: the whole session would be spent looking at the wrong
-	# half. Non-empty rather than merely present, because the file
-	# is written by another repo's provisioning and a zero-length
-	# one is that write interrupted.
-	remote="${remote}; [ -s ${audio_conf} ] || exit ${rc_no_audio_conf}"
 	# Each speech service the configuration names, asked from the
 	# unit — the vantage that decides whether this pipeline can hear
 	# and speak. A workstation-era endpoint that answers on the
@@ -2186,48 +2164,6 @@ supervised_run() {
 		bus_refusal "$rc" "a ${noun}" "nothing was started"
 		chain_refusal "$rc" "$launcher" "$fetch_flag" "$push_line"
 		case "$rc" in
-		"$rc_no_audio_conf")
-			# The line below is pasted by someone already blocked, so
-			# it may only name a concrete file this run can show is the
-			# one the payload carries. REACHY_SPEECH_CONFIG is read
-			# here, at deploy time; the staged copy is what the host
-			# loads, and --stale-ok, a direct invocation with the
-			# variable unset, or a build in another shell each part the
-			# two. Provisioning from the other half derives the pod's
-			# address and its key from a configuration the host never
-			# reads — a next run that composes and sits deaf, which is
-			# the failure this refusal exists to head off. Unconfirmed,
-			# the placeholder goes back in and says so: a path the
-			# operator has to supply is one they have to think about.
-			#
-			# The host is always named: this refusal came from it.
-			# Omitted, the remediation command may target a different
-			# unit, and this one refuses again identically.
-			provision_note=()
-			if cmp -s -- "$speech_config" "${payload}/${speech_config_path}"; then
-				provision_config=$speech_config
-			else
-				provision_config="<assembly>/speech.toml"
-				provision_note=(
-					"The path there is yours to fill in: this deploy could not confirm which file the"
-					"staged ${speech_config_path} was built from, so name the assembly configuration"
-					"that matches it — not one that merely looks like it."
-				)
-			fi
-			die "${host} has no ${audio_conf}, so the audio device has no link credentials and would park silently." \
-				"That file is written for you by the target that runs this script:" \
-				"    ${entry_target}" \
-				"which provisions it before every run, from the same speech configuration it" \
-				"builds the payload with. Reaching this refusal means either this script was" \
-				"invoked directly, or the unit lost its tmpfs since the provisioning ran." \
-				"The raw command, for the first case — it is brenn-pod's, whose writer this repo" \
-				"invokes and never duplicates:" \
-				"    make -C firmware reachy-provision ON_UNIT=1 REACHY_HOST=${host} SPEECH_CONFIG=\"${provision_config}\"" \
-				${provision_note+"${provision_note[@]}"} \
-				"ON_UNIT=1 is what says the voice host runs on the unit, which is what makes the" \
-				"configuration's loopback address the right one to hand the audio device." \
-				"Nothing was started and nothing was emptied."
-			;;
 		"$rc_service_unreachable")
 			die "${host} cannot reach a speech service the configuration names, so nothing was started." \
 				"The failing URL is in the output above, asked for ${service_probe_path} from the unit." \
@@ -2298,6 +2234,14 @@ case "$mode" in
 			[ -n "$wake_key" ] || continue
 			require_members model "$wake_path"
 		done <<<"$staged_wake_models"
+		# The offline clip, like the wake head, is staged from beside the
+		# payload's own configuration, so that copy is what names it. A missing
+		# clip stops the voice host at startup.
+		staged_clips=$(speech_clip_paths "${payload}/${speech_config_path}") || exit 1
+		while IFS=$'\t' read -r clip_key clip_path _; do
+			[ -n "$clip_key" ] || continue
+			require_members "offline clip" "$clip_path"
+		done <<<"$staged_clips"
 		require_members "run configuration" "${run_config_files[@]}"
 
 		age_unchecked=no
@@ -2358,6 +2302,17 @@ case "$mode" in
 					"wake model ${model_path}" \
 					"${prog} ${host} --push --stale-ok"
 			done <<<"$speech_models"
+			# A clip re-rendered under its existing name since the last build is
+			# the same mistake: the unit speaks the old line under a green push.
+			speech_clips=$(speech_clip_paths "$speech_config") || exit 1
+			while IFS=$'\t' read -r clip_key clip_path clip_src; do
+				[ -n "$clip_key" ] || continue
+				refuse_if_source_newer \
+					"${payload}/${clip_path}" \
+					"$clip_src" \
+					"offline clip ${clip_path}" \
+					"${prog} ${host} --push --stale-ok"
+			done <<<"$speech_clips"
 		fi
 
 		# Read for its refusal only: a payload whose logger configuration
@@ -2546,11 +2501,27 @@ case "$mode" in
 
 	--resync)
 		[ $# -eq 0 ] || usage
+		staged_params="${payload}/${host_params_path}"
+		[ -f "$staged_params" ] ||
+			die "no staged host configuration at ${staged_params}, so there is no pod to check ${host}'s hostname against." \
+				"A resync checks the unit's hostname against this build's host configuration -- under make motion-release, the payload it has just published; build it first: make motion-build"
+		unit_pod=$(textproto_string "$staged_params" pod) || exit 1
+		plain_name "${staged_params}'s pod" "$unit_pod"
 		# Not bus_probe: an active brenn-app.service is the expected
 		# state here -- it is what the activation replaces, and systemd
 		# stops the old `run` (and with it motord, which de-torques)
 		# before starting the new one. Only the pod's daemon is refused.
 		remote="systemctl is-active --quiet ${motiond_service} && exit 4"
+		# Before anything is installed, the unit's hostname is checked
+		# against this build's staged host configuration, not the
+		# archive the unit is about to fetch. Under make motion-release
+		# those are the same tree, because pack, publish and resync run
+		# in order from it; run on its own, a resync is checked against
+		# whatever this workstation last built. A payload whose link key
+		# is filed under a name the pod will not present, and whose
+		# scripts are addressed to a name the edge drops, is found here
+		# rather than by a deaf, still robot.
+		remote="${remote}; [ \"\$(cat /proc/sys/kernel/hostname)\" = ${unit_pod} ] || exit ${rc_pod_not_hostname}"
 		remote="${remote}; [ \"\$(systemctl show -p ActiveState --value ${fetch_service})\" != activating ] || exit ${rc_fetch_in_flight}"
 		remote="${remote}; brenn-app-resync || exit ${rc_resync_failed}"
 
@@ -2620,7 +2591,7 @@ case "$mode" in
 	--record-preflight)
 		[ $# -eq 0 ] || usage
 		# `--speech-preflight`'s question, asked by `make pose-record`
-		# before it provisions the unit and builds a payload: a
+		# before it builds a payload: a
 		# recording session is ended by the operator's ^C too, and a
 		# session property knowable first is refused first.
 		require_speech_tty
@@ -2677,7 +2648,7 @@ case "$mode" in
 	--speech-preflight)
 		[ $# -eq 0 ] || usage
 		# The one refusal a speech run can reach before anything has been
-		# provisioned, built or pushed, so `make speech-run` asks it
+		# built or pushed, so `make speech-run` asks it
 		# first: a terminal is a property of the session, not of the
 		# payload. The rest of `--speech`'s preflights need the staged
 		# payload and stay where they are.

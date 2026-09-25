@@ -467,6 +467,68 @@ assert_contains "and the refusal names what it would install" "$(output_of "$res
 	"install a wake model"
 
 # ---------------------------------------------------------------------------
+# The offline clip the site supplies
+# ---------------------------------------------------------------------------
+#
+# The same convention as the wake head, on its own key list and in its own
+# noun: a refusal about the clip has to send the operator to the `[stt]` line,
+# not to the wake head.
+
+printf '[stt]\nunreachable_clip = "clips/offline.wav"\n' >"${work}/clip.toml"
+assert_eq "the clip comes back keyed, with the source beside the configuration" \
+	"unreachable_clip	clips/offline.wav	${work}/clips/offline.wav" \
+	"$(speech_clip_paths "${work}/clip.toml")"
+
+printf '[stt]\nurl = "http://stt:8000"\n' >"${work}/clipless.toml"
+assert_eq "an stt table stating no clip names none" "" \
+	"$(speech_clip_paths "${work}/clipless.toml")"
+
+printf '[stt]\nunreachable_clip = "/srv/clips/offline.wav"\n' >"${work}/clip-absolute.toml"
+result=$(attempt speech_clip_paths "${work}/clip-absolute.toml")
+assert_status "an absolute clip path refuses" 1 "$(status_of "$result")"
+assert_contains "and the refusal is about offline clips" \
+	"$(output_of "$result")" "the payload carries its own copy of every offline clip"
+
+printf '[stt]\nunreachable_clip = "../x.wav"\n' >"${work}/clip-climbing.toml"
+result=$(attempt speech_clip_paths "${work}/clip-climbing.toml")
+assert_status "a clip path that climbs out of the payload refuses" 1 \
+	"$(status_of "$result")"
+assert_contains "with the same rule as a credential" "$(output_of "$result")" \
+	"climbs out of the payload"
+
+# ---------------------------------------------------------------------------
+# A quoted scalar out of the host configuration
+# ---------------------------------------------------------------------------
+#
+# The pod id the build composes the link for, read from the operator's file
+# rather than from a staged one, so each refusal names the file it was given.
+# A missing file, an absent field and an empty one are three different edits.
+
+params="${work}/host_params.textproto"
+printf '# pod: "decoy"\nlog_root_dir: "/elsewhere"\n  pod: "reachy07"\n' >"$params"
+result=$(attempt textproto_string "$params" pod)
+assert_status "an indented quoted field is read" 0 "$(status_of "$result")"
+assert_eq "and its value comes back, the commented decoy skipped" reachy07 \
+	"$(output_of "$result")"
+
+result=$(attempt textproto_string "${work}/no-such-params.textproto" pod)
+assert_status "a missing file refuses" 1 "$(status_of "$result")"
+assert_contains "naming the file it was given" "$(output_of "$result")" \
+	"there is no ${work}/no-such-params.textproto"
+
+printf 'log_root_dir: "/elsewhere"\n' >"${work}/podless.textproto"
+result=$(attempt textproto_string "${work}/podless.textproto" pod)
+assert_status "an absent field refuses" 1 "$(status_of "$result")"
+assert_contains "naming the file and the field" "$(output_of "$result")" \
+	"${work}/podless.textproto states no pod"
+
+printf 'pod: ""\n' >"${work}/empty-pod.textproto"
+result=$(attempt textproto_string "${work}/empty-pod.textproto" pod)
+assert_status "an empty value refuses" 1 "$(status_of "$result")"
+assert_contains "in its own words" "$(output_of "$result")" \
+	"${work}/empty-pod.textproto states an empty pod"
+
+# ---------------------------------------------------------------------------
 # The run directory under a log root
 # ---------------------------------------------------------------------------
 
@@ -593,8 +655,8 @@ assert_contains "and says what is accepted" "$(output_of "$result")" \
 #
 # One knob for one physical fact: BRENN_POD_DIR names the brenn-pod checkout,
 # and both things this repo takes out of it — the audio binary the payload build
-# compiles there and stages, and the provisioning a speech run invokes — resolve
-# under it.
+# compiles there and stages, and the writer that composes the pod's link into
+# the payload — resolve under it.
 # REACHY_POD_BINARY still wins for the binary alone, because it names a file
 # rather than a repository: an artifact copied out of a build somewhere else has
 # no checkout around it.

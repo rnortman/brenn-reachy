@@ -207,10 +207,11 @@ pub fn runnable_with_pods(
 /// The same fixture with every model path a configuration can name.
 ///
 /// A `[wake]` table with its three openWakeWord models, an `[endpointer]` with
-/// the VAD model, and a `[brain]` answering every utterance with a clip: the
-/// five path fields beside the two credential ones, each naming a file of its
-/// own so a check that looks at the wrong struct member names the wrong file.
-/// Every one of them is written, so a case that wants one missing removes it.
+/// the VAD model, a `[brain]` answering every utterance with a clip, and an
+/// `[stt]` naming the offline clip: the six path fields beside the two
+/// credential ones, each naming a file of its own so a check that looks at the
+/// wrong struct member names the wrong file. Every one of them is written, so a
+/// case that wants one missing removes it.
 ///
 /// Nothing here is a real model — they are bytes at a path, which is all a
 /// presence check reads. No `[brenn]`, so this composes without a bus.
@@ -234,6 +235,7 @@ pub fn modelled_named(dir: &Path, events: Events<'_>, naming: Naming) -> PathBuf
     let wake_model = named(WAKE_MODEL);
     let endpointer = named(ENDPOINTER_MODEL);
     let clip = named(BRAIN_CLIP);
+    let offline = named(OFFLINE_CLIP);
     let text = std::fs::read_to_string(&path).expect("the fixture");
     std::fs::write(
         &path,
@@ -245,7 +247,9 @@ pub fn modelled_named(dir: &Path, events: Events<'_>, naming: Naming) -> PathBuf
              model = {wake_model}\n\
              phrase = \"hey jarvis\"\n\
              [endpointer]\nmodel = {endpointer}\n\
-             [brain]\nmode = \"wav\"\nclip = {clip}\n",
+             [brain]\nmode = \"wav\"\nclip = {clip}\n\
+             {STT_HTTP}\
+             unreachable_clip = {offline}\n",
         ),
     )
     .expect("a file");
@@ -267,8 +271,16 @@ pub const ENDPOINTER_MODEL: &str = "endpointer-vad.onnx";
 /// The file `brain.clip` names in [`modelled_named`].
 pub const BRAIN_CLIP: &str = "brain-answer.wav";
 
+/// The file `stt.unreachable_clip` names in [`modelled_named`].
+pub const OFFLINE_CLIP: &str = "offline-clip.wav";
+
 /// The recording block every written fixture carries, as `records` finds it.
 const RECORDING_OFF: &str = "[record]\nenabled = false\n";
+
+/// A recogniser table naming a loopback HTTP service that a composition
+/// running no turn never calls.
+const STT_HTTP: &str =
+    "[stt]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\nmodel = \"m\"\n";
 
 /// Turn a written fixture's recording on, into `dir` under `cap_bytes`.
 ///
@@ -366,7 +378,7 @@ pub fn carrying_named(dir: &Path, events: Events<'_>, naming: Naming) -> PathBuf
         format!(
             "{text}\
              [brain]\nmode = \"brenn\"\n\
-             [stt]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\nmodel = \"m\"\n\
+             {STT_HTTP}\
              [tts]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8000\"\n\
              model = \"m\"\nvoice = \"v\"\n\
              [brenn]\n\

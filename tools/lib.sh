@@ -196,8 +196,8 @@ pinion_defaults=(
 #
 #   check_pinion_defaults <workspace-relative path>
 #
-# Line-oriented and exact, leading whitespace allowed, the same shape
-# deploy-motion.sh reads a scalar with: what must hold is that the file states
+# Line-oriented and exact, leading whitespace allowed, the same line shape
+# `textproto_string` reads: what must hold is that the file states
 # these values and not some others.
 check_pinion_defaults() {
 	local config=$1 want line
@@ -385,8 +385,9 @@ refuse_if_stale() {
 # cannot answer the two scripts differently.
 
 # The brenn-pod checkout this repo reads two things out of: the audio device's
-# binary, which the payload build compiles there and stages, and the provisioning
-# make target that writes the pod's half of the voice link onto the unit.
+# binary, which the payload build compiles there and stages, and the writer that
+# composes the pod's half of the voice link into the payload
+# (`firmware/tools/provision-reachy-pod.sh`).
 #
 # One physical fact — where that repo is — gets one knob, so a workstation whose
 # checkouts are not siblings says so once. `REACHY_POD_BINARY` still wins for the
@@ -908,6 +909,28 @@ host_params=${REACHY_HOST_PARAMS:-${repo_root}/.local/host_params.textproto}
 # Where it goes under the payload root: the host's own `DEFAULT_CONFIG`, which is
 # why the launcher entry passes no `--config` at all.
 host_params_path=host/host_params.textproto
+
+# One quoted-string scalar out of a protobuf-text file.
+#
+#   textproto_string <file> <field>
+#
+# One field per line, leading whitespace allowed. A missing file, an absent
+# field and an empty value are three different refusals because they are three
+# different edits.
+textproto_string() {
+	local file=$1 field=$2 line value
+	[ -f "$file" ] ||
+		die "there is no ${file}, so its ${field} cannot be read."
+	line=$(sed -n "s/^[[:space:]]*\\(${field}: \".*\"\\)\$/\\1/p" -- "$file" | head -n 1)
+	[ -n "$line" ] ||
+		die "${file} states no ${field}, so the command that needs it cannot be built." \
+			"If the field was renamed, this script and the runbook both name the old one."
+	value=${line#*: \"}
+	value=${value%\"}
+	[ -n "$value" ] ||
+		die "${file} states an empty ${field}, so the command that needs it would name nothing."
+	printf '%s\n' "$value"
+}
 
 # The recording session's own speech configuration: a second arrangement of the
 # voice pipeline (bypassed wake gate, echo brain, no bridge), and a site's file
@@ -1493,6 +1516,20 @@ speech_model_keys=(
 # is a coherent pipeline is the host's business and surfaces at `--check`.
 speech_model_paths() {
 	payload_path_entries "$1" "wake model" "${speech_model_keys[@]}"
+}
+
+# The speech configuration's clip path fields, as `<table>\t<key>`. One key: the
+# line the host speaks when a wake's transcription fails. Its own list and noun,
+# not the wake model's, so a refusal about it names the right file.
+speech_clip_keys=(
+	$'stt\tunreachable_clip'
+)
+
+# The clips a speech configuration supplies itself.
+#
+#   speech_clip_paths <config>
+speech_clip_paths() {
+	payload_path_entries "$1" "offline clip" "${speech_clip_keys[@]}"
 }
 
 # The speech configuration's service endpoints, as `<table>\t<key>`.

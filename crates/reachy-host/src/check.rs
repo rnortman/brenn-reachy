@@ -584,6 +584,11 @@ fn named_paths(config: &speech_surface::Config) -> Vec<(&'static str, PathBuf)> 
     {
         named.push(("brain.clip", clip.clone()));
     }
+    if let Some(stt) = &config.stt
+        && let Some(clip) = &stt.unreachable_clip
+    {
+        named.push(("stt.unreachable_clip", clip.clone()));
+    }
     named
 }
 
@@ -741,13 +746,48 @@ mod tests {
     }
 
     /// Each model-and-clip field of `modelled_named`, with the file it names.
-    const MODELLED: [(&str, &str); 5] = [
+    const MODELLED: [(&str, &str); 6] = [
         ("wake.melspectrogram", speech_fixture::WAKE_MELSPECTROGRAM),
         ("wake.embedding", speech_fixture::WAKE_EMBEDDING),
         ("wake.model", speech_fixture::WAKE_MODEL),
         ("endpointer.model", speech_fixture::ENDPOINTER_MODEL),
         ("brain.clip", speech_fixture::BRAIN_CLIP),
+        ("stt.unreachable_clip", speech_fixture::OFFLINE_CLIP),
     ];
+
+    /// Remove the file `field` names in `modelled_named`, and expect the check
+    /// to fail on that field alone: not settled, `field` a `names` conclusion
+    /// not held that says the path it looked for, every other `MODELLED`
+    /// field held, and the verdict naming `field`.
+    fn only_this_missing_fails(scratch: &str, field: &str, file: &str) {
+        let dir = scratch_dir(scratch);
+        let config = params(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::modelled_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        std::fs::remove_file(dir.join(file)).expect("a file the fixture wrote");
+
+        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        assert!(!settled(&found), "{found:?}");
+        let missing = about(&found, field);
+        assert_eq!(missing.kind, "names", "{missing:?}");
+        assert!(!missing.held, "{missing:?}");
+        assert!(
+            missing
+                .says
+                .contains(dir.join(file).to_str().expect("a path this fixture wrote")),
+            "{missing:?}",
+        );
+        for (other, _) in MODELLED {
+            if other != field {
+                assert!(about(&found, other).held, "{found:?}");
+            }
+        }
+        assert!(verdict(&found).says.contains(field), "{found:?}");
+    }
 
     #[test]
     fn every_model_a_configuration_names_is_looked_for_by_its_own_name() {
@@ -781,35 +821,20 @@ mod tests {
 
     #[test]
     fn a_model_the_payload_does_not_carry_is_the_only_thing_that_fails() {
-        let dir = scratch_dir("reachy-host-check-model-missing");
-        let config = params(dir.as_ref(), "names.json");
-        library_names(dir.as_ref(), "names.json");
-        let speech = speech_fixture::modelled_named(
-            dir.as_ref(),
-            speech_fixture::Events::Dropped,
-            speech_fixture::Naming::PayloadRelative,
+        only_this_missing_fails(
+            "reachy-host-check-model-missing",
+            "wake.embedding",
+            speech_fixture::WAKE_EMBEDDING,
         );
-        std::fs::remove_file(dir.join(speech_fixture::WAKE_EMBEDDING))
-            .expect("the fixture's embedding model");
+    }
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
-        assert!(!settled(&found), "{found:?}");
-        let missing = about(&found, "wake.embedding");
-        assert!(!missing.held, "{missing:?}");
-        assert!(
-            missing.says.contains(
-                dir.join(speech_fixture::WAKE_EMBEDDING)
-                    .to_str()
-                    .expect("a path this fixture wrote")
-            ),
-            "{missing:?}",
+    #[test]
+    fn an_offline_clip_the_payload_does_not_carry_is_the_only_thing_that_fails() {
+        only_this_missing_fails(
+            "reachy-host-check-offline-clip-missing",
+            "stt.unreachable_clip",
+            speech_fixture::OFFLINE_CLIP,
         );
-        for (field, _) in MODELLED {
-            if field != "wake.embedding" {
-                assert!(about(&found, field).held, "{found:?}");
-            }
-        }
-        assert!(verdict(&found).says.contains("wake.embedding"), "{found:?}");
     }
 
     /// The failure this comparison exists for, exactly: two files that both

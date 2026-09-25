@@ -14,12 +14,13 @@
 # app commissions the servos. `run --chip-rebooted` then attaches without
 # resetting the board again.
 #
-# No configuration argument, because the pod takes none: it reads
-# `/run/brenn-app/conf/audio.conf` by a compiled-in path, which is a per-unit
-# push into RAM because it holds that unit's link key. A pod started before that
-# file is there parks and re-reads rather than exiting, so this app is safe to
-# start on a unit whose credentials have not been pushed yet -- what it does then
-# is wait, in its own console log.
+# The pod is given `--config conf/audio.conf`, relative to the payload root the
+# launcher starts it in. That file is a payload member the build composes with
+# brenn-pod's writer; it holds this unit's link key, and the payload already
+# carries the unit's other secrets. A payload built with no speech configuration
+# stages no link, and a pod started without its file parks and re-reads rather
+# than exiting, so this app is safe to start there -- what it does then is wait,
+# in its own console log.
 #
 # Named `pod` because that is this repo's word for the audio device, and the
 # launcher spells each app's console `<name>_<run>.log`.
@@ -37,4 +38,6 @@ app {
   executable: "reachy_pod"
   args: "run"
   args: "--chip-rebooted"
+  args: "--config"
+  args: "conf/audio.conf"
 }
