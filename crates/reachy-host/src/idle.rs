@@ -879,7 +879,7 @@ fn decoded(body: &[u8]) -> Option<MotionScript> {
         .and_then(|text| MotionScript::decode(text).ok())
 }
 
-/// Whether `script` plays nothing, holds nothing, and names no pose but the stow.
+/// Whether `script` plays nothing, holds nothing, looks nowhere, and names no pose but the stow.
 fn bare_stow(script: &MotionScript) -> bool {
     let mut posed = false;
     for step in script.steps() {
@@ -892,6 +892,7 @@ fn bare_stow(script: &MotionScript) -> bool {
                 posed = true;
             }
             Action::Base(Base::Keep) => return false,
+            Action::Base(Base::Look { .. }) => return false,
         }
     }
     posed
@@ -1781,6 +1782,20 @@ mod tests {
         assert_eq!(rig.speech(&keep, 1_500), Verdict::Offer);
         assert_eq!(rig.surface.count(IDLE_DROPPED_STOW), 0);
         rig.accept(&keep, 1_500);
+        assert_eq!(rig.idle.owner, Owner::Speech);
+        assert_eq!(rig.surface.count(IDLE_SUSPENDED), 1);
+    }
+
+    #[test]
+    fn a_look_led_speech_script_takes_the_head() {
+        let mut rig = active_loop();
+        let look = body(
+            vec![Step::look(0, 520, 471), Step::new(30_000, STOW_POSE)],
+            35_000,
+        );
+        assert_eq!(rig.speech(&look, 1_500), Verdict::Offer);
+        assert_eq!(rig.surface.count(IDLE_DROPPED_STOW), 0);
+        rig.accept(&look, 1_500);
         assert_eq!(rig.idle.owner, Owner::Speech);
         assert_eq!(rig.surface.count(IDLE_SUSPENDED), 1);
     }

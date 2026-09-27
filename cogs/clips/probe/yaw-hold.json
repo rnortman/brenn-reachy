@@ -1,0 +1,16 @@
+{
+  "description": "body yaw alone, the base, then 1.0 rad either way, then the base, each reached in one frame and held 12 s: three long holds after a full-speed arrival, where a marginal loop's limit cycle shows",
+  "entries": [
+    {"ref":"probe/yaw-at/zero"},
+    {"gap_ms":11980},
+    {"ref":"probe/yaw-at/plus-1000"},
+    {"gap_ms":11980},
+    {"ref":"probe/yaw-at/minus-1000"},
+    {"gap_ms":11980},
+    {"ref":"probe/yaw-at/zero"},
+    {"gap_ms":11980}
+  ],
+  "kind": "sequence",
+  "name": "probe/yaw-hold",
+  "version": 1
+}

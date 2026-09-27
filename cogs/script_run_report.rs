@@ -6,8 +6,8 @@ use std::process::ExitCode;
 use brenn_reachy__cogs__schedule_clk_rs::StepKindWire;
 use brenn_reachy__cogs__script_clk_rs::ScriptWire;
 use motion_run_report::{
-    SettleResult, Span, every_window_moved, overlay_spans, prepare, settle, stillness,
-    the_stream_held, whole_stream_measurements, window_measurements, windows,
+    SettleResult, SettleTarget, Span, every_window_moved, overlay_spans, prepare, settle,
+    stillness, the_stream_held, whole_stream_measurements, window_measurements, windows,
 };
 use pose_reading::{RunConfig, no_faults};
 use reachy_edge::{compile::MAX_STEPS, parse};
@@ -123,7 +123,7 @@ fn main() -> ExitCode {
                 stillness_report::Standard::JudgedWhereHeadStill,
                 &mut report,
             );
-            let result = settle(&run, &prepared.ordered, &planned, &config, &mut report);
+            let result = settle(&run, &prepared.ordered, &planned, &mut report);
             if strict {
                 strict_settle(
                     &script.message,
@@ -363,6 +363,20 @@ fn poses_label(id: u16, poses: &reachy_edge::PoseTable) -> String {
         )
 }
 
+fn move_label(target: SettleTarget, poses: &reachy_edge::PoseTable) -> String {
+    match target {
+        SettleTarget::Pose(id) => {
+            let name = poses
+                .entries()
+                .find(|(_, entry)| entry.pose_id == id)
+                .map(|(name, _)| name)
+                .unwrap_or("unknown");
+            format!("pose {name} ({id})")
+        }
+        SettleTarget::Look { .. } => target.to_string(),
+    }
+}
+
 fn strict_settle(
     script: &ScriptWire,
     result: &SettleResult,
@@ -373,7 +387,9 @@ fn strict_settle(
     let rows = script
         .steps()
         .iter()
-        .filter(|step| step.kind() == StepKindWire::BASE_POSTURE)
+        .filter(|step| {
+            step.kind() == StepKindWire::BASE_POSTURE || step.kind() == StepKindWire::BASE_LOOK
+        })
         .count();
     if result.moves.len() != rows {
         report.fail(format!(
@@ -381,11 +397,15 @@ fn strict_settle(
             result.moves.len()
         ));
     }
-    let skipped: Vec<_> = result.moves.iter().filter(|item| !item.measured).collect();
+    let skipped: Vec<_> = result
+        .moves
+        .iter()
+        .filter(|item| !item.measured())
+        .collect();
     let terminal = result.moves.last();
     if skipped.len() != 1
         || terminal.is_none()
-        || skipped[0].pose_id != stow_id
+        || skipped[0].target != SettleTarget::Pose(stow_id)
         || terminal != skipped.first().copied()
     {
         report.fail(
@@ -393,28 +413,23 @@ fn strict_settle(
                 .to_owned(),
         );
     }
-    for item in result.moves.iter().filter(|item| !item.measured) {
+    for item in result.moves.iter().filter(|item| !item.measured()) {
         if terminal == Some(item) {
             continue;
         }
-        let name = poses
-            .entries()
-            .find(|(_, entry)| entry.pose_id == item.pose_id)
-            .map(|(name, _)| name)
-            .unwrap_or("unknown");
         report.fail(format!(
-            "pose {name} ({}) at {} lacks settle evidence: {}",
-            item.pose_id,
+            "{} at {} lacks settle evidence: {}",
+            move_label(item.target, poses),
             item.start_ns,
             item.reason.as_deref().unwrap_or("unknown reason")
         ));
     }
-    if result.moves.iter().filter(|item| item.measured).count() != rows.saturating_sub(1) {
+    if result.moves.iter().filter(|item| item.measured()).count() != rows.saturating_sub(1) {
         report.fail(
             "strict settle evidence measured count does not match the nonterminal rows".to_owned(),
         );
     }
-    if result.maxima.iter().any(Option::is_none) {
+    if result.any_unavailable() {
         report.fail("strict settle evidence has an unavailable leg maximum".to_owned());
     }
 }
@@ -432,13 +447,10 @@ mod tests {
     use motion_proto::PlayWindow;
     use motion_proto::STOW_POSE;
     use motion_run_report::settle;
-    use motion_run_report::{Run, SETTLE_BOUND_COUNTS, SettleMove};
+    use motion_run_report::{LegFigure, Run, SETTLE_BOUND_COUNTS, SettleMove, SettleTarget};
     use motion_run_report::{Span, every_window_moved, windows};
-    use pose_reading::RunConfig;
     use reachy_edge::names::{MotionEntry, MotionTable, PoseEntry, PoseTable};
-    use reachy_motion::arm::DEFAULT_GAINS;
     use reachy_motion::joints::{JointRef, ROW_COUNT, row, write_rows};
-    use reachy_motion::plant::SHIPPED_PROFILES;
     use reachy_motion::stillness::COUNT_RAD;
     use run_report::Report;
 
@@ -572,6 +584,21 @@ mod tests {
             sequence_number: 0,
             message,
         }
+    }
+
+    /// Samples every 20 ms over `[from_ns, to_ns)`, leg 1 commanded at
+    /// `commanded_at` of the instant and present zero, valid where
+    /// `present_valid` says.
+    fn pose_stream(
+        from_ns: i64,
+        to_ns: i64,
+        commanded_at: impl Fn(i64) -> f64,
+        present_valid: impl Fn(i64) -> bool,
+    ) -> Vec<Logged<PoseSampleWire>> {
+        (from_ns..to_ns)
+            .step_by(20_000_000)
+            .map(|at| pose_sample(at, present_valid(at), commanded_at(at)))
+            .collect()
     }
 
     fn script_with_plays() -> Logged<ScriptWire> {
@@ -1108,27 +1135,38 @@ mod tests {
         message
     }
 
+    /// Every leg of every table at `count`, read on pose 0.
+    fn tables_at(count: f64) -> [Option<LegFigure>; 6] {
+        [Some(LegFigure {
+            counts: count,
+            target: SettleTarget::Pose(0),
+            at_ns: 123,
+        }); 6]
+    }
+
     fn settle_result(first_measured: bool, first_reason: Option<&str>, count: f64) -> SettleResult {
         SettleResult {
             moves: vec![
                 SettleMove {
                     start_ns: 100,
                     end_ns: 200,
-                    pose_id: 0,
+                    target: SettleTarget::Pose(0),
                     pace_ns: 1,
-                    measured: first_measured,
+                    settled_at_ns: first_measured.then_some(150),
                     reason: first_reason.map(str::to_owned),
                 },
                 SettleMove {
                     start_ns: 300,
                     end_ns: 400,
-                    pose_id: 2,
+                    target: SettleTarget::Pose(2),
                     pace_ns: 1,
-                    measured: false,
+                    settled_at_ns: None,
                     reason: Some("no commanded change".to_owned()),
                 },
             ],
-            maxima: [Some((count, 0, "hold-end", 123)); 6],
+            residual: tables_at(count),
+            overshoot: tables_at(count),
+            creep: tables_at(count),
         }
     }
 
@@ -1159,13 +1197,7 @@ mod tests {
         };
         let mut report = Report::default();
         let ordered = run.ordered_samples();
-        settle(
-            &run,
-            &ordered,
-            &[],
-            &RunConfig::stated(SHIPPED_PROFILES, DEFAULT_GAINS, true),
-            &mut report,
-        );
+        settle(&run, &ordered, &[], &mut report);
         assert!(report.findings.is_empty(), "{:?}", report.findings);
         assert!(
             report
@@ -1195,7 +1227,7 @@ mod tests {
     fn strict_policy_rejects_unavailable_leg_maximum() {
         let (_, poses) = tables();
         let mut unavailable = settle_result(true, None, SETTLE_BOUND_COUNTS);
-        unavailable.maxima[0] = None;
+        unavailable.creep[0] = None;
         let mut report = Report::default();
         strict_settle(&strict_script(), &unavailable, 2, &poses, &mut report);
         assert!(
@@ -1212,7 +1244,7 @@ mod tests {
         let excessive = settle_result(true, None, 18.1);
         let mut report = Report::default();
         report.fail(
-            "base-move settle exceeds 18 counts at leg 1: 18.1 counts (pose 0, hold-end at 123)"
+            "base-move settled residual exceeds 18 counts at leg 1: 18.1 counts (pose 0 at 123)"
                 .to_owned(),
         );
         let findings_before = report.findings.len();
@@ -1229,22 +1261,24 @@ mod tests {
         let (_, poses) = tables();
         let make = |moves: Vec<SettleMove>| SettleResult {
             moves,
-            maxima: [Some((SETTLE_BOUND_COUNTS, 0, "hold-end", 123)); 6],
+            residual: tables_at(SETTLE_BOUND_COUNTS),
+            overshoot: tables_at(SETTLE_BOUND_COUNTS),
+            creep: tables_at(SETTLE_BOUND_COUNTS),
         };
         let measured = SettleMove {
             start_ns: 100,
             end_ns: 200,
-            pose_id: 0,
+            target: SettleTarget::Pose(0),
             pace_ns: 1,
-            measured: true,
+            settled_at_ns: Some(150),
             reason: None,
         };
         let skipped = |pose_id| SettleMove {
             start_ns: 300,
             end_ns: 400,
-            pose_id,
+            target: SettleTarget::Pose(pose_id),
             pace_ns: 1,
-            measured: false,
+            settled_at_ns: None,
             reason: Some("reason".to_owned()),
         };
         for (label, result, expected) in [
@@ -1308,27 +1342,27 @@ mod tests {
                     schedule_custom(0, 1000, 500, false),
                     schedule_custom(2, 4000, 500, false),
                 ],
-                samples: vec![
-                    pose_sample(start, true, 0.0),
-                    pose_sample(start + 500_000_000, true, count * COUNT_RAD),
-                    pose_sample(start + 1_000_000_000, true, count * COUNT_RAD),
-                    pose_sample(start + 1_500_000_000, true, count * COUNT_RAD),
-                ],
+                samples: pose_stream(
+                    start,
+                    start + 2_000_000_000,
+                    |at| {
+                        if at < start + 500_000_000 {
+                            0.0
+                        } else {
+                            count * COUNT_RAD
+                        }
+                    },
+                    |_| true,
+                ),
                 ..Run::default()
             };
             let mut report = Report::default();
-            let result = settle(
-                &run,
-                &run.ordered_samples(),
-                &[],
-                &RunConfig::stated(SHIPPED_PROFILES, DEFAULT_GAINS, true),
-                &mut report,
-            );
+            let result = settle(&run, &run.ordered_samples(), &[], &mut report);
             let before = report.findings.len();
             strict_settle(&strict_script(), &result, 2, &poses, &mut report);
             let shared = report.findings[before..]
                 .iter()
-                .filter(|finding| finding.contains("settle exceeds"))
+                .filter(|finding| finding.contains("exceeds"))
                 .count();
             assert_eq!(
                 shared, 0,
@@ -1341,8 +1375,8 @@ mod tests {
                     .iter()
                     .filter(|finding| finding.contains("18.1 counts")
                         && finding.contains("leg 1")
-                        && finding.contains("pose 0")
-                        && finding.contains("endpoint at 1700000002000000000"))
+                        && finding.contains("pose 0 at 1700000001500000000")
+                        && finding.contains("settled residual exceeds"))
                     .count(),
                 usize::from(expected),
                 "{:?}",
@@ -1352,7 +1386,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_policy_rejects_malformed_nonterminal_settle_reading() {
+    fn strict_policy_rejects_an_unsettled_nonterminal_move() {
         let (_, poses) = tables();
         let start = 1_700_000_001_000_000_000;
         let run = Run {
@@ -1360,31 +1394,36 @@ mod tests {
                 schedule_custom(0, 1000, 500, false),
                 schedule_custom(2, 4000, 500, false),
             ],
-            samples: vec![
-                pose_sample(start, true, 0.0),
-                pose_sample(start + 500_000_000, true, 1.0),
-                pose_sample(start + 700_000_000, false, 1.0),
-                pose_sample(start + 1_500_000_000, true, 1.0),
-            ],
+            samples: pose_stream(
+                start,
+                start + 2_000_000_000,
+                |at| {
+                    if at < start + 500_000_000 {
+                        0.0
+                    } else {
+                        COUNT_RAD
+                    }
+                },
+                |at| at < start + 500_000_000,
+            ),
             ..Run::default()
         };
         let ordered = run.ordered_samples();
         let mut settle_report = Report::default();
-        let result = settle(
-            &run,
-            &ordered,
-            &[],
-            &RunConfig::stated(SHIPPED_PROFILES, DEFAULT_GAINS, true),
-            &mut settle_report,
-        );
+        let result = settle(&run, &ordered, &[], &mut settle_report);
         let mut report = Report::default();
         strict_settle(&strict_script(), &result, 2, &poses, &mut report);
-        assert!(
+        assert_eq!(
             report
                 .findings
                 .iter()
-                .any(|finding| finding
-                    .contains("endpoint reading at 1700000001700000000 missing commanded or present rows before clean end 1700000003000000000")),
+                .filter(|finding| finding.contains(
+                    "pose neutral (0) at 1700000001000000000 lacks settle evidence: unsettled \
+                     before clean end 1700000003000000000: no complete 200 ms of readings after \
+                     endpoint 1700000001500000000"
+                ))
+                .count(),
+            1,
             "{:?}",
             report.findings
         );
@@ -1392,6 +1431,47 @@ mod tests {
             report.findings.iter().any(|finding| finding.contains(
                 "strict settle evidence measured count does not match the nonterminal rows"
             )),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn strict_count_includes_look_rows() {
+        let (_, poses) = tables();
+        let mut script = ScriptWire::new();
+        {
+            let mut steps = script.steps_mut();
+            let look = steps.try_grow().expect("look step");
+            look.set_after_ms(1000);
+            look.set_duration_ms(2000);
+            look.set_kind(StepKindWire::BASE_LOOK);
+            look.set_bearing_mrad(520);
+            look.set_elevation_mrad(471);
+            let stow = steps.try_grow().expect("stow step");
+            stow.set_after_ms(4000);
+            stow.set_duration_ms(2000);
+            stow.set_move_ms(500);
+            stow.set_kind(StepKindWire::BASE_POSTURE);
+            stow.set_pose_id(2);
+        }
+        let look = SettleTarget::Look {
+            bearing_mrad: 520,
+            elevation_mrad: 471,
+        };
+        let mut result = settle_result(true, None, SETTLE_BOUND_COUNTS);
+        result.moves[0].target = look;
+        let mut report = Report::default();
+        strict_settle(&script, &result, 2, &poses, &mut report);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+
+        let mut unsettled = settle_result(false, Some("unsettled x"), SETTLE_BOUND_COUNTS);
+        unsettled.moves[0].target = look;
+        let mut report = Report::default();
+        strict_settle(&script, &unsettled, 2, &poses, &mut report);
+        assert!(
+            report.findings.iter().any(|finding| finding
+                .contains("look +30°/27° at 100 lacks settle evidence: unsettled x")),
             "{:?}",
             report.findings
         );

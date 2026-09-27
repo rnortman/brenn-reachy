@@ -729,9 +729,14 @@ fn plan_of(script: &Script) -> Result<SessionScheduleWire, RefusalReasonWire> {
             // step asks for crosses the screen without being reinterpreted.
             row.set_kind(StepKindWire::from(step.kind));
             row.set_pose_id(step.pose_id);
+            row.set_bearing_mrad(step.bearing_mrad);
+            row.set_elevation_mrad(step.elevation_mrad);
             // A base step's pace crosses the same way, and is screened the same
             // way a span is: a move given no time is not a move, so a base step
-            // that states none is a script this session does not run.
+            // that states none is a script this session does not run. A look's
+            // clock is the mover's configuration, not the row's, so a look row
+            // states no pace and is not refused for having none. The session
+            // does not screen the angles.
             if step.kind == StepKind::BasePosture {
                 if step.move_ms == 0 {
                     return Err(RefusalReasonWire::BAD_TIMES);

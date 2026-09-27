@@ -55,6 +55,12 @@ pub const MAX_MOTIONS: usize = 128;
 /// probe run.
 pub const PROBE_PREFIX: &str = "probe/";
 
+/// The body yaw's probes: a [`PROBE_PREFIX`] instrument that steps the yaw and holds
+/// it. A run of these alone is judged by the yaw's own row, under the limit-cycle
+/// rule, rather than by the antennas' hold. The prefix is the whole of the rule, as
+/// [`PROBE_PREFIX`]'s is.
+pub const YAW_PROBE_PREFIX: &str = "probe/yaw-";
+
 /// How many poses the library message the box loads holds, and so the highest
 /// index a schedule can carry.
 ///
@@ -206,11 +212,24 @@ impl MotionTable {
     /// run it is judging. An empty table is neither.
     #[must_use]
     pub fn probes_only(&self) -> bool {
-        !self.by_name.is_empty()
-            && self
-                .by_name
-                .keys()
-                .all(|name| name.starts_with(PROBE_PREFIX))
+        self.all_under(PROBE_PREFIX)
+    }
+
+    /// Whether every motion this table holds is a [`YAW_PROBE_PREFIX`] instrument,
+    /// and it holds at least one.
+    ///
+    /// What tells a run of the body yaw's probes from any other probe run, for a
+    /// reader that has to know whose holds it is judging. An empty table is
+    /// neither.
+    #[must_use]
+    pub fn yaw_probes_only(&self) -> bool {
+        self.all_under(YAW_PROBE_PREFIX)
+    }
+
+    /// Whether the table holds at least one motion and every one is named under
+    /// `prefix`.
+    fn all_under(&self, prefix: &str) -> bool {
+        !self.by_name.is_empty() && self.by_name.keys().all(|name| name.starts_with(prefix))
     }
 
     /// How many motions the table holds.
@@ -538,7 +557,10 @@ struct PoseRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_MOTIONS, MAX_POSES, MotionTable, PoseTable, SidecarError, parse};
+    use super::{
+        MAX_MOTIONS, MAX_POSES, MotionTable, PROBE_PREFIX, PoseTable, SidecarError,
+        YAW_PROBE_PREFIX, parse,
+    };
 
     const SIDECAR: &str = r#"{
   "clips": [{"clip_id": 0, "name": "bench/nod"}],
@@ -592,6 +614,41 @@ mod tests {
                 .probes_only()
         );
         assert!(!MotionTable::default().probes_only());
+    }
+
+    #[test]
+    fn a_table_of_yaw_probes_alone_says_so() {
+        let yaw = MotionTable::from_sidecar(
+            r#"{"motions": [
+                {"motion_id": 70, "name": "probe/yaw-hold", "duration_ms": 48000,
+                 "blend_out_ms": 200}
+            ]}"#,
+        )
+        .expect("the emitter's own shape");
+        assert!(yaw.yaw_probes_only());
+        assert!(yaw.probes_only());
+        let antenna = MotionTable::from_sidecar(
+            r#"{"motions": [
+                {"motion_id": 66, "name": "probe/antenna-step-a", "duration_ms": 19520,
+                 "blend_out_ms": 200}
+            ]}"#,
+        )
+        .expect("the emitter's own shape");
+        assert!(!antenna.yaw_probes_only());
+        let mixed = MotionTable::from_sidecar(
+            r#"{"motions": [
+                {"motion_id": 66, "name": "probe/antenna-step-a", "duration_ms": 19520,
+                 "blend_out_ms": 200},
+                {"motion_id": 70, "name": "probe/yaw-hold", "duration_ms": 48000,
+                 "blend_out_ms": 200}
+            ]}"#,
+        )
+        .expect("the emitter's own shape");
+        assert!(!mixed.yaw_probes_only());
+        assert!(!MotionTable::default().yaw_probes_only());
+        // A yaw probe is a probe, so a tour that leaves the probes out leaves these
+        // out too.
+        assert!(YAW_PROBE_PREFIX.starts_with(PROBE_PREFIX));
     }
 
     #[test]

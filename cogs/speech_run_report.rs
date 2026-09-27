@@ -2683,7 +2683,7 @@ fn refusal_kinds() -> Vec<&'static str> {
             accepted: 0,
         }
         .kind(),
-        Refusal::Uncompilable(CompileError::NoPose).kind(),
+        Refusal::Uncompilable(CompileError::NoDestination).kind(),
     ]
 }
 

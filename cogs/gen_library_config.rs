@@ -57,7 +57,8 @@ use reachy_poses::format::Pose as LoadedPose;
 
 mod probe_clips;
 
-use probe_clips::{Folds, PROBES};
+// Aliased: `documents` is already the clip walk's.
+use probe_clips::{Folds, document_path, documents as probe_documents};
 
 /// What the emitted clip asset says about itself before its first clip.
 ///
@@ -213,27 +214,25 @@ fn run(args: &Args, say: &mut dyn FnMut(String)) -> anyhow::Result<()> {
 
 /// Write every probe document from its table, before the walk reads them.
 ///
-/// The probes are instruments whose poses are the library's own folds, so they
-/// are authored here rather than by hand: a document holding hundreds of copies
-/// of a delta is re-transcribed whenever the fold behind it moves, and a
-/// stale one loads and emits exactly as happily as a fresh one. The rest of the
+/// Two kinds: the antenna probes, clips whose poses are the library's own folds,
+/// and the body yaw's probes, sequences over one-frame yaw clips written with
+/// them. They are authored here rather than by hand: a document holding hundreds
+/// of copies of a delta is re-transcribed whenever the fold behind it moves, and
+/// a stale one loads and emits exactly as happily as a fresh one. The rest of the
 /// library is recorded content and arrives as documents.
 ///
 /// The write is part of the emit rather than a target of its own so that `make
 /// library-config` is one command for both halves, and so the asset can never
 /// be regenerated from probe documents the table has moved on from.
 fn write_probes(clips: &Path, folds: &Folds, say: &mut dyn FnMut(String)) -> anyhow::Result<()> {
-    for probe in PROBES {
-        let path = probe.path(clips);
-        let document = probe.document(folds).with_context(|| {
-            format!("{}: the probe table does not author a document", probe.name)
-        })?;
+    for document in probe_documents(folds)? {
+        let path = document_path(clips, &document.name);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot make {}", parent.display()))?;
         }
-        write(&path, &document)?;
-        say(format!("probe {} to {}", probe.name, path.display()));
+        write(&path, &document.text)?;
+        say(format!("probe {} to {}", document.name, path.display()));
     }
     Ok(())
 }
@@ -873,7 +872,7 @@ mod tests {
     use reachy_kin::neutral_head_pose;
     use reachy_scratch::scratch_dir;
 
-    use super::probe_clips::Pose;
+    use super::probe_clips::{PROBES, Pose, YAW_PROBES, yaw_clip_name};
 
     /// The environment variable naming the committed clip documents' directory,
     /// relative to the runfiles root, which is a test's working directory.
@@ -1707,17 +1706,15 @@ mod tests {
     #[test]
     fn the_committed_probe_documents_are_what_the_table_authors() {
         let texts = texts_ref();
-        for probe in PROBES {
-            let suffix = format!("{}.json", probe.name);
+        let authored = probe_documents(&folds()).expect("the tables author their documents");
+        for doc in &authored {
+            let suffix = format!("{}.json", doc.name);
             let (source, text) = texts
                 .iter()
                 .find(|(source, _)| source.ends_with(&suffix))
-                .unwrap_or_else(|| panic!("{} is not a committed document", probe.name));
+                .unwrap_or_else(|| panic!("{} is not a committed document", doc.name));
             assert_eq!(
-                *text,
-                probe
-                    .document(&folds())
-                    .expect("the table authors a document"),
+                *text, doc.text,
                 "{source} is stale; run `make library-config`"
             );
         }
@@ -1734,7 +1731,7 @@ mod tests {
             {
                 let name = rest.trim_end_matches(".json");
                 assert!(
-                    PROBES.iter().any(|probe| probe.name == name),
+                    authored.iter().any(|doc| doc.name == name),
                     "{source} is a probe document with no row in the table"
                 );
             }
@@ -1801,6 +1798,80 @@ mod tests {
                     frames.iter().filter(|frame| **frame == angles).count(),
                     "{name} does not carry {pose:?} the number of times its table states"
                 );
+            }
+        }
+    }
+
+    /// A yaw probe is a step-and-hold sequence, and this is the assertion that
+    /// its shape survives into the library the machine plays: one segment per
+    /// step, each a one-frame body-yaw clip entered with no blend, and the gap
+    /// after it the rest of the step's frames on the tick grid.
+    #[test]
+    fn every_yaw_probe_the_library_carries_is_the_sequence_the_table_states() {
+        let emitted = baseline();
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&emitted.names_json()).expect("the sidecar is JSON");
+        let motions = sidecar["motions"].as_array().expect("a motions table");
+        let clip_id = |name: &str| {
+            emitted
+                .clips
+                .entries
+                .iter()
+                .position(|clip| clip.name == name)
+                .unwrap_or_else(|| panic!("{name} is a clip"))
+        };
+        for probe in YAW_PROBES {
+            let name = probe.name;
+            let motion = emitted
+                .motions
+                .entries
+                .iter()
+                .find(|motion| motion.name == name)
+                .unwrap_or_else(|| panic!("{name} is not in the library"));
+            assert_eq!(motion.parts, Some(probe.steps.len()), "{name}");
+            let row = motions
+                .iter()
+                .find(|row| row["name"] == json!(name))
+                .unwrap_or_else(|| panic!("{name} is not playable"));
+            // 20 ms a frame, which is the tick rate the format pins.
+            assert_eq!(row["duration_ms"], json!(probe.frames() * 20), "{name}");
+
+            let mut expected = String::from("  lead_gap_ms: 0\n");
+            for step in probe.steps {
+                let _ = write!(
+                    expected,
+                    "  segments {{\n    clip_id: {}\n    speed: 1.0\n    gap_after_ms: {}\n  }}\n",
+                    clip_id(&yaw_clip_name(step.mrad)),
+                    (step.frames - 1) * 20
+                );
+            }
+            let printed = emitted
+                .textproto
+                .split(&format!("\n# {name}\nmotions {{\n"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name}'s motion is not printed"));
+            // The block ends at its own closing brace, the one at the line's
+            // start; the segments' closing braces are indented.
+            let (block, _) = printed
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("{name}'s motion block is not closed"));
+            assert_eq!(format!("{block}\n"), expected, "{name}");
+
+            for step in probe.steps {
+                let clip_name = yaw_clip_name(step.mrad);
+                let clip = &emitted.clips.entries[clip_id(&clip_name)];
+                assert_eq!(clip.parts, Some(1), "{clip_name}");
+                let block = emitted
+                    .textproto
+                    .split("\n# ")
+                    .find(|block| block.starts_with(&format!("{clip_name}\nclips {{")))
+                    .unwrap_or_else(|| panic!("{clip_name}'s clip block is not in the text"));
+                assert!(
+                    block.contains("\n  blend_in_ms: 0\n"),
+                    "{clip_name}: {block:.200}"
+                );
+                let printed = format!("body_yaw_d: {} ", number(f64::from(step.mrad) / 1000.0));
+                assert!(block.contains(&printed), "{clip_name}: {block:.400}");
             }
         }
     }

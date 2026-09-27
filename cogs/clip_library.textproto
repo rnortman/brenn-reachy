@@ -92,10 +92,17 @@
 #   73  probe/antenna-step-a
 #   74  probe/antenna-step-b
 #   75  probe/antenna-sweep
-#   76  bench/sway
-#   77  bench/tip
-#   78  wave_left
-#   79  wave_right
+#   76  probe/yaw-at/minus-1000
+#   77  probe/yaw-at/minus-1500
+#   78  probe/yaw-at/minus-500
+#   79  probe/yaw-at/plus-1000
+#   80  probe/yaw-at/plus-1500
+#   81  probe/yaw-at/plus-500
+#   82  probe/yaw-at/zero
+#   83  bench/sway
+#   84  bench/tip
+#   85  wave_left
+#   86  wave_right
 #
 # motion_id  name
 #   0  dance
@@ -174,11 +181,20 @@
 #   73  probe/antenna-step-a
 #   74  probe/antenna-step-b
 #   75  probe/antenna-sweep
-#   76  bench/sway
-#   77  bench/tip
-#   78  bench/tour
-#   79  wave_left
-#   80  wave_right
+#   76  probe/yaw-at/minus-1000
+#   77  probe/yaw-at/minus-1500
+#   78  probe/yaw-at/minus-500
+#   79  probe/yaw-at/plus-1000
+#   80  probe/yaw-at/plus-1500
+#   81  probe/yaw-at/plus-500
+#   82  probe/yaw-at/zero
+#   83  probe/yaw-hold
+#   84  probe/yaw-step
+#   85  bench/sway
+#   86  bench/tip
+#   87  bench/tour
+#   88  wave_left
+#   89  wave_right
 
 # dance
 clips {
@@ -23445,6 +23461,146 @@ clips {
   frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
 }
 
+# probe/yaw-at/minus-1000
+clips {
+  mask: 1
+  frame_rate_hz: 50.0
+  blend_in_ms: 0
+  blend_out_ms: 20
+  posed_mask: 0
+  anchor_head_dx: 0.0
+  anchor_head_dy: 0.0
+  anchor_head_dz: 0.177
+  anchor_head_qw: 1.0
+  anchor_head_qx: 0.0
+  anchor_head_qy: 0.0
+  anchor_head_qz: 0.0
+  anchor_body_yaw: 0.0
+  anchor_antenna_right: 0.0
+  anchor_antenna_left: 0.0
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -1.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+}
+
+# probe/yaw-at/minus-1500
+clips {
+  mask: 1
+  frame_rate_hz: 50.0
+  blend_in_ms: 0
+  blend_out_ms: 20
+  posed_mask: 0
+  anchor_head_dx: 0.0
+  anchor_head_dy: 0.0
+  anchor_head_dz: 0.177
+  anchor_head_qw: 1.0
+  anchor_head_qx: 0.0
+  anchor_head_qy: 0.0
+  anchor_head_qz: 0.0
+  anchor_body_yaw: 0.0
+  anchor_antenna_right: 0.0
+  anchor_antenna_left: 0.0
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -1.5 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+}
+
+# probe/yaw-at/minus-500
+clips {
+  mask: 1
+  frame_rate_hz: 50.0
+  blend_in_ms: 0
+  blend_out_ms: 20
+  posed_mask: 0
+  anchor_head_dx: 0.0
+  anchor_head_dy: 0.0
+  anchor_head_dz: 0.177
+  anchor_head_qw: 1.0
+  anchor_head_qx: 0.0
+  anchor_head_qy: 0.0
+  anchor_head_qz: 0.0
+  anchor_body_yaw: 0.0
+  anchor_antenna_right: 0.0
+  anchor_antenna_left: 0.0
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: -0.5 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+}
+
+# probe/yaw-at/plus-1000
+clips {
+  mask: 1
+  frame_rate_hz: 50.0
+  blend_in_ms: 0
+  blend_out_ms: 20
+  posed_mask: 0
+  anchor_head_dx: 0.0
+  anchor_head_dy: 0.0
+  anchor_head_dz: 0.177
+  anchor_head_qw: 1.0
+  anchor_head_qx: 0.0
+  anchor_head_qy: 0.0
+  anchor_head_qz: 0.0
+  anchor_body_yaw: 0.0
+  anchor_antenna_right: 0.0
+  anchor_antenna_left: 0.0
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 1.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+}
+
+# probe/yaw-at/plus-1500
+clips {
+  mask: 1
+  frame_rate_hz: 50.0
+  blend_in_ms: 0
+  blend_out_ms: 20
+  posed_mask: 0
+  anchor_head_dx: 0.0
+  anchor_head_dy: 0.0
+  anchor_head_dz: 0.177
+  anchor_head_qw: 1.0
+  anchor_head_qx: 0.0
+  anchor_head_qy: 0.0
+  anchor_head_qz: 0.0
+  anchor_body_yaw: 0.0
+  anchor_antenna_right: 0.0
+  anchor_antenna_left: 0.0
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 1.5 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+}
+
+# probe/yaw-at/plus-500
+clips {
+  mask: 1
+  frame_rate_hz: 50.0
+  blend_in_ms: 0
+  blend_out_ms: 20
+  posed_mask: 0
+  anchor_head_dx: 0.0
+  anchor_head_dy: 0.0
+  anchor_head_dz: 0.177
+  anchor_head_qw: 1.0
+  anchor_head_qx: 0.0
+  anchor_head_qy: 0.0
+  anchor_head_qz: 0.0
+  anchor_body_yaw: 0.0
+  anchor_antenna_right: 0.0
+  anchor_antenna_left: 0.0
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.5 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+}
+
+# probe/yaw-at/zero
+clips {
+  mask: 1
+  frame_rate_hz: 50.0
+  blend_in_ms: 0
+  blend_out_ms: 20
+  posed_mask: 0
+  anchor_head_dx: 0.0
+  anchor_head_dy: 0.0
+  anchor_head_dz: 0.177
+  anchor_head_qw: 1.0
+  anchor_head_qx: 0.0
+  anchor_head_qy: 0.0
+  anchor_head_qz: 0.0
+  anchor_body_yaw: 0.0
+  anchor_antenna_right: 0.0
+  anchor_antenna_left: 0.0
+  frames { head_dx: 0.0 head_dy: 0.0 head_dz: 0.0 quat_w: 0.0 quat_x: 0.0 quat_y: 0.0 quat_z: 0.0 body_yaw_d: 0.0 antenna_right_d: 0.0 antenna_left_d: 0.0 }
+}
+
 # bench/sway
 clips {
   mask: 1
@@ -24618,7 +24774,7 @@ motions {
   }
 }
 
-# bench/sway
+# probe/yaw-at/minus-1000
 motions {
   lead_gap_ms: 0
   segments {
@@ -24628,7 +24784,7 @@ motions {
   }
 }
 
-# bench/tip
+# probe/yaw-at/minus-1500
 motions {
   lead_gap_ms: 0
   segments {
@@ -24638,22 +24794,7 @@ motions {
   }
 }
 
-# bench/tour
-motions {
-  lead_gap_ms: 0
-  segments {
-    clip_id: 77
-    speed: 1.0
-    gap_after_ms: 400
-  }
-  segments {
-    clip_id: 76
-    speed: 1.0
-    gap_after_ms: 0
-  }
-}
-
-# wave_left
+# probe/yaw-at/minus-500
 motions {
   lead_gap_ms: 0
   segments {
@@ -24663,11 +24804,251 @@ motions {
   }
 }
 
-# wave_right
+# probe/yaw-at/plus-1000
 motions {
   lead_gap_ms: 0
   segments {
     clip_id: 79
+    speed: 1.0
+    gap_after_ms: 0
+  }
+}
+
+# probe/yaw-at/plus-1500
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 80
+    speed: 1.0
+    gap_after_ms: 0
+  }
+}
+
+# probe/yaw-at/plus-500
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 81
+    speed: 1.0
+    gap_after_ms: 0
+  }
+}
+
+# probe/yaw-at/zero
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 0
+  }
+}
+
+# probe/yaw-hold
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 11980
+  }
+  segments {
+    clip_id: 79
+    speed: 1.0
+    gap_after_ms: 11980
+  }
+  segments {
+    clip_id: 76
+    speed: 1.0
+    gap_after_ms: 11980
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 11980
+  }
+}
+
+# probe/yaw-step
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 0
+  }
+  segments {
+    clip_id: 81
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 78
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 79
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 76
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 80
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 77
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 81
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 78
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 79
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 76
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 80
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 77
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+  segments {
+    clip_id: 82
+    speed: 1.0
+    gap_after_ms: 1480
+  }
+}
+
+# bench/sway
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 83
+    speed: 1.0
+    gap_after_ms: 0
+  }
+}
+
+# bench/tip
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 84
+    speed: 1.0
+    gap_after_ms: 0
+  }
+}
+
+# bench/tour
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 84
+    speed: 1.0
+    gap_after_ms: 400
+  }
+  segments {
+    clip_id: 83
+    speed: 1.0
+    gap_after_ms: 0
+  }
+}
+
+# wave_left
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 85
+    speed: 1.0
+    gap_after_ms: 0
+  }
+}
+
+# wave_right
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 86
     speed: 1.0
     gap_after_ms: 0
   }

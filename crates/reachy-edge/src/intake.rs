@@ -456,7 +456,7 @@ mod tests {
             "stale",
         );
         assert_eq!(
-            Refusal::Uncompilable(CompileError::NoPose).kind(),
+            Refusal::Uncompilable(CompileError::NoDestination).kind(),
             "uncompilable",
         );
 
@@ -477,7 +477,7 @@ mod tests {
                 accepted: 0,
             }
             .kind(),
-            Refusal::Uncompilable(CompileError::NoPose).kind(),
+            Refusal::Uncompilable(CompileError::NoDestination).kind(),
         ];
         kinds.sort_unstable();
         let named = kinds.len();

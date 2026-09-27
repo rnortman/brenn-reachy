@@ -3,9 +3,10 @@
 //! Four arguments: the output log directory and the three config textprotos the
 //! process ran against. Everything asserted here is read out of those.
 //!
-//! What is S13's among them is the answer each of the four scripts got and the
-//! order of the two things that must not overlap: the release's last write and
-//! the second engagement's ask. Every other property of a healthy run is
+//! What is S13's among them is the answer each of the four scripts got, the
+//! order of the two things that must not overlap -- the release's last write and
+//! the second engagement's ask -- and the second session's look: where it lands,
+//! body included, and the clock it runs on. Every other property of a healthy run is
 //! `scenario::check`'s, and they all still hold -- a run that answered every
 //! script correctly and gapped the goal stream doing it is not the run this
 //! scenario is for.
@@ -21,15 +22,23 @@ use brenn_reachy__hardware__dynamixel__registers_clk_rs::RegIdWire;
 use brenn_reachy__motion__bus_txn_clk_rs::AuxOpKindWire;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use brenn_reachy__motion__reports_clk_rs::RefusalReasonWire;
-use reachy_motion::joints::ROW_COUNT;
+use reachy_motion::joints::{JointRef, ROW_COUNT, row};
 use scenario::check;
 use scenario::read::Run;
 
 use s13_scenario::{
-    CLOSING_SCRIPT_ID, HELD_SCRIPT_ID, KEEP_SCRIPT_ID, OPENING_SCRIPT_ID, closing_cycle,
-    disengage_cycle, duplicate_cycle, end_cycle, keep_sent_cycle, keep_stamped_cycle,
-    script_sent_cycle, second_disengage_cycle, second_stow_start_cycle, stow_start_cycle,
+    CLOSING_SCRIPT_ID, HELD_SCRIPT_ID, KEEP_SCRIPT_ID, LOOK_BEARING_MRAD, LOOK_ELEVATION_MRAD,
+    OPENING_SCRIPT_ID, closing_cycle, disengage_cycle, duplicate_cycle, end_cycle, keep_sent_cycle,
+    keep_stamped_cycle, script_sent_cycle, second_disengage_cycle, second_look_start_cycle,
+    second_stow_start_cycle, stow_start_cycle,
 };
+
+/// How many cycles past the look's clock the goal stream may still move.
+///
+/// The mover acts on a row the cycle it comes due or the one after, and the goal
+/// is dated ahead of the sample, so the stream is still only by a couple of
+/// cycles past the clock.
+const LOOK_DISPATCH_SLACK_CYCLES: i64 = 2;
 
 fn main() -> ExitCode {
     check::main("s13_checker", |run, failures| {
@@ -137,6 +146,7 @@ fn main() -> ExitCode {
         check::estimates_valid(run, failures);
         check_arrival(run, failures);
         check_keep_froze_the_raise(run, failures);
+        check_look_ran_on_its_head_clock(run, failures);
         if let Some(rested) = engaged.and_then(|engaged| engaged.rested) {
             check_torque_off_before_the_second_ask(run, rested, failures);
         }
@@ -150,7 +160,12 @@ fn main() -> ExitCode {
 }
 
 /// The machine arrives at what each session's schedule asked for: stowed by the
-/// end of the first session's fold, and upright and then stowed in the second.
+/// end of the first session's fold, and upright, then at its look -- the body
+/// yaw included -- and then stowed in the second.
+///
+/// The look is judged against the Mover's own composition of its direction.
+/// [`check::arrived_at`] reads the head pose and the antennas, and the look also
+/// turns the body, so the body yaw's reading is asserted beside it.
 ///
 /// The first session's fold is the keep script's, and "stowed" is what shows the
 /// drained schedule ran: the opening script has no fold. Its raise is not
@@ -166,10 +181,29 @@ fn check_arrival(run: &Run, failures: &mut Vec<String>) {
     check::arrived_at(
         run,
         "upright again",
-        second_stow_start_cycle() - 1,
+        second_look_start_cycle() - 1,
         &scenario::neutral_pose(),
         failures,
     );
+    let look = scenario::look_pose(LOOK_BEARING_MRAD, LOOK_ELEVATION_MRAD);
+    let looking = second_stow_start_cycle() - 1;
+    check::arrived_at(run, "looking", looking, &look, failures);
+    match (check::sample_at(run, looking), row(JointRef::BodyYaw)) {
+        (None, _) => failures.push(format!(
+            "no sample for cycle {looking}, where the body should be turned to the look"
+        )),
+        (_, None) => failures.push(format!("{:?} sits on no bus row", JointRef::BodyYaw)),
+        (Some(sample), Some(body)) => {
+            let present = check::present_rows(sample)[body];
+            if (present - look.body_yaw).abs() > check::ARRIVAL_TOLERANCE {
+                failures.push(format!(
+                    "at cycle {looking} the body yaw reads {present} rad and the look puts it at \
+                     {} rad",
+                    look.body_yaw
+                ));
+            }
+        }
+    }
     check::arrived_at(
         run,
         "stowed again",
@@ -242,6 +276,49 @@ fn check_torque_off_before_the_second_ask(run: &Run, rested: i64, failures: &mut
              rest on {rested}: a script held through a release is drained on the wake the release \
              confirms, and that wake takes the engagement's first bus step"
         ));
+    }
+}
+
+/// The second session's look ran on the clock the deployed head clock and the
+/// mover's floor give it: the goal was still moving halfway through that clock,
+/// and it does not move again from the clock's end until the fold.
+///
+/// The tick's `MoveTo` is an in-process call and is not logged, so this is where
+/// its durations show: in the goal stream, measured against the clock the
+/// mover's own floor gives the move. Its target is the arrival reads'. The
+/// mover acts on the row the cycle it comes due or the one after, and the goal
+/// is dated ahead of the sample, so the stream is held from a couple of cycles
+/// past the clock.
+fn check_look_ran_on_its_head_clock(run: &Run, failures: &mut Vec<String>) {
+    let look = scenario::look_pose(LOOK_BEARING_MRAD, LOOK_ELEVATION_MRAD);
+    let start = second_look_start_cycle();
+    let moving = scenario::look_clocks(&scenario::neutral_pose(), &look).cycles();
+    let halfway = start + moving / 2;
+    let before = check::goal_at_or(run, halfway, "turning to the look", failures);
+    let after = check::goal_at_or(run, halfway + 1, "turning to the look", failures);
+    if let (Some(before), Some(after)) = (before, after)
+        && before == after
+    {
+        failures.push(format!(
+            "the goal stood still halfway through the look's {moving}-cycle clock (cycle \
+             {halfway}): the look did not move on the clock the deployed head clock and the \
+             mover's floor give it"
+        ));
+    }
+    let settled = start + moving + LOOK_DISPATCH_SLACK_CYCLES;
+    let Some(held) = check::goal_at_or(run, settled, "holding the look", failures) else {
+        return;
+    };
+    for cycle in settled + 1..second_stow_start_cycle() {
+        if check::goal_at(run, cycle) != Some(held) {
+            failures.push(format!(
+                "the goal moved on cycle {cycle}, {} cycles past the look's {moving}-cycle clock: \
+                 the look ran on a clock other than the one the deployed head clock and the \
+                 mover's floor give it",
+                cycle - start - moving
+            ));
+            return;
+        }
     }
 }
 

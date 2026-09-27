@@ -1,0 +1,12 @@
+{
+  "blend_in_ms": 0,
+  "channels": ["body_yaw"],
+  "description": "one frame of body yaw at +0.0 rad over the base, which the yaw probes step to and hold with the gap after it",
+  "frame_hz": 50.0,
+  "frames": [
+    {"body_yaw":0.0}
+  ],
+  "kind": "clip",
+  "name": "probe/yaw-at/zero",
+  "version": 1
+}

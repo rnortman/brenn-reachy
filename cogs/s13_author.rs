@@ -7,7 +7,8 @@
 //! driver cycle. The third is a keep sent mid-raise and stamped a couple of
 //! cycles before it is sent, as an edge's receipt precedes the mover's first
 //! look. The other two arrive inside the release the first session ends at, the
-//! second of them carrying the first's number.
+//! second of them carrying the first's number. That closing script is the
+//! second session's schedule: it raises the head, looks, and folds.
 //!
 //! The plant is never touched: every hold, the refusal and both engagements are
 //! the system's own answers.

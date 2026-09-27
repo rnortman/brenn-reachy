@@ -277,6 +277,20 @@ impl Sequence {
     }
 }
 
+/// A sequence document as the tree commits one: the same layout a clip document
+/// is committed in, one entry a line.
+///
+/// # Panics
+///
+/// Never: a sequence document serialises to a JSON object.
+#[must_use]
+pub fn render_sequence(doc: &SequenceDoc) -> String {
+    crate::format::render_committed(
+        &serde_json::to_value(doc).expect("a sequence document is JSON"),
+        "entries",
+    )
+}
+
 /// Validate one document entry and convert it.
 fn validated_entry(index: usize, entry: &EntryDoc) -> Result<Entry, SequenceError> {
     match (&entry.reference, entry.gap_ms) {
@@ -501,5 +515,19 @@ mod tests {
         let sequence = Sequence::from_doc(doc()).expect("well-formed");
         let json = serde_json::to_string(&sequence.to_doc().entries[1]).expect("serialisable");
         assert_eq!(json, r#"{"gap_ms":300}"#);
+    }
+
+    #[test]
+    fn a_sequence_renders_one_entry_a_line_and_reads_back() {
+        let text = render_sequence(&doc());
+        assert!(text.ends_with("}\n"));
+        assert!(text.lines().any(|line| line == "  \"entries\": ["));
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("    {"))
+                .count(),
+            3
+        );
+        assert_eq!(serde_json::from_str::<SequenceDoc>(&text).unwrap(), doc());
     }
 }

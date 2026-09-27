@@ -672,36 +672,48 @@ pub struct ClipDoc {
 /// A clip document as the tree commits one: `serde`'s own JSON, laid out with
 /// the frame track one frame per line.
 ///
-/// The layout is what makes a committed document reviewable — 775 frames on one
-/// line is a diff nobody reads — and it is all this function decides. Every key
-/// and every value comes from the format's own serialisation, so the two are
-/// never spelled twice.
+/// The layout is `render_committed`'s, with the frame track as the expanded
+/// array.
 ///
 /// # Panics
 ///
 /// Never for a document this type can hold: its serialisation is a JSON object.
 #[must_use]
 pub fn render_document(doc: &ClipDoc) -> String {
-    let value = serde_json::to_value(doc).expect("a clip document is JSON");
+    render_committed(
+        &serde_json::to_value(doc).expect("a clip document is JSON"),
+        "frames",
+    )
+}
+
+/// A document as the tree commits one: `serde`'s own JSON, one key a line, with
+/// the array under `track` laid out one element per line. The layout is what
+/// makes a committed document reviewable, and it is all this function decides.
+/// Every key and value comes from the format's own serialisation.
+///
+/// # Panics
+///
+/// If `value` is not a JSON object.
+pub(crate) fn render_committed(value: &serde_json::Value, track: &str) -> String {
     let fields = value
         .as_object()
-        .expect("a clip document is a JSON object")
+        .expect("a committed document is a JSON object")
         .clone();
     let mut out = String::from("{\n");
     for (index, (key, field)) in fields.iter().enumerate() {
         let comma = if index + 1 == fields.len() { "" } else { "," };
-        let key = serde_json::to_string(key).expect("a key is JSON");
-        match field.as_array().filter(|_| key == "\"frames\"") {
-            Some(frames) => {
-                let _ = writeln!(out, "  {key}: [");
-                for (index, frame) in frames.iter().enumerate() {
-                    let inner = if index + 1 == frames.len() { "" } else { "," };
-                    let _ = writeln!(out, "    {frame}{inner}");
+        let quoted = serde_json::to_string(key).expect("a key is JSON");
+        match field.as_array().filter(|_| key == track) {
+            Some(elements) => {
+                let _ = writeln!(out, "  {quoted}: [");
+                for (index, element) in elements.iter().enumerate() {
+                    let inner = if index + 1 == elements.len() { "" } else { "," };
+                    let _ = writeln!(out, "    {element}{inner}");
                 }
                 let _ = writeln!(out, "  ]{comma}");
             }
             None => {
-                let _ = writeln!(out, "  {key}: {field}{comma}");
+                let _ = writeln!(out, "  {quoted}: {field}{comma}");
             }
         }
     }

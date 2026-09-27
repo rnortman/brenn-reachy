@@ -29,7 +29,7 @@
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use reachy_motion::joints::{JointRef, ROW_COUNT, flags};
-use scenario::author::Step;
+use scenario::author::{Step, StepBase};
 use scenario::{SESSION_WAKE_FLOOR_NS, cycle_at, cycles_for, hold_timeout_cycles};
 
 // Where a run begins, and the cycle a script may first be taken on. The armed
@@ -102,7 +102,9 @@ pub fn steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(script_sent_cycle()),
         end_ns: cycle_at(end_cycle()),
-        pose: Some(scenario::NEUTRAL_POSE),
-        move_ms: None,
+        base: StepBase::Pose {
+            name: scenario::NEUTRAL_POSE,
+            move_ms: None,
+        },
     }]
 }

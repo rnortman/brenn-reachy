@@ -175,7 +175,8 @@ schema MoverState
         // span the configured clock cannot carry is lengthened rather than
         // refused. Zero on a healthy machine is the invariant this field exists
         // to make legible; the de-phasing every base move asks for is
-        // routine and is counted next door, in `base_dephased`.
+        // routine and is counted next door, in `base_dephased`, and a look's
+        // span stretch is its pace and is counted in `look_paced`.
         #20 base_stretched: UInt64;
 
         // How many base plans were adjusted only to de-phase the antenna pair,
@@ -199,6 +200,24 @@ schema MoverState
         // compared against to decide whether the machine has somewhere new to
         // be.
         #23 desired_pose_id: UInt16;
+
+        // The direction of the last dispatched look, milliradians; zero
+        // otherwise. Compared with `desired_kind`, `desired_pose_id` and
+        // `desired_pace`, so a look at the same direction asks for nothing new.
+        #24 desired_bearing_mrad: Int32;
+
+        // Its elevation, milliradians; zero otherwise.
+        #25 desired_elevation_mrad: Int32;
+
+        // How many look plans were lengthened for their span, all run. A look's
+        // configured clock is sized for the head, and the body's pace is the
+        // step floor, so a look whose body swing the head's clock cannot carry
+        // is lengthened by design and counts here rather than in
+        // `base_stretched`, which stays zero on a healthy machine. Nearly
+        // always the stretch is for the body's span; a look from far off the
+        // leg travel (from `stow`, say) may also be lengthened for the legs,
+        // and counts here the same way.
+        #26 look_paced: UInt64;
     }
     history
     {

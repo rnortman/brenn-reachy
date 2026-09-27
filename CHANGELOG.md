@@ -21,6 +21,15 @@ Nothing has been released.
   scripts walk every transition into and out of the new poses. They have not
   been run on a unit, so the clearance floor's measured residuals still cover
   only the earlier five poses.
+- **A script can ask for a look.** A motion script step may carry `look`, with
+  `bearing_mrad` (from the base's forward, positive to the robot's left) and
+  `elevation_mrad` (above level), instead of naming a pose. The machine splits the
+  bearing between the head (up to `look_head_share_rad`, 30° in the shipped
+  `MoverParams`, at most 54°) and the body, pitches the head to the elevation, holds
+  the antennas at `neutral`'s pair, and moves on `look_head_ms` (400 ms), with the
+  body paced by the planner's per-period step bound. A look the envelope refuses is
+  a refused command. A decoder from before this change refuses a script carrying a
+  look whole. Nothing on the voice host sends one yet.
 - **The voice host knows where the head is.** The control process sends every
   head pose estimate to the voice host on loopback port 7411, and the host keeps
   the newest usable one for choosing where to look. `reachy-kin` gains `mic`,
@@ -67,9 +76,31 @@ Nothing has been released.
   judges anything.
 - **`--resync` refuses a unit whose hostname is not the staged host
   configuration's `pod`** (exit 19).
+- **Body-yaw probes.** `probe/yaw-step` steps the body yaw 0.5, 1.0 and 1.5 rad
+  either way and back, each held 1.5 s, twice. `probe/yaw-hold` holds it 12 s at
+  the base and at 1.0 rad either way. A probe run of either is judged on the yaw's
+  own holds: three counts or more turning regularly hunts and fails the run, three
+  counts or more that is not regular is an unexpected reading and fails it, and
+  anything under three counts is quiet.
 
 ### Changed
 
+- **Settle evidence reads legs at rest.** The settle report no longer reads each
+  leg 24 ms after the last commanded change, which measured the tail of arrival.
+  For every base move it now finds when each leg came to rest (two counts for
+  200 ms) and reports three figures per leg from there: the settled residual,
+  the overshoot past the target, and the signed creep across the hold. The
+  18-count bound judges the larger of the residual and the overshoot. A move
+  whose legs never come to rest before the hold ends is reported unsettled, and
+  fails a `--settle-evidence` run. Look steps are measured beside pose steps and
+  labelled by their direction.
+- **The machine turns its body at the body yaw's own speed.** The per-period
+  step bound on the body yaw, which paces every body swing the machine plans for
+  itself (a look's among them), is now twice the yaw's commissioned speed per
+  period — 0.048 rad at 50 Hz on the shipped pair — instead of 0.15 rad. A
+  planned move that turns the body far enough runs longer: a fold from half a
+  turn now takes about 2.5 s rather than 0.8 s. Clips and other content are not
+  step-guarded and are unchanged.
 - **The idle loop dances a short, slow set.** Ten gentle clips at half speed
   replace the full 68-clip list, which kept the microphone's voice gate open
   and cost wakes.
@@ -431,6 +462,11 @@ Nothing has been released.
 
 ### Fixed
 
+- **A two-count flicker is two counts wherever a joint stands.** Stillness and
+  settle verdicts compare a spread of readings in whole encoder counts, so a
+  joint dithering over two counts is no longer judged past the two-count bound
+  at positions where converting counts to radians rounds the spread a hair over
+  it.
 - **A wake that freezes the head now freezes it.** A speech script that keeps
   the head and then stows it — what `presence_wake_pose = "keep"` sends — is
   no longer dropped by the idle loop as a stale stow.

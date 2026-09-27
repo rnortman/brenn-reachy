@@ -10,8 +10,9 @@
 //! The unit of intent is a **script**: a timeline at offsets from the moment it
 //! arrives, under a timeout after which the head goes back down. Its steps come
 //! in two kinds — a **base** step, which is where the head is going (a pose
-//! named in the daemon's own library, or `keep`: hold the base where it is), and
-//! a **play** step, which starts a named motion from that library as an overlay
+//! named in the daemon's own library; `keep`: hold the base where it is; or a
+//! look: a direction, which the daemon turns into head and body targets
+//! itself), and a **play** step, which starts a named motion from that library as an overlay
 //! layered on top of whatever the base is doing. The base collapses to the last
 //! due step; overlays are windows, several of which can be open at once.
 //! Both kinds of name resolve at the daemon and nowhere here. One is reserved:
@@ -63,7 +64,8 @@ pub mod seq;
 
 pub use script::{
     Action, ActiveOverlay, Base, DecodeError, KEEP_BASE, MAX_ASSET_NAME_LEN,
-    MAX_CONCURRENT_OVERLAYS, MAX_SPEED, MAX_TIMEOUT_MS, MIN_SPEED, MOTION_SCRIPT_TYPE,
-    MotionScript, OverlayError, Play, PlayWindow, STOW_POSE, ScriptError, Step, speed_is_carried,
+    MAX_CONCURRENT_OVERLAYS, MAX_LOOK_BEARING_MRAD, MAX_LOOK_ELEVATION_MRAD, MAX_SPEED,
+    MAX_TIMEOUT_MS, MIN_SPEED, MOTION_SCRIPT_TYPE, MotionScript, OverlayError, Play, PlayWindow,
+    STOW_POSE, ScriptError, Step, speed_is_carried,
 };
 pub use seq::{SeqSource, unix_millis};

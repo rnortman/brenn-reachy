@@ -27,7 +27,7 @@ mod session_cog;
 // Public for the one figure the scenario harness cannot derive for itself: the
 // clocks a base move runs on once this cog has floored them, which is what says
 // whether a scripted step leaves the antennas time to arrive.
-pub use mover_overlay::{Goal, floored_clocks, planned_path};
+pub use mover_overlay::{Goal, GoalKind, floored_clocks, planned_path};
 // Public for one figure each, both read by the scenario harness: the
 // provisioning grid, whose readable cells are most of what the start-up survey
 // costs in transactions, and the bus cycle the session's staleness window counts
@@ -55,7 +55,9 @@ use nalgebra::Isometry3;
 use reachy_kin::{FkOptions, FkStats, LegAngles, default_geometry, forward_kinematics};
 use reachy_motion::arm::{ArmRecord, Gains, GroupGains, rest_pose_seeds};
 use reachy_motion::fault::{self, FaultKind};
-use reachy_motion::joints::{JointRef, JointVector, flags, rows_of, vector_of, write_vector};
+use reachy_motion::joints::{
+    JointRef, JointTargets, JointVector, flags, rows_of, vector_of, write_vector,
+};
 use reachy_motion::plant::{ClassProfile, GroupPlants, GroupProfiles};
 use reachy_motion::record;
 use reachy_motion::tick::{
@@ -478,14 +480,17 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
         // will not resolve is the refusal already reported, and one raise per
         // sample for as long as the step stood would be a channel nobody can
         // read.
-        let fresh = match asked.map(|asked| asked.goal(&library)).transpose() {
+        let fresh = match asked
+            .map(|asked| asked.goal(&library, &settings.look))
+            .transpose()
+        {
             Ok(goal) => goal.flatten(),
             Err(UnknownPose { .. }) => {
                 reports.offer(Raise::of_unknown_pose(nominal));
                 None
             }
         };
-        let standing = desired.goal(&library).unwrap_or(None);
+        let standing = desired.goal(&library, &settings.look).unwrap_or(None);
 
         // What the base does this period, and what rides on it. Three answers
         // in one call: the ordinary base move while the tick owns the base, a
@@ -792,14 +797,44 @@ struct Settings {
     lag_k: i64,
     /// The bus cycle, nanoseconds.
     period_ns: u64,
+    /// How a look step resolves.
+    look: LookSettings,
+}
+
+/// How a look step resolves: the split and the head's clock.
+#[derive(Clone, Copy)]
+struct LookSettings {
+    policy: reachy_kin::LookPolicy,
+    head: Duration,
 }
 
 impl Settings {
     /// Read and check this cog's configuration.
+    ///
+    /// Refuses a look head clock of no length, and a look head share outside
+    /// `[0, LOOK_HEAD_SHARE_LIMIT]`: a share past that limit would put a look's
+    /// head at or past the head-relative yaw cap, where a composed pose passes
+    /// or fails the envelope by rounding. Checked on the first execution, so a
+    /// configuration that drops either field fails at start rather than at the
+    /// first look.
     fn of(params: &MoverParams) -> Self {
+        assert!(
+            params.look_head_ms != 0,
+            "a look's head clock must be a length of time, not 0 ms"
+        );
+        let share = params.look_head_share_rad;
+        assert!(
+            (0.0..=reachy_kin::LOOK_HEAD_SHARE_LIMIT).contains(&share),
+            "a look's head share is {share} rad, outside [0, {}] rad — the head-relative yaw cap less a degree",
+            reachy_kin::LOOK_HEAD_SHARE_LIMIT
+        );
         Self {
             lag_k: i64::from(params.lag_k),
             period_ns: length_of(params.period_ns, "the control period"),
+            look: LookSettings {
+                policy: reachy_kin::LookPolicy { head_share: share },
+                head: Duration::from_millis(u64::from(params.look_head_ms)),
+            },
         }
     }
 
@@ -853,11 +888,14 @@ fn covering(schedule: &SessionScheduleWire, nominal: i64) -> Option<&ScheduledSt
 
 /// The base move last dispatched: where it sends the machine, and how fast.
 ///
-/// A triple rather than a pose alone. "Nothing has been dispatched" is a state
-/// of its own and the kind carries it -- a step that keeps the base is never
-/// dispatched, so `base_keep` is a value no dispatch produces -- and the pace is
-/// part of what a step asks for, so a row naming the pose already commanded at
-/// another pace is a fresh ask and dispatches.
+/// Five things a dispatch is compared on: the kind, the pose, the pace and a
+/// look's two angles. "Nothing has been dispatched" is a state of its own and
+/// the kind carries it -- a step that keeps the base is never dispatched, so
+/// `base_keep` is a value no dispatch produces -- and the pace is part of what
+/// a step asks for, so a row naming the pose already commanded at another pace
+/// is a fresh ask and dispatches. A look names no pose and states no pace, so
+/// two looks at the same direction compare equal and the second is not a
+/// fresh ask.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Desired {
     /// What the last dispatched step asked for.
@@ -866,17 +904,24 @@ struct Desired {
     pose_id: u16,
     /// How long the move that step asked for takes.
     pace: Duration,
+    /// The direction a look faces, milliradians; zero for anything else.
+    bearing_mrad: i32,
+    /// Its elevation, milliradians; zero for anything else.
+    elevation_mrad: i32,
 }
 
 impl Desired {
     /// Nothing dispatched: what a freshly armed machine has asked for.
     ///
-    /// The id and the pace are zero and nothing reads either: [`Desired::goal`]
-    /// answers `None` for a kept base before it looks at them.
+    /// The id, the pace and the angles are zero and nothing reads them:
+    /// [`Desired::goal`] answers `None` for a kept base before it looks at
+    /// them.
     const NOTHING_DISPATCHED: Self = Self {
         kind: StepKindWire::BASE_KEEP,
         pose_id: 0,
         pace: Duration::ZERO,
+        bearing_mrad: 0,
+        elevation_mrad: 0,
     };
 
     /// What the slot says was last dispatched.
@@ -885,6 +930,8 @@ impl Desired {
             kind: state.desired_kind(),
             pose_id: state.desired_pose_id(),
             pace: pace_of(state.desired_pace()),
+            bearing_mrad: state.desired_bearing_mrad(),
+            elevation_mrad: state.desired_elevation_mrad(),
         }
     }
 
@@ -895,6 +942,8 @@ impl Desired {
         state.set_desired_pace(clockwork_rs::Duration::from_nanos(
             i64::try_from(self.pace.as_nanos()).unwrap_or(i64::MAX),
         ));
+        state.set_desired_bearing_mrad(self.bearing_mrad);
+        state.set_desired_elevation_mrad(self.elevation_mrad);
     }
 
     /// What is dispatched for `step`, the step covering an instant
@@ -905,19 +954,43 @@ impl Desired {
     /// which stops a running move where it stands. An instant no step covers
     /// asks for nothing either, since the caller has no step, and a gap leaves
     /// the machine wherever the last move takes it.
+    ///
+    /// A look is stored with a zero id and a zero pace whatever the row's
+    /// bytes hold there: it names no pose and states no pace, so what it is
+    /// compared on is its direction alone.
     fn dispatched_by(step: &ScheduledStepWire) -> Option<Self> {
-        (step.kind() == StepKindWire::BASE_POSTURE).then_some(Self {
-            kind: StepKindWire::BASE_POSTURE,
-            pose_id: step.pose_id(),
-            pace: pace_of(step.pace()),
-        })
+        let kind = step.kind();
+        if kind == StepKindWire::BASE_POSTURE {
+            Some(Self {
+                kind: StepKindWire::BASE_POSTURE,
+                pose_id: step.pose_id(),
+                pace: pace_of(step.pace()),
+                bearing_mrad: 0,
+                elevation_mrad: 0,
+            })
+        } else if kind == StepKindWire::BASE_LOOK {
+            Some(Self {
+                kind: StepKindWire::BASE_LOOK,
+                pose_id: 0,
+                pace: Duration::ZERO,
+                bearing_mrad: step.bearing_mrad(),
+                elevation_mrad: step.elevation_mrad(),
+            })
+        } else {
+            None
+        }
     }
 
     /// Where this sends the base, and over what clocks — or `None` for a
-    /// dispatch that names no pose, which is what nothing dispatched is.
+    /// dispatch that names neither a pose nor a look, which is what nothing
+    /// dispatched is.
     ///
-    /// Targets come from the library, the single source of truth for where each
-    /// pose sends the head.
+    /// A pose's targets come from the library, the single source of truth for
+    /// where each pose sends the head. A look's are composed from its
+    /// direction under the configured split, on the configured head clock:
+    /// this is the one place a look's milliradians become radians, and its
+    /// goal depends on nothing but the step and the configuration, exactly as
+    /// a pose's does.
     ///
     /// # Errors
     ///
@@ -925,18 +998,40 @@ impl Desired {
     /// and not a substitution: a head sent to the fold, or anywhere else,
     /// because an id did not resolve is a machine moving on a guess, and the
     /// answer to a command this cog cannot carry out is to say so and let the
-    /// fault policy decide what the machine does about it.
-    fn goal(self, library: &PoseLibrary<'_>) -> Result<Option<Goal>, UnknownPose> {
-        if self.kind != StepKindWire::BASE_POSTURE {
-            return Ok(None);
+    /// fault policy decide what the machine does about it. A look consults no
+    /// library and is never refused here.
+    fn goal(
+        self,
+        library: &PoseLibrary<'_>,
+        look: &LookSettings,
+    ) -> Result<Option<Goal>, UnknownPose> {
+        if self.kind == StepKindWire::BASE_POSTURE {
+            let (target, _) = library.targets(self.pose_id).ok_or(UnknownPose {
+                pose_id: self.pose_id,
+            })?;
+            Ok(Some(Goal {
+                target,
+                durations: MoveDurations::uniform(self.pace),
+                kind: GoalKind::Base,
+            }))
+        } else if self.kind == StepKindWire::BASE_LOOK {
+            let t = reachy_kin::look::target(
+                f64::from(self.bearing_mrad) / 1000.0,
+                f64::from(self.elevation_mrad) / 1000.0,
+                &look.policy,
+            );
+            Ok(Some(Goal {
+                target: JointTargets {
+                    head_pose_body: t.head_pose_body,
+                    body_yaw: t.body_yaw,
+                    antennas: t.antennas,
+                },
+                durations: MoveDurations::uniform(look.head),
+                kind: GoalKind::Look,
+            }))
+        } else {
+            Ok(None)
         }
-        let (target, _) = library.targets(self.pose_id).ok_or(UnknownPose {
-            pose_id: self.pose_id,
-        })?;
-        Ok(Some(Goal {
-            target,
-            durations: MoveDurations::uniform(self.pace),
-        }))
     }
 }
 
@@ -1125,8 +1220,11 @@ mod tests {
     //! arriving on one tick are not all reachable from a schedule. They are all
     //! reachable here, where the mapping is a function over the tick's report.
 
-    use super::{Raise, Reports};
+    use super::{Raise, Reports, Settings, configured};
+    use brenn_reachy__cogs__config_clk_rs::MoverParamsWire;
     use brenn_reachy__motion__joints_clk_rs::JointFlags;
+    use core::f64::consts::FRAC_PI_6;
+    use core::time::Duration;
     use reachy_kin::EnvelopeViolations;
     use reachy_motion::fault::FaultKind;
     use reachy_motion::joints::{JointRef, flags};
@@ -1138,6 +1236,64 @@ mod tests {
     /// The instant every case is about. One number, so a report carrying
     /// another one carried it from somewhere.
     const AT: i64 = 1_700_000_000_000_000_000;
+
+    /// The Mover's configuration with a look split of `share` and a head clock
+    /// of `head_ms`, on a 20 ms grid, every other field cleared.
+    fn look_params(share: f64, head_ms: u32) -> MoverParamsWire {
+        let mut message = MoverParamsWire::new();
+        let params = message.clear_valid();
+        params.period_ns = 20_000_000;
+        params.look_head_share_rad = share;
+        params.look_head_ms = head_ms;
+        message
+    }
+
+    /// What the first execution reads out of `message`.
+    fn settings(message: &MoverParamsWire) -> Settings {
+        Settings::of(configured(message, "the mover's"))
+    }
+
+    #[test]
+    #[should_panic(expected = "a look's head clock must be a length of time")]
+    fn a_look_head_clock_of_no_length_is_refused_by_name() {
+        settings(&look_params(FRAC_PI_6, 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "the head-relative yaw cap less a degree")]
+    fn a_share_at_the_yaw_cap_is_refused_by_name() {
+        settings(&look_params(55.0_f64.to_radians(), 400));
+    }
+
+    #[test]
+    #[should_panic(expected = "the head-relative yaw cap less a degree")]
+    fn a_share_an_ulp_past_its_limit_is_refused_by_name() {
+        settings(&look_params(
+            reachy_kin::LOOK_HEAD_SHARE_LIMIT.next_up(),
+            400,
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "the head-relative yaw cap less a degree")]
+    fn a_negative_share_is_refused_by_name() {
+        settings(&look_params(-0.01, 400));
+    }
+
+    #[test]
+    #[should_panic(expected = "the head-relative yaw cap less a degree")]
+    fn a_share_that_is_no_number_is_refused_by_name() {
+        settings(&look_params(f64::NAN, 400));
+    }
+
+    #[test]
+    fn a_share_at_its_limit_or_zero_is_a_policy() {
+        for share in [reachy_kin::LOOK_HEAD_SHARE_LIMIT, 0.0] {
+            let read = settings(&look_params(share, 400));
+            assert_eq!(read.look.policy.head_share, share);
+            assert_eq!(read.look.head, Duration::from_millis(400));
+        }
+    }
 
     /// A pose outside two bounds, which is evidence a refusal counts rather
     /// than measures.
@@ -1354,5 +1510,7 @@ counters! {
         base_stretched / set_base_stretched,
         /// Base plans adjusted only to part the antenna pair at their crossing.
         base_dephased / set_base_dephased,
+        /// Look plans lengthened for their span: a look's pace, not an anomaly.
+        look_paced / set_look_paced,
     }
 }

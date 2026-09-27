@@ -21,3 +21,10 @@ period_ns: 20000000
 # scenario suite pins this true, and both analyzers fail any run whose recorded
 # configuration says otherwise.
 tracking_armed: true
+
+# A look's head carries up to 30 degrees of the bearing; the body yaw carries the rest.
+look_head_share_rad: 0.5235987755982989
+
+# The head's clock for a look. Above the head group's 0.36 s floor; a body swing the step
+# bound will not carry in it is lengthened by the tick's floor.
+look_head_ms: 400

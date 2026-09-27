@@ -37,6 +37,7 @@ pub mod envelope;
 pub mod fk;
 pub mod geometry;
 pub mod ik;
+pub mod look;
 pub mod mic;
 #[cfg(test)]
 mod testutil;
@@ -54,5 +55,6 @@ pub use geometry::{
 pub use ik::{
     IkError, LegAngles, inverse_kinematics, min_margin, min_pose_margin, pose_margins, wrap_to_pi,
 };
+pub use look::{LOOK_ANTENNAS, LOOK_HEAD_SHARE_LIMIT, LookPolicy, LookTargets};
 pub use mic::{MicError, array_axis_world, bearing_from_azimuth, talker_elevation_in_domain};
 pub use yaw::{body_to_world, world_to_body};

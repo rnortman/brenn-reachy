@@ -1,10 +1,10 @@
-//! Shared motion-run log reading and measurements used by the tour, supplied-script and idle
-//! reports.
+//! Shared motion-run log reading, measurements and the settle instrument used by the tour,
+//! supplied-script and idle reports.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire;
+use brenn_reachy__cogs__schedule_clk_rs::{SessionScheduleWire, StepKindWire};
 use brenn_reachy__cogs__script_clk_rs::ScriptWire;
 use brenn_reachy__driver__health_clk_rs::{DriverEventWire, EventKindWire, HealthReportWire};
 use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
@@ -22,7 +22,7 @@ use reachy_edge::names::MotionTable;
 use reachy_motion::joints::{JointRef, Name, ROWS, row};
 use reachy_motion::phase::{ANTENNA_CONTACT_BAND_RAD, inside_band, mirror_offset};
 use reachy_motion::plant::GroupPlants;
-use reachy_motion::stillness::COUNT_RAD;
+use reachy_motion::stillness::{COUNT_RAD, MAX_EXCURSION_RAD, whole_counts};
 use run_report::Report;
 use stillness_report::{Standard, Stillness, say};
 
@@ -259,212 +259,466 @@ pub fn windows_and_seams(run: &Run) -> (Vec<Window>, Vec<Seam>) {
     (windows, seams)
 }
 
+/// What a base row asked for, which is what its settle lines are labelled by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SettleTarget {
+    /// A library pose, by index.
+    Pose(u16),
+    /// A look, in the row's milliradians.
+    Look {
+        bearing_mrad: i32,
+        elevation_mrad: i32,
+    },
+}
+
+impl std::fmt::Display for SettleTarget {
+    /// `pose 3`, or a look's bearing and elevation in whole degrees, the bearing
+    /// signed: `look +30°/27°`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let degrees = |mrad: i32| (f64::from(mrad) / 1000.0).to_degrees();
+        match *self {
+            Self::Pose(id) => write!(f, "pose {id}"),
+            Self::Look {
+                bearing_mrad,
+                elevation_mrad,
+            } => write!(
+                f,
+                "look {:+.0}°/{:.0}°",
+                degrees(bearing_mrad),
+                degrees(elevation_mrad)
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SettleMove {
     pub start_ns: i64,
     pub end_ns: i64,
-    pub pose_id: u16,
+    pub target: SettleTarget,
     pub pace_ns: i64,
-    pub measured: bool,
+    /// When the last of the six legs came to rest; none for a move that was
+    /// skipped or never settled.
+    pub settled_at_ns: Option<i64>,
     pub reason: Option<String>,
 }
+
+impl SettleMove {
+    /// Whether the move produced figures.
+    pub fn measured(&self) -> bool {
+        self.settled_at_ns.is_some()
+    }
+}
+
+/// One leg's worst figure over a run, and where it was read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LegFigure {
+    pub counts: f64,
+    pub target: SettleTarget,
+    pub at_ns: i64,
+}
+
+/// One figure per leg, indexed Leg0..Leg5; none where no move was measured.
+pub type LegTable = [Option<LegFigure>; 6];
 
 #[derive(Clone, Debug)]
 pub struct SettleResult {
     pub moves: Vec<SettleMove>,
-    pub maxima: [Option<(f64, u16, &'static str, i64)>; 6],
+    pub residual: LegTable,
+    pub overshoot: LegTable,
+    pub creep: LegTable,
 }
 
-/// The largest observed end-of-move residual over the committed library,
-/// rounded up to a whole count. The residual is whatever a run leaves between
-/// goal and present, including servo behavior, load, and possible head/body
-/// contact. Because head/body interference is not modelled
-/// (`TODO(head-body-interference)`), this is a run bound and not a measured
-/// property of a servo. The envelope floor is derived to provide five times
-/// this bound at the outer merge.
+impl SettleResult {
+    /// Whether any leg of any of the three tables is unavailable.
+    pub fn any_unavailable(&self) -> bool {
+        [&self.residual, &self.overshoot, &self.creep]
+            .iter()
+            .any(|table| table.iter().any(Option::is_none))
+    }
+}
+
+/// The bound each leg's `max(settled residual, overshoot)` is judged against,
+/// in counts.
+///
+/// The settled residual includes the integral term's wind-down on purpose: a
+/// leg at rest short of its target stands that far from where the envelope
+/// checked it. The figure on record is the largest end-of-move reading over the
+/// five committed poses' walks, rounded up to a whole count. That reading was
+/// taken at the tail of arrival, so it bounds the settled figure from above,
+/// and the walks under the settle instrument re-bake it. The residual is
+/// whatever a run leaves between goal and present, including servo behavior,
+/// load, and possible head/body contact. Because head/body interference is not
+/// modelled (`TODO(head-body-interference)`), this is a run bound and not a
+/// measured property of a servo. The envelope floor is derived to provide five
+/// times this bound at the outer merge.
 pub const SETTLE_BOUND_COUNTS: f64 = 18.0;
 
+/// How far a leg at rest may wander, radians: the encoder's own flicker, two
+/// counts, judged in whole counts.
+pub const SETTLE_BAND_RAD: f64 = MAX_EXCURSION_RAD;
+
+/// How long a leg must stay inside the band to count as at rest.
+pub const SETTLE_WINDOW_NS: i64 = 200_000_000;
+
+/// The readings a window holds on the driver's nominal grid: ten.
+const SETTLE_WINDOW_SAMPLES: usize = (SETTLE_WINDOW_NS / NOMINAL_CYCLE_NS) as usize;
+
+/// The six legs, in the order every settle table is indexed by.
+const LEGS: [JointRef; 6] = [
+    JointRef::Leg0,
+    JointRef::Leg1,
+    JointRef::Leg2,
+    JointRef::Leg3,
+    JointRef::Leg4,
+    JointRef::Leg5,
+];
+
+/// The six legs' values out of a sample's nine rows.
+fn leg_values(rows: &[f64; ROWS.len()]) -> [f64; 6] {
+    LEGS.map(|joint| row(joint).map_or(0.0, |index| rows[index]))
+}
+
+/// One sample of a hold, decoded to what the settle figures read.
+#[derive(Clone, Copy)]
+struct Reading {
+    at_ns: i64,
+    commanded: [f64; 6],
+    present: [f64; 6],
+}
+
+impl Reading {
+    /// The sample's legs, or nothing where it holds no commanded or no present
+    /// rows.
+    fn of(sample: &Logged<PoseSampleWire>) -> Option<Self> {
+        Some(Self {
+            at_ns: sample.message.nominal_time().as_nanos(),
+            commanded: leg_values(&commanded_rows(&sample.message)?),
+            present: leg_values(&present_rows(&sample.message)?),
+        })
+    }
+
+    /// Leg `k`'s distance from its goal, in counts.
+    fn error_counts(&self, k: usize) -> f64 {
+        (self.commanded[k] - self.present[k]).abs() / COUNT_RAD
+    }
+}
+
+/// The largest of `figures`, with the instant it was first reached.
+fn peak(figures: impl Iterator<Item = (f64, i64)>) -> Option<(f64, i64)> {
+    let mut best: Option<(f64, i64)> = None;
+    for (figure, at_ns) in figures {
+        if best.is_none_or(|(old, _)| figure > old) {
+            best = Some((figure, at_ns));
+        }
+    }
+    best
+}
+
+/// Keep `figure` in `slot` where the slot is empty or the figure is larger.
+fn offer(slot: &mut Option<LegFigure>, figure: LegFigure) {
+    if slot.is_none_or(|old| figure.counts > old.counts) {
+        *slot = Some(figure);
+    }
+}
+
+/// One leg's three figures over one settled move.
+struct LegFigures {
+    settled_at_ns: i64,
+    residual: (f64, i64),
+    overshoot: (f64, i64),
+    creep: f64,
+}
+
+/// Where each base move's legs came to rest, and what they read from there.
+///
+/// Every `BASE_POSTURE` and `BASE_LOOK` row is a move, judged over
+/// `[endpoint, clean_end)`: from the last commanded leg change inside the row to
+/// the row's end or the first overlay opening over it, whichever is sooner.
+/// Rest is read from position, because no velocity is recorded: a leg is at
+/// rest from the first reading whose next `SETTLE_WINDOW_NS` of present values
+/// stay within `SETTLE_BAND_RAD`, read in whole counts. From there each leg
+/// reports three figures, in counts:
+///
+/// - the settled residual, the largest `|commanded − present|` from rest to the
+///   clean end;
+/// - the overshoot, the largest distance past the target in the direction the
+///   leg was commanded to travel, over the whole hold; at most zero is a leg
+///   that never passed its target;
+/// - the creep, the mean error over the hold's last window less the mean over
+///   the window the leg came to rest in, signed: positive is a leg losing ground
+///   off its target, negative the integral term winding it on.
+///
+/// `max(settled residual, overshoot)` is judged against `SETTLE_BOUND_COUNTS`;
+/// the creep is printed and judges nothing. A move whose hold holds no complete
+/// window, or on which a leg never comes to rest, is unsettled and skipped.
 pub fn settle(
     run: &Run,
     ordered: &[&Logged<PoseSampleWire>],
     overlays: &[Window],
-    config: &RunConfig,
     report: &mut Report,
 ) -> SettleResult {
     let mut keys = BTreeSet::new();
     for schedule in &run.schedules {
         for step in schedule.message.steps().iter() {
-            if step.kind() == brenn_reachy__cogs__schedule_clk_rs::StepKindWire::BASE_POSTURE {
-                keys.insert((
-                    step.start().as_nanos(),
-                    step.end().as_nanos(),
-                    step.pose_id(),
-                    step.pace().as_nanos(),
-                ));
-            }
+            let target = match step.kind() {
+                StepKindWire::BASE_POSTURE => SettleTarget::Pose(step.pose_id()),
+                StepKindWire::BASE_LOOK => SettleTarget::Look {
+                    bearing_mrad: step.bearing_mrad(),
+                    elevation_mrad: step.elevation_mrad(),
+                },
+                _ => continue,
+            };
+            keys.insert((
+                step.start().as_nanos(),
+                step.end().as_nanos(),
+                target,
+                step.pace().as_nanos(),
+            ));
         }
     }
-    let legs = [
-        JointRef::Leg0,
-        JointRef::Leg1,
-        JointRef::Leg2,
-        JointRef::Leg3,
-        JointRef::Leg4,
-        JointRef::Leg5,
-    ];
-    let lag_ns = i64::from(config.profiles.legs.following_lag_us).saturating_mul(1_000);
-    let mut maxima: [Option<(f64, u16, &'static str, i64)>; 6] = [None; 6];
+    let mut residual: LegTable = [None; 6];
+    let mut overshoot: LegTable = [None; 6];
+    let mut creep: LegTable = [None; 6];
     let mut moves = Vec::new();
-    for (start, end, pose_id, pace_ns) in keys {
+    for (start, end, target, pace_ns) in keys {
         let clean_end = overlays
             .iter()
             .filter(|window| window.start_ns < end && window.end_ns > start)
             .map(|window| window.start_ns)
             .min()
             .map_or(end, |at| end.min(at));
-        let mut reason = None;
-        if let Some(window) = overlays
-            .iter()
-            .find(|window| window.start_ns <= start && window.end_ns > start)
-        {
-            reason = Some(format!(
-                "overlay motion {} begins at {} before base start {}",
-                window.motion_id, window.start_ns, start
-            ));
-        }
-        let mut endpoint = None;
-        if reason.is_none() {
-            for pair in ordered.windows(2) {
-                let at = pair[1].message.nominal_time().as_nanos();
-                let (Some(before), Some(after)) = (
-                    commanded_rows(&pair[0].message),
-                    commanded_rows(&pair[1].message),
-                ) else {
-                    continue;
-                };
-                let changed = legs
+        let (settled_at_ns, reason) = match settle_move(ordered, overlays, start, clean_end) {
+            Ok((endpoint, figures)) => {
+                let settled_at = figures
                     .iter()
-                    .any(|joint| row(*joint).is_some_and(|index| before[index] != after[index]));
-                if at >= start && at < clean_end && changed {
-                    endpoint = Some(at);
-                }
-            }
-            if endpoint.is_none() {
-                reason = Some(format!("no commanded change in [{start}, {clean_end})"));
-            }
-        }
-        let mut first: Option<&Logged<PoseSampleWire>> = None;
-        let mut hold = None;
-        if let Some(endpoint) = endpoint {
-            first = ordered
-                .iter()
-                .find(|sample| {
-                    let at = sample.message.nominal_time().as_nanos();
-                    at >= endpoint.saturating_add(lag_ns) && at < clean_end
-                })
-                .copied();
-            if first.is_none() {
-                reason = Some(format!(
-                    "hold shorter than the following lag: endpoint {}, first eligible {}, clean end {}",
-                    endpoint,
-                    endpoint.saturating_add(lag_ns),
-                    clean_end
+                    .map(|leg| leg.settled_at_ns)
+                    .max()
+                    .expect("six legs");
+                report.measured.push(format!(
+                    "base-move {target} measured: endpoint {endpoint}, settled at {settled_at}, \
+                     clean end {clean_end}"
                 ));
-            } else {
-                hold = Some(
-                    ordered
-                        .iter()
-                        .rev()
-                        .find(|sample| {
-                            let at = sample.message.nominal_time().as_nanos();
-                            at >= start && at < clean_end
-                        })
-                        .copied()
-                        .expect("the endpoint-plus-lag sample itself is in the clean interval"),
-                );
-            }
-        }
-        let mut selected_rows = None;
-        if reason.is_none() {
-            let mut decoded = Vec::new();
-            for (label, sample) in [
-                ("endpoint", first.expect("endpoint sample")),
-                ("hold-end", hold.expect("hold sample")),
-            ] {
-                let (Some(commanded), Some(present)) = (
-                    commanded_rows(&sample.message),
-                    present_rows(&sample.message),
-                ) else {
-                    reason = Some(format!(
-                        "{label} reading at {} missing commanded or present rows before clean end {}",
-                        sample.message.nominal_time().as_nanos(),
-                        clean_end
+                for (k, leg) in figures.iter().enumerate() {
+                    report.measured.push(format!(
+                        "base-move {target} {}: settled at {}, residual {:.1}, overshoot {:.1}, \
+                         creep {:+.1} counts",
+                        Name(LEGS[k]),
+                        leg.settled_at_ns,
+                        leg.residual.0,
+                        leg.overshoot.0,
+                        leg.creep
                     ));
-                    break;
-                };
-                decoded.push((
-                    label,
-                    sample.message.nominal_time().as_nanos(),
-                    commanded,
-                    present,
-                ));
-            }
-            if reason.is_none() {
-                selected_rows = Some(decoded);
-            }
-        }
-        let measured = selected_rows.is_some();
-        if measured {
-            report.measured.push(format!(
-                "base-move pose {pose_id} measured: endpoint {}, clean end {clean_end}",
-                endpoint.expect("measured endpoint")
-            ));
-            for (label, instant, commanded, present) in selected_rows.expect("selected rows") {
-                for (index, joint) in legs.iter().enumerate() {
-                    if let Some(row) = row(*joint) {
-                        let counts = (commanded[row] - present[row]).abs() / COUNT_RAD;
-                        if maxima[index].is_none_or(|old| counts > old.0) {
-                            maxima[index] = Some((counts, pose_id, label, instant));
-                        }
-                    }
+                    offer(
+                        &mut residual[k],
+                        LegFigure {
+                            counts: leg.residual.0,
+                            target,
+                            at_ns: leg.residual.1,
+                        },
+                    );
+                    offer(
+                        &mut overshoot[k],
+                        LegFigure {
+                            counts: leg.overshoot.0,
+                            target,
+                            at_ns: leg.overshoot.1,
+                        },
+                    );
+                    offer(
+                        &mut creep[k],
+                        LegFigure {
+                            counts: leg.creep,
+                            target,
+                            at_ns: leg.settled_at_ns,
+                        },
+                    );
                 }
+                (Some(settled_at), None)
             }
-        }
+            Err(reason) => (None, Some(reason)),
+        };
         moves.push(SettleMove {
             start_ns: start,
             end_ns: end,
-            pose_id,
+            target,
             pace_ns,
-            measured,
+            settled_at_ns,
             reason,
         });
     }
-    for (index, joint) in legs.iter().enumerate() {
-        match maxima[index] {
-            Some((counts, pose, label, instant)) => {
-                report.measured.push(format!(
-                    "base-move settle {}: {counts:.1} counts (pose {pose}, {label} at {instant})",
-                    reachy_motion::joints::Name(*joint)
-                ));
-                if counts > SETTLE_BOUND_COUNTS {
-                    report.fail(format!("base-move settle exceeds {SETTLE_BOUND_COUNTS:.0} counts at {}: {counts:.1} counts (pose {pose}, {label} at {instant})", reachy_motion::joints::Name(*joint)));
+    for (figure, table) in [("settled residual", &residual), ("overshoot", &overshoot)] {
+        for (k, joint) in LEGS.iter().enumerate() {
+            let leg = Name(*joint);
+            match table[k] {
+                Some(LegFigure {
+                    counts,
+                    target,
+                    at_ns,
+                }) => {
+                    report.measured.push(format!(
+                        "base-move {figure} {leg}: {counts:.1} counts ({target} at {at_ns})"
+                    ));
+                    if counts > SETTLE_BOUND_COUNTS {
+                        report.fail(format!(
+                            "base-move {figure} exceeds {SETTLE_BOUND_COUNTS:.0} counts at {leg}: \
+                             {counts:.1} counts ({target} at {at_ns})"
+                        ));
+                    }
                 }
+                None => report
+                    .measured
+                    .push(format!("base-move {figure} {leg}: unavailable")),
             }
-            None => report.measured.push(format!(
-                "base-move settle {}: unavailable",
-                reachy_motion::joints::Name(*joint)
-            )),
         }
     }
-    let measured = moves.iter().filter(|item| item.measured).count();
+    for (k, joint) in LEGS.iter().enumerate() {
+        let leg = Name(*joint);
+        match creep[k] {
+            Some(LegFigure {
+                counts,
+                target,
+                at_ns,
+            }) => report.measured.push(format!(
+                "base-move creep {leg}: {counts:+.1} counts ({target} settled at {at_ns})"
+            )),
+            None => report
+                .measured
+                .push(format!("base-move creep {leg}: unavailable")),
+        }
+    }
+    let measured = moves.iter().filter(|item| item.measured()).count();
     let skipped = moves.len() - measured;
     report.note(format!("{measured} measured, {skipped} skipped base moves"));
     for item in &moves {
         if let Some(reason) = item.reason.as_deref() {
-            report.note(format!("base move pose {} skipped: {reason}", item.pose_id));
+            report.note(format!("base move {} skipped: {reason}", item.target));
         }
     }
-    SettleResult { moves, maxima }
+    SettleResult {
+        moves,
+        residual,
+        overshoot,
+        creep,
+    }
+}
+
+/// One move's endpoint and per-leg figures over `[start, clean_end)`, or why it
+/// has none.
+fn settle_move(
+    ordered: &[&Logged<PoseSampleWire>],
+    overlays: &[Window],
+    start: i64,
+    clean_end: i64,
+) -> Result<(i64, [LegFigures; 6]), String> {
+    if let Some(window) = overlays
+        .iter()
+        .find(|window| window.start_ns <= start && window.end_ns > start)
+    {
+        return Err(format!(
+            "overlay motion {} begins at {} before base start {}",
+            window.motion_id, window.start_ns, start
+        ));
+    }
+    let mut endpoint = None;
+    let mut origin = None;
+    let mut endpoint_commanded = None;
+    for pair in ordered.windows(2) {
+        let at = pair[1].message.nominal_time().as_nanos();
+        let (Some(before), Some(after)) = (
+            commanded_rows(&pair[0].message),
+            commanded_rows(&pair[1].message),
+        ) else {
+            continue;
+        };
+        let (before, after) = (leg_values(&before), leg_values(&after));
+        let changed = before.iter().zip(&after).any(|(b, a)| b != a);
+        if at >= start && at < clean_end && changed {
+            endpoint = Some(at);
+            origin.get_or_insert(before);
+            endpoint_commanded = Some(after);
+        }
+    }
+    let (Some(endpoint), Some(origin), Some(endpoint_commanded)) =
+        (endpoint, origin, endpoint_commanded)
+    else {
+        return Err(format!("no commanded change in [{start}, {clean_end})"));
+    };
+    let at = |sample: &&Logged<PoseSampleWire>| sample.message.nominal_time().as_nanos();
+    let lo = ordered.partition_point(|sample| at(sample) < endpoint);
+    let hi = ordered.partition_point(|sample| at(sample) < clean_end);
+    let hold = &ordered[lo..hi];
+    let readings: Vec<Option<Reading>> = hold.iter().map(|sample| Reading::of(sample)).collect();
+    let mut complete: Vec<(usize, usize)> = Vec::new();
+    for (i, sample) in hold.iter().enumerate() {
+        let closes = at(sample) + SETTLE_WINDOW_NS;
+        if closes > clean_end {
+            break;
+        }
+        let j = i + hold[i..].partition_point(|later| at(later) < closes);
+        if j - i >= SETTLE_WINDOW_SAMPLES && readings[i..j].iter().all(Option::is_some) {
+            complete.push((i, j));
+        }
+    }
+    let Some(&last) = complete.last() else {
+        return Err(format!(
+            "unsettled before clean end {clean_end}: no complete {} ms of readings after \
+             endpoint {endpoint}",
+            SETTLE_WINDOW_NS / 1_000_000
+        ));
+    };
+    let window = |(i, j): (usize, usize)| readings[i..j].iter().flatten();
+    let rested: [Option<(usize, usize)>; 6] = std::array::from_fn(|k| {
+        complete.iter().copied().find(|&span| {
+            let (lo, hi) = window(span).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), r| {
+                (lo.min(r.present[k]), hi.max(r.present[k]))
+            });
+            // In whole counts: the band is two counts as stated, and a two-count flicker is inside it wherever on the encoder the leg stands.
+            whole_counts(hi - lo) <= SETTLE_BAND_RAD / COUNT_RAD
+        })
+    });
+    let unsettled: Vec<String> = LEGS
+        .iter()
+        .zip(&rested)
+        .filter(|(_, span)| span.is_none())
+        .map(|(joint, _)| Name(*joint).to_string())
+        .collect();
+    if !unsettled.is_empty() {
+        return Err(format!(
+            "unsettled before clean end {clean_end}: {} never stood within {:.0} counts for {} ms",
+            unsettled.join(", "),
+            SETTLE_BAND_RAD / COUNT_RAD,
+            SETTLE_WINDOW_NS / 1_000_000
+        ));
+    }
+    let mean_error = |span: (usize, usize), k: usize| {
+        let (sum, n) =
+            window(span).fold((0.0, 0_u32), |(sum, n), r| (sum + r.error_counts(k), n + 1));
+        sum / f64::from(n)
+    };
+    let figures = std::array::from_fn(|k| {
+        let rest = rested[k].expect("every leg came to rest");
+        let settled_at_ns = hold[rest.0].message.nominal_time().as_nanos();
+        let decoded = || readings.iter().flatten();
+        let travel = endpoint_commanded[k] - origin[k];
+        let dir = (travel.abs() > MOVED_RAD).then(|| travel.signum());
+        LegFigures {
+            settled_at_ns,
+            residual: peak(
+                decoded()
+                    .filter(|r| r.at_ns >= settled_at_ns)
+                    .map(|r| (r.error_counts(k), r.at_ns)),
+            )
+            .expect("the window the leg rested in holds readings"),
+            overshoot: peak(decoded().map(|r| {
+                let past = dir.map_or(0.0, |dir| (r.present[k] - r.commanded[k]) * dir / COUNT_RAD);
+                (past, r.at_ns)
+            }))
+            .expect("the hold holds readings"),
+            creep: mean_error(last, k) - mean_error(rest, k),
+        }
+    });
+    Ok((endpoint, figures))
 }
 
 pub fn whole_stream_measurements(
@@ -777,8 +1031,14 @@ pub fn stillness(ordered: &[&Logged<PoseSampleWire>], standard: Standard, report
 /// asked to measure and fails. A content tour holds the antennas almost only
 /// while the head moves, so the same absence there is a reading of the content
 /// and fails nothing.
+///
+/// A table of the body yaw's probes alone is judged by the yaw's own row,
+/// because the antennas stand still across the yaw's motion there and no
+/// antenna hold is head-still.
 pub fn held_standard(table: &MotionTable) -> Standard {
-    if table.probes_only() {
+    if table.yaw_probes_only() {
+        Standard::YawProbe
+    } else if table.probes_only() {
         Standard::JudgedWhereHeadStillRequired
     } else {
         Standard::JudgedWhereHeadStill
@@ -1044,5 +1304,466 @@ mod window_fold_tests {
             assert_eq!(got_windows, windows, "{case}");
             assert_eq!(got_seams, seams, "{case}");
         }
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    //! The settle instrument over synthetic runs: where legs come to rest and
+    //! the three figures read from there.
+
+    use brenn_reachy__cogs__schedule_clk_rs::{
+        ScheduledStepWire, SessionScheduleWire, StepKindWire,
+    };
+    use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
+    use clockwork_rs::{Duration, SyncTime};
+    use dxl_proto::counts_to_rad;
+    use log_read::Logged;
+    use reachy_driver::NOMINAL_CYCLE_NS;
+    use reachy_motion::joints::{JointRef, ROW_COUNT, row, write_rows};
+    use reachy_motion::stillness::COUNT_RAD;
+    use run_report::Report;
+
+    use super::{Run, SettleResult, SettleTarget, settle};
+
+    /// An arbitrary instant a synthetic run starts at, chosen for being nothing
+    /// round.
+    const T0: i64 = 1_772_000_000_123_456_789;
+
+    /// The instant cycle `n` of a synthetic run sits at.
+    fn at_cycle(n: i64) -> i64 {
+        T0 + n * NOMINAL_CYCLE_NS
+    }
+
+    /// A one-step schedule over cycles `[start, end)`.
+    fn one_step(
+        start: i64,
+        end: i64,
+        fill: impl FnOnce(&mut ScheduledStepWire),
+    ) -> Logged<SessionScheduleWire> {
+        let mut message = SessionScheduleWire::new();
+        message.set_engaged(true);
+        {
+            let mut steps = message.steps_mut();
+            let step: &mut ScheduledStepWire = steps.try_grow().expect("one base step fits");
+            step.set_start(SyncTime::from_nanos(at_cycle(start)));
+            step.set_end(SyncTime::from_nanos(at_cycle(end)));
+            fill(step);
+        }
+        Logged {
+            at_ns: at_cycle(start),
+            sequence_number: 0,
+            message,
+        }
+    }
+
+    /// A posture row over cycles `[start, end)` at five cycles' pace.
+    fn posture(start: i64, end: i64, pose_id: u16) -> Logged<SessionScheduleWire> {
+        one_step(start, end, |step| {
+            step.set_kind(StepKindWire::BASE_POSTURE);
+            step.set_pose_id(pose_id);
+            step.set_pace(Duration::from_nanos(5 * NOMINAL_CYCLE_NS));
+        })
+    }
+
+    /// A look row over cycles `[start, end)`, which carries no pace.
+    fn look(
+        start: i64,
+        end: i64,
+        bearing_mrad: i32,
+        elevation_mrad: i32,
+    ) -> Logged<SessionScheduleWire> {
+        one_step(start, end, |step| {
+            step.set_kind(StepKindWire::BASE_LOOK);
+            step.set_bearing_mrad(bearing_mrad);
+            step.set_elevation_mrad(elevation_mrad);
+        })
+    }
+
+    /// A valid sample at cycle `n`, legs in counts, every other row zero.
+    fn legs(n: i64, commanded: [f64; 6], present: [f64; 6]) -> Logged<PoseSampleWire> {
+        legs_rad(
+            n,
+            commanded.map(|c| c * COUNT_RAD),
+            present.map(|c| c * COUNT_RAD),
+        )
+    }
+
+    /// A valid sample at cycle `n`, legs in radians, every other row zero.
+    fn legs_rad(n: i64, commanded: [f64; 6], present: [f64; 6]) -> Logged<PoseSampleWire> {
+        let leg0 = row(JointRef::Leg0).expect("leg row");
+        let mut commanded_rows = [0.0; ROW_COUNT];
+        let mut present_rows = [0.0; ROW_COUNT];
+        commanded_rows[leg0..leg0 + 6].copy_from_slice(&commanded);
+        present_rows[leg0..leg0 + 6].copy_from_slice(&present);
+        let mut message = PoseSampleWire::new();
+        {
+            let read = message.clear_valid();
+            read.nominal_time = SyncTime::from_nanos(at_cycle(n));
+            read.sample_time = SyncTime::from_nanos(at_cycle(n));
+            read.present_valid = true.into();
+            read.commanded_valid = true.into();
+            write_rows(&mut read.present, &present_rows);
+            write_rows(&mut read.commanded, &commanded_rows);
+        }
+        Logged {
+            at_ns: at_cycle(n),
+            sequence_number: u32::try_from(n).expect("a small cycle"),
+            message,
+        }
+    }
+
+    /// What the instrument reads off `schedules` and `samples`, with no overlay.
+    fn read(
+        schedules: Vec<Logged<SessionScheduleWire>>,
+        samples: Vec<Logged<PoseSampleWire>>,
+    ) -> (SettleResult, Report) {
+        let run = Run {
+            schedules,
+            samples,
+            ..Run::default()
+        };
+        let mut report = Report::default();
+        let result = settle(&run, &run.ordered_samples(), &[], &mut report);
+        (result, report)
+    }
+
+    /// Every leg commanded 100 from cycle 10, ramping in, flickering over three
+    /// counts, then over one.
+    fn ramp_and_flicker() -> Vec<Logged<PoseSampleWire>> {
+        (0..100)
+            .map(|n| {
+                let commanded = if n < 10 { 0.0 } else { 100.0 };
+                let present = match n {
+                    0..=9 => 0.0,
+                    10..=19 => 9.6 * (n - 9) as f64,
+                    20..=24 => {
+                        if n % 2 == 0 {
+                            99.0
+                        } else {
+                            96.0
+                        }
+                    }
+                    _ => {
+                        if n % 2 == 0 {
+                            97.0
+                        } else {
+                            96.0
+                        }
+                    }
+                };
+                legs(n, [commanded; 6], [present; 6])
+            })
+            .collect()
+    }
+
+    fn close(got: f64, want: f64) -> bool {
+        (got - want).abs() < 1e-9
+    }
+
+    /// Every leg commanded to count 1025 from cycle 10 and reading `settled(n)`
+    /// from there, every value converted from counts as the driver records it.
+    fn flicker_at_1024(settled: impl Fn(i64) -> i32) -> Vec<Logged<PoseSampleWire>> {
+        (0..60)
+            .map(|n| {
+                let (commanded, present) = if n < 10 {
+                    (counts_to_rad(1000), counts_to_rad(1000))
+                } else {
+                    (counts_to_rad(1025), counts_to_rad(settled(n)))
+                };
+                legs_rad(n, [commanded; 6], [present; 6])
+            })
+            .collect()
+    }
+
+    /// A leg flickering over two counts is at rest at a position where the
+    /// spread in radians reads a rounding past the two-count band.
+    #[test]
+    fn a_two_count_flicker_rests_wherever_on_the_encoder_the_leg_stands() {
+        assert!(counts_to_rad(1026) - counts_to_rad(1024) > super::SETTLE_BAND_RAD);
+        let samples = flicker_at_1024(|n| 1024 + (n % 3) as i32);
+        let (result, report) = read(vec![posture(1, 60, 7)], samples);
+        assert_eq!(result.moves[0].settled_at_ns, Some(at_cycle(10)));
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        for k in 0..6 {
+            let residual = result.residual[k].expect("residual");
+            assert!(close(residual.counts, 1.0), "{residual:?}");
+        }
+    }
+
+    /// The negative control: at the same position a three-count flicker is
+    /// never at rest.
+    #[test]
+    fn a_three_count_flicker_is_not_at_rest_wherever_the_leg_stands() {
+        let samples = flicker_at_1024(|n| 1024 + (n % 4) as i32);
+        let (result, _report) = read(vec![posture(1, 60, 7)], samples);
+        let only = &result.moves[0];
+        assert_eq!(only.settled_at_ns, None);
+        let reason = only.reason.as_deref().expect("a reason");
+        assert!(reason.contains("never stood within 2 counts"), "{reason}");
+    }
+
+    #[test]
+    fn settled_at_follows_the_ramp_and_the_flicker() {
+        let (result, report) = read(vec![posture(1, 100, 7)], ramp_and_flicker());
+        assert_eq!(result.moves[0].settled_at_ns, Some(at_cycle(25)));
+        for k in 0..6 {
+            let residual = result.residual[k].expect("residual");
+            assert!(close(residual.counts, 4.0), "{residual:?}");
+            assert_eq!(residual.at_ns, at_cycle(25));
+            let overshoot = result.overshoot[k].expect("overshoot");
+            assert!(close(overshoot.counts, -1.0), "{overshoot:?}");
+        }
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        let line = format!(
+            "base-move pose 7 measured: endpoint {}, settled at {}, clean end {}",
+            at_cycle(10),
+            at_cycle(25),
+            at_cycle(100)
+        );
+        assert!(report.measured.contains(&line), "{:?}", report.measured);
+    }
+
+    #[test]
+    fn a_hold_that_never_comes_to_rest_or_ends_inside_the_window_is_unsettled() {
+        let restless = (0..100)
+            .map(|n| {
+                let commanded = if n < 10 { 0.0 } else { 100.0 };
+                let present = match n {
+                    0..=9 => 0.0,
+                    10..=19 => 9.6 * (n - 9) as f64,
+                    _ => {
+                        if n % 2 == 0 {
+                            99.0
+                        } else {
+                            96.0
+                        }
+                    }
+                };
+                legs(n, [commanded; 6], [present; 6])
+            })
+            .collect();
+        let (result, report) = read(vec![posture(1, 100, 7)], restless);
+        let only = &result.moves[0];
+        assert_eq!(only.settled_at_ns, None);
+        assert!(!only.measured());
+        let reason = only.reason.as_deref().expect("a reason");
+        assert!(
+            reason.contains("never stood within 2 counts for 200 ms"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("leg 1, leg 2, leg 3, leg 4, leg 5, leg 6"),
+            "{reason}"
+        );
+        for table in [&result.residual, &result.overshoot, &result.creep] {
+            assert!(table.iter().all(Option::is_none));
+        }
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line == "0 measured, 1 skipped base moves"),
+            "{:?}",
+            report.measured
+        );
+        assert_eq!(
+            report
+                .measured
+                .iter()
+                .filter(|line| line.ends_with(": unavailable"))
+                .count(),
+            18,
+            "{:?}",
+            report.measured
+        );
+
+        let short = (0..18)
+            .map(|n| {
+                let value = if n < 10 { 0.0 } else { 100.0 };
+                legs(n, [value; 6], [value; 6])
+            })
+            .collect();
+        let (result, _) = read(vec![posture(1, 18, 7)], short);
+        assert_eq!(
+            result.moves[0].reason.as_deref(),
+            Some(
+                format!(
+                    "unsettled before clean end {}: no complete 200 ms of readings after \
+                     endpoint {}",
+                    at_cycle(18),
+                    at_cycle(10)
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn overshoot_counts_only_past_the_target() {
+        let samples = (0..100)
+            .map(|n| {
+                let (commanded, present) = match n {
+                    0..=9 => ([0.0; 6], [0.0; 6]),
+                    10..=14 => (
+                        [100.0, -100.0, -100.0, 0.0, 0.0, 0.0],
+                        [103.0, -97.0, -103.0, 0.0, 0.0, 0.0],
+                    ),
+                    _ => (
+                        [100.0, -100.0, -100.0, 0.0, 0.0, 0.0],
+                        [100.0, -97.0, -100.0, 0.0, 0.0, 0.0],
+                    ),
+                };
+                legs(n, commanded, present)
+            })
+            .collect();
+        let (result, _) = read(vec![posture(1, 100, 7)], samples);
+        let expected = [
+            (3.0, 0.0),
+            (-3.0, 3.0),
+            (3.0, 0.0),
+            (0.0, 0.0),
+            (0.0, 0.0),
+            (0.0, 0.0),
+        ];
+        for (k, (overshoot, residual)) in expected.into_iter().enumerate() {
+            let got = result.overshoot[k].expect("overshoot").counts;
+            assert!(close(got, overshoot), "leg {k} overshoot {got}");
+            let got = result.residual[k].expect("residual").counts;
+            assert!(close(got, residual), "leg {k} residual {got}");
+        }
+        assert_eq!(result.moves[0].settled_at_ns, Some(at_cycle(15)));
+    }
+
+    #[test]
+    fn creep_reads_growth_away_from_the_target_and_the_wind_down_onto_it() {
+        let samples = (0..210)
+            .map(|n| {
+                if n < 10 {
+                    return legs(n, [0.0; 6], [0.0; 6]);
+                }
+                let q = ((n - 10) / 20) as f64;
+                let flicker = if n % 2 == 0 { 50.0 } else { 51.0 };
+                legs(
+                    n,
+                    [50.0; 6],
+                    [50.0 + q, 40.0 + q, flicker, 50.0, 50.0, 50.0],
+                )
+            })
+            .collect();
+        let (result, report) = read(vec![posture(1, 210, 7)], samples);
+        let expected = [
+            (9.0, 9.0),
+            (-9.0, 10.0),
+            (0.0, 1.0),
+            (0.0, 0.0),
+            (0.0, 0.0),
+            (0.0, 0.0),
+        ];
+        for (k, (creep, residual)) in expected.into_iter().enumerate() {
+            let got = result.creep[k].expect("creep").counts;
+            assert!(close(got, creep), "leg {k} creep {got}");
+            let got = result.residual[k].expect("residual").counts;
+            assert!(close(got, residual), "leg {k} residual {got}");
+        }
+        assert_eq!(result.moves[0].settled_at_ns, Some(at_cycle(10)));
+        let line = format!(
+            "base-move creep leg 2: -9.0 counts (pose 7 settled at {})",
+            at_cycle(10)
+        );
+        assert!(report.measured.contains(&line), "{:?}", report.measured);
+    }
+
+    #[test]
+    fn a_look_row_is_read_like_a_posture_row() {
+        let (result, report) = read(vec![look(1, 100, 520, 471)], ramp_and_flicker());
+        let target = SettleTarget::Look {
+            bearing_mrad: 520,
+            elevation_mrad: 471,
+        };
+        assert_eq!(result.moves[0].target, target);
+        assert_eq!(result.residual[0].expect("residual").target, target);
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.starts_with("base-move look +30°/27° measured: ")),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.starts_with("base-move settled residual ")
+                    && line.contains("(look +30°/27° at ")),
+            "{:?}",
+            report.measured
+        );
+        assert_eq!(
+            SettleTarget::Look {
+                bearing_mrad: -611,
+                elevation_mrad: 0
+            }
+            .to_string(),
+            "look -35°/0°"
+        );
+    }
+
+    #[test]
+    fn the_bound_judges_the_residual_and_the_overshoot() {
+        let stream = |before: f64, after: f64| {
+            (0..100)
+                .map(|n| {
+                    let commanded = if n < 10 { before } else { after };
+                    legs(n, [commanded; 6], [0.0; 6])
+                })
+                .collect()
+        };
+        let (_, clean) = read(vec![posture(1, 100, 7)], stream(0.0, 18.0));
+        assert!(clean.findings.is_empty(), "{:?}", clean.findings);
+
+        let (_, short) = read(vec![posture(1, 100, 7)], stream(0.0, 18.1));
+        assert_eq!(short.findings.len(), 6, "{:?}", short.findings);
+        assert!(
+            short.findings.iter().any(|finding| finding.contains(
+                "base-move settled residual exceeds 18 counts at leg 1: 18.1 counts (pose 7 at "
+            )),
+            "{:?}",
+            short.findings
+        );
+        assert!(
+            !short
+                .findings
+                .iter()
+                .any(|finding| finding.contains("overshoot exceeds")),
+            "{:?}",
+            short.findings
+        );
+
+        let (_, past) = read(vec![posture(1, 100, 7)], stream(36.2, 18.1));
+        assert!(
+            past.findings.iter().any(|finding| finding
+                .contains("base-move overshoot exceeds 18 counts at leg 1: 18.1 counts")),
+            "{:?}",
+            past.findings
+        );
+    }
+
+    #[test]
+    fn republished_schedules_measure_once() {
+        let (result, report) = read(
+            vec![posture(1, 100, 7), posture(1, 100, 7)],
+            ramp_and_flicker(),
+        );
+        assert_eq!(result.moves.len(), 1);
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line == "1 measured, 0 skipped base moves"),
+            "{:?}",
+            report.measured
+        );
     }
 }

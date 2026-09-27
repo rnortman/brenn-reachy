@@ -38,7 +38,7 @@
 //! Both the author and the checker read this module, so what the run *is* is
 //! stated once. Every instant is a cycle count from the epoch.
 
-use scenario::author::{Overlay, Step};
+use scenario::author::{Overlay, Step, StepBase};
 use scenario::{ARRIVAL_SETTLE_CYCLES, LAG_K, cycle_at, run_end_cycle};
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
@@ -239,8 +239,10 @@ pub fn steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(up_start_cycle()),
         end_ns: cycle_at(disengage_cycle()),
-        pose: Some(scenario::NEUTRAL_POSE),
-        move_ms: None,
+        base: StepBase::Pose {
+            name: scenario::NEUTRAL_POSE,
+            move_ms: None,
+        },
     }]
 }
 

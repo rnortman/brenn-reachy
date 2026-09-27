@@ -94,6 +94,20 @@ pub const COUNT_RAD: f64 = core::f64::consts::TAU / COUNTS_PER_TURN;
 /// figure replaces this one and cites the run it came from.
 pub const MAX_EXCURSION_RAD: f64 = 2.0 * COUNT_RAD;
 
+/// A spread of present readings, as the whole number of encoder counts it
+/// spans.
+///
+/// Present readings are whole counts converted to radians, and the
+/// conversion subtracts π, so the difference of two readings is a whole
+/// number of counts only to within a few ulps either way. Rounding recovers
+/// that number. A bound compared against it is the bound as stated: a spread
+/// of n counts is inside a bound of b counts exactly when n ≤ b. Neither side
+/// gets a tolerance.
+#[must_use]
+pub fn whole_counts(spread_rad: f64) -> f64 {
+    (spread_rad / COUNT_RAD).round()
+}
+
 /// The default settle allowance: enough to cover a move as well as the coming
 /// to rest after it.
 ///
@@ -128,7 +142,8 @@ pub struct StillnessConfig {
     /// Shortest judged hold after settling. A stretch shorter than this says
     /// nothing and is counted rather than reported.
     pub min_hold: Duration,
-    /// Widest peak-to-peak excursion a still joint may show, radians.
+    /// Widest peak-to-peak excursion a still joint may show, radians. Judged in
+    /// whole counts ([`whole_counts`]).
     pub max_excursion_rad: f64,
     /// How often the recording this is fed from sampled the machine.
     ///
@@ -362,11 +377,11 @@ pub enum StillnessError {
 ///
 /// # Errors
 ///
-/// [`StillnessError::Excursion`] when the peak-to-peak spread exceeds
-/// [`StillnessConfig::max_excursion_rad`].
+/// [`StillnessError::Excursion`] when the peak-to-peak spread, in whole counts
+/// ([`whole_counts`]), exceeds [`StillnessConfig::max_excursion_rad`] in counts.
 pub fn judge(window: &HoldWindow, cfg: &StillnessConfig) -> Result<(), StillnessError> {
     let read = &window.readings;
-    if read.excursion_rad <= cfg.max_excursion_rad {
+    if whole_counts(read.excursion_rad) <= cfg.max_excursion_rad / COUNT_RAD {
         return Ok(());
     }
     Err(StillnessError::Excursion {
@@ -1431,7 +1446,9 @@ mod tests {
     /// The bound is a limit the joint may reach, not one it must stay under.
     /// The figure in it is going to be replaced by an observation of a hold
     /// that was accepted as still, so that hold reading its own figure back has
-    /// to pass.
+    /// to pass. Readings are whole counts, so the bound is judged in whole
+    /// counts. A spread of exactly its counts passes however it rounded, and one
+    /// count more does not.
     #[test]
     fn the_bound_admits_a_hold_that_reads_exactly_it() {
         let cfg = StillnessConfig {
@@ -1457,13 +1474,37 @@ mod tests {
             platform_still: true,
         };
         assert_eq!(judge(&at(cfg.max_excursion_rad), &cfg), Ok(()));
-        let over = cfg.max_excursion_rad * (1.0 + f64::EPSILON);
+        assert_eq!(
+            judge(&at(cfg.max_excursion_rad * (1.0 + f64::EPSILON)), &cfg),
+            Ok(()),
+            "five counts read a rounding past five is five counts"
+        );
+        let over = cfg.max_excursion_rad + COUNT_RAD;
         let Err(error) = judge(&at(over), &cfg) else {
             panic!("a hold past the bound judged still");
         };
         let StillnessError::Excursion { bound_counts, .. } = error;
         // The configured bound, not the default one.
         assert!((bound_counts - 5.0).abs() < 1e-9, "{error}");
+    }
+
+    /// Two readings two counts apart span two counts at every position on the
+    /// encoder, although their difference in radians lands a rounding either
+    /// side of two counts depending on where the joint stands.
+    #[test]
+    fn a_two_count_spread_is_two_counts_wherever_the_joint_stands() {
+        // The case sits on the edge: at this position the spread in radians
+        // reads past the two-count bound.
+        assert!(
+            dxl_proto::counts_to_rad(1026) - dxl_proto::counts_to_rad(1024) > MAX_EXCURSION_RAD
+        );
+        for c in 0..4094_i32 {
+            assert_eq!(
+                whole_counts(dxl_proto::counts_to_rad(c + 2) - dxl_proto::counts_to_rad(c)),
+                2.0,
+                "a two-count spread from count {c}"
+            );
+        }
     }
 
     /// The other half of holding nothing: the setpoint comes back, and the

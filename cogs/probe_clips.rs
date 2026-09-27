@@ -27,12 +27,21 @@
 //!   single frame with no dwell between them. The chain is checked rather than
 //!   trusted: a ramp whose successor does not start where it was heading never
 //!   reaches its pose, which no reader of the table would see.
+//!
+//! The body yaw's probes are step-and-hold sequences over one-frame clips,
+//! stated in [`YAW_PROBES`]: each step is a clip of one frame at the yaw it goes
+//! to, and the gap after it holds that frame. A yaw step is a turn from the base,
+//! not a difference of an authored fold, so no [`Folds`] are read for it.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 
 use reachy_clips::format::{
-    CLIP_KIND, Channel, ClipDoc, FORMAT_VERSION, FrameDoc, render_document,
+    CLIP_KIND, Channel, ClipDoc, FORMAT_VERSION, FrameDoc, SEQUENCE_KIND, render_document,
 };
+use reachy_clips::sequence::{EntryDoc, SequenceDoc, render_sequence};
 use reachy_poses::format::Pose as LoadedPose;
 
 const SIDEWAYS_PROBE: [f64; 2] = [-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2];
@@ -47,6 +56,13 @@ const FRAME_HZ: f64 = reachy_motion::FLOOR_TICK_HZ;
 /// would compose its first pose a tenth at a time and its first arrival would be
 /// a ten-period ramp rather than the step or the stated ramp the table says.
 const BLEND_IN_MS: u32 = 0;
+
+/// The tick period in milliseconds: what one frame occupies, and the grid a
+/// yaw probe's gaps are written on.
+const FRAME_MS: u32 = 20;
+
+/// Where the yaw probes' one-frame clips live, under the probe prefix.
+const YAW_CLIP_PREFIX: &str = "probe/yaw-at/";
 
 /// Where the machine's own antennas stand, as the pose library says.
 ///
@@ -198,7 +214,8 @@ impl Probe {
     pub fn antenna_frames(&self, folds: &Folds) -> anyhow::Result<Vec<[f64; 2]>> {
         if self.channel != Channel::Antennas {
             bail!(
-                "{}: only the antenna channel has a pose set today",
+                "{}: only the antenna channel has a frame-track pose set; a body-yaw probe is a \
+                 YAW_PROBES row",
                 self.name
             );
         }
@@ -292,10 +309,183 @@ impl Probe {
     }
 
     /// Where the document belongs, under a clips directory.
+    #[cfg(test)]
     #[must_use]
-    pub fn path(&self, clips: &std::path::Path) -> std::path::PathBuf {
-        clips.join(format!("{}.json", self.name))
+    pub fn path(&self, clips: &Path) -> PathBuf {
+        document_path(clips, self.name)
     }
+}
+
+/// Where the document of library name `name` belongs, under a clips directory:
+/// `<clips>/<name>.json`.
+#[must_use]
+pub fn document_path(clips: &Path, name: &str) -> PathBuf {
+    clips.join(format!("{name}.json"))
+}
+
+/// One step of a body-yaw probe: the yaw reached in one frame and held.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct YawStep {
+    /// The body-yaw delta over the base, milliradians. Signed as the joint is;
+    /// zero is the base itself.
+    pub mrad: i32,
+    /// How many frames the step stands, the frame that writes it included.
+    pub frames: usize,
+}
+
+/// `YawStep { mrad, frames }`, one table row a line.
+const fn step(mrad: i32, frames: usize) -> YawStep {
+    YawStep { mrad, frames }
+}
+
+/// One body-yaw probe: a sequence of one-frame steps, each held by the gap after it.
+#[derive(Clone, Copy, Debug)]
+pub struct YawProbe {
+    /// The library name, which is also the document's path under the clips
+    /// directory.
+    pub name: &'static str,
+    /// What the instrument is for, carried into the document's `description`.
+    pub description: &'static str,
+    /// The steps, in order.
+    pub steps: &'static [YawStep],
+}
+
+/// One document the probe tables author: its library name and its text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Document {
+    /// The library name, which [`document_path`] places.
+    pub name: String,
+    /// The JSON, as committed.
+    pub text: String,
+}
+
+/// The library name of the one-frame clip that stands the body yaw at `mrad`.
+///
+/// Spelt by sign rather than as a side: which way a positive yaw turns the unit
+/// is not confirmed, so a name saying "left" could be a lie nobody would notice.
+#[must_use]
+pub fn yaw_clip_name(mrad: i32) -> String {
+    match mrad {
+        0 => format!("{YAW_CLIP_PREFIX}zero"),
+        plus if plus > 0 => format!("{YAW_CLIP_PREFIX}plus-{plus}"),
+        minus => format!("{YAW_CLIP_PREFIX}minus-{}", minus.unsigned_abs()),
+    }
+}
+
+/// The one-frame clip that stands the body yaw at `mrad` over the base, and
+/// nothing else.
+#[must_use]
+pub fn yaw_clip(mrad: i32) -> ClipDoc {
+    let rad = f64::from(mrad) / 1000.0;
+    ClipDoc {
+        base: None,
+        version: FORMAT_VERSION,
+        kind: CLIP_KIND.to_owned(),
+        name: yaw_clip_name(mrad),
+        description: Some(format!(
+            "one frame of body yaw at {rad:+.1} rad over the base, which the yaw probes step to \
+             and hold with the gap after it"
+        )),
+        channels: vec![Channel::BodyYaw],
+        frame_hz: FRAME_HZ,
+        blend_in_ms: Some(BLEND_IN_MS),
+        blend_out_ms: None,
+        frames: vec![FrameDoc {
+            body_yaw: Some(rad),
+            ..FrameDoc::default()
+        }],
+    }
+}
+
+impl YawProbe {
+    /// The sequence document: each step's clip, then a gap holding it for the
+    /// rest of the step's frames.
+    ///
+    /// # Errors
+    ///
+    /// If the probe has no steps, a step stands no frames, or a step's hold is
+    /// past what a gap can carry.
+    pub fn sequence(&self) -> anyhow::Result<SequenceDoc> {
+        if self.steps.is_empty() {
+            bail!("{}: a yaw probe with no steps has no frames", self.name);
+        }
+        let mut entries = Vec::new();
+        for (index, step) in self.steps.iter().enumerate() {
+            if step.frames == 0 {
+                bail!("{}: step {index} stands no frames", self.name);
+            }
+            entries.push(EntryDoc {
+                reference: Some(yaw_clip_name(step.mrad)),
+                ..EntryDoc::default()
+            });
+            if step.frames > 1 {
+                let gap = u32::try_from(step.frames - 1)
+                    .ok()
+                    .and_then(|held| held.checked_mul(FRAME_MS))
+                    .with_context(|| {
+                        format!(
+                            "{}: step {index} holds {} frames, past what a gap can carry",
+                            self.name, step.frames
+                        )
+                    })?;
+                entries.push(EntryDoc {
+                    gap_ms: Some(gap),
+                    ..EntryDoc::default()
+                });
+            }
+        }
+        Ok(SequenceDoc {
+            version: FORMAT_VERSION,
+            kind: SEQUENCE_KIND.to_owned(),
+            name: self.name.to_owned(),
+            description: Some(self.description.to_owned()),
+            entries,
+        })
+    }
+
+    /// How many frames the probe stands, over every step.
+    #[cfg(test)]
+    #[must_use]
+    pub fn frames(&self) -> usize {
+        self.steps.iter().map(|step| step.frames).sum()
+    }
+}
+
+/// Every document the probe tables author, each name once: the antenna probes
+/// in table order, then the yaw probes' one-frame clips by yaw ascending, then
+/// the yaw probes in table order.
+///
+/// # Errors
+///
+/// Whatever a table row refuses, naming the row.
+pub fn documents(folds: &Folds) -> anyhow::Result<Vec<Document>> {
+    let refused = |name: &str| format!("{name}: the probe table does not author a document");
+    let mut out = Vec::new();
+    for probe in PROBES {
+        let text = probe.document(folds).with_context(|| refused(probe.name))?;
+        out.push(Document {
+            name: probe.name.to_owned(),
+            text,
+        });
+    }
+    let yaws: BTreeSet<i32> = YAW_PROBES
+        .iter()
+        .flat_map(|probe| probe.steps.iter().map(|step| step.mrad))
+        .collect();
+    for mrad in yaws {
+        out.push(Document {
+            name: yaw_clip_name(mrad),
+            text: render_document(&yaw_clip(mrad)),
+        });
+    }
+    for probe in YAW_PROBES {
+        let doc = probe.sequence().with_context(|| refused(probe.name))?;
+        out.push(Document {
+            name: probe.name.to_owned(),
+            text: render_sequence(&doc),
+        });
+    }
+    Ok(out)
 }
 
 /// Every probe document the tree carries.
@@ -453,9 +643,70 @@ pub const PROBES: &[Probe] = &[
     },
 ];
 
+/// Every body-yaw probe the tree carries.
+///
+/// A yaw probe is a sequence rather than a clip because a clip holds at most
+/// `MAX_CLIP_FRAMES` frames and these run longer, and the player holds a
+/// segment's last delta through the gap after it: one frame at a yaw and a gap
+/// is that yaw written in one period and held. The head and antennas are not in
+/// the mask, so they stand at the raised base throughout.
+///
+/// A yaw probe's names, its clips' included, all start `probe/yaw-`: that is how
+/// the report knows to judge the yaw row (`reachy_edge::names::YAW_PROBE_PREFIX`).
+pub const YAW_PROBES: &[YawProbe] = &[
+    YawProbe {
+        name: "probe/yaw-step",
+        description: "body yaw alone, steps of 0.5, 1.0 and 1.5 rad either way from the base \
+                      and back, each reached in one frame and held 1.5 s, the twelve twice: the \
+                      servo's own generator is the whole of every move, which is the capability \
+                      instrument's goal-step stimulus",
+        steps: &[
+            step(0, 1),
+            step(500, 75),
+            step(0, 75),
+            step(-500, 75),
+            step(0, 75),
+            step(1000, 75),
+            step(0, 75),
+            step(-1000, 75),
+            step(0, 75),
+            step(1500, 75),
+            step(0, 75),
+            step(-1500, 75),
+            step(0, 75),
+            step(500, 75),
+            step(0, 75),
+            step(-500, 75),
+            step(0, 75),
+            step(1000, 75),
+            step(0, 75),
+            step(-1000, 75),
+            step(0, 75),
+            step(1500, 75),
+            step(0, 75),
+            step(-1500, 75),
+            step(0, 75),
+        ],
+    },
+    YawProbe {
+        name: "probe/yaw-hold",
+        description: "body yaw alone, the base, then 1.0 rad either way, then the base, each \
+                      reached in one frame and held 12 s: three long holds after a full-speed \
+                      arrival, where a marginal loop's limit cycle shows",
+        steps: &[
+            step(0, 600),
+            step(1000, 600),
+            step(-1000, 600),
+            step(0, 600),
+        ],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use reachy_clips::sequence::{Entry, Sequence};
 
     /// Folds a case steps between: not the library's, so that what these cases
     /// judge is the arithmetic rather than the content, and a pose document the
@@ -686,6 +937,228 @@ mod tests {
                 probe.path(std::path::Path::new("/tmp/clips")),
                 std::path::PathBuf::from(format!("/tmp/clips/{}.json", probe.name))
             );
+        }
+    }
+
+    /// The yaw probe named `name`.
+    fn yaw_probe(name: &str) -> &'static YawProbe {
+        YAW_PROBES
+            .iter()
+            .find(|probe| probe.name == name)
+            .unwrap_or_else(|| panic!("{name} is in the table"))
+    }
+
+    /// A gap is written in whole ticks, so the frame period is the tick's.
+    #[test]
+    fn the_frame_period_is_the_tick_s() {
+        assert!((f64::from(FRAME_MS) - 1000.0 / FRAME_HZ).abs() < f64::EPSILON);
+    }
+
+    /// A yaw clip masks the body yaw and nothing else, one frame of it, entered
+    /// with no blend so the step is a step.
+    #[test]
+    fn a_yaw_clip_drives_the_body_yaw_alone() {
+        let clip = yaw_clip(-1500);
+        assert_eq!(clip.channels, vec![Channel::BodyYaw]);
+        assert_eq!(clip.frames.len(), 1);
+        let frame = &clip.frames[0];
+        assert_eq!(frame.body_yaw, Some(-1.5));
+        assert_eq!(frame.dt, None);
+        assert_eq!(frame.dq, None);
+        assert_eq!(frame.antennas, None);
+        assert_eq!(clip.blend_in_ms, Some(0));
+        assert_eq!(clip.name, "probe/yaw-at/minus-1500");
+        assert_eq!(yaw_clip_name(0), "probe/yaw-at/zero");
+        assert_eq!(yaw_clip_name(500), "probe/yaw-at/plus-500");
+    }
+
+    /// Every yaw probe starts and ends on the base, and every step is a move.
+    #[test]
+    fn every_yaw_probe_opens_and_closes_on_the_base_and_every_step_moves() {
+        for probe in YAW_PROBES {
+            assert_eq!(
+                probe.steps.first().map(|step| step.mrad),
+                Some(0),
+                "{}",
+                probe.name
+            );
+            assert_eq!(
+                probe.steps.last().map(|step| step.mrad),
+                Some(0),
+                "{}",
+                probe.name
+            );
+            for pair in probe.steps.windows(2) {
+                assert_ne!(pair[0].mrad, pair[1].mrad, "{}", probe.name);
+            }
+        }
+    }
+
+    /// The capability probe: an opening frame on the base, then the twelve
+    /// steps twice, each 1.5 s.
+    #[test]
+    fn the_yaw_step_probe_is_twenty_four_steps_of_one_and_a_half_seconds() {
+        let probe = yaw_probe("probe/yaw-step");
+        assert_eq!(probe.steps[0], step(0, 1));
+        let steps = &probe.steps[1..];
+        assert_eq!(steps.len(), 24);
+        assert!(steps.iter().all(|step| step.frames == 75));
+        let twelve = [500, 0, -500, 0, 1000, 0, -1000, 0, 1500, 0, -1500, 0];
+        let expected: Vec<i32> = twelve.iter().chain(twelve.iter()).copied().collect();
+        let mrads: Vec<i32> = steps.iter().map(|step| step.mrad).collect();
+        assert_eq!(mrads, expected);
+        assert_eq!(probe.frames(), 1801);
+    }
+
+    /// The hunt probe: three long holds after full-speed arrivals, 12 s each.
+    #[test]
+    fn the_yaw_hold_probe_is_three_long_holds_after_full_speed_arrivals() {
+        let probe = yaw_probe("probe/yaw-hold");
+        assert_eq!(
+            probe.steps,
+            &[
+                step(0, 600),
+                step(1000, 600),
+                step(-1000, 600),
+                step(0, 600)
+            ]
+        );
+        assert_eq!(probe.frames(), 2400);
+    }
+
+    /// The entries a sequence document should read back to, from the table.
+    fn stated_entries(probe: &YawProbe) -> Vec<Entry> {
+        let mut entries = Vec::new();
+        for step in probe.steps {
+            entries.push(Entry::Play {
+                reference: yaw_clip_name(step.mrad),
+                speed: 1.0,
+            });
+            if step.frames > 1 {
+                entries.push(Entry::Gap {
+                    ms: u32::try_from(step.frames - 1).expect("a table hold") * FRAME_MS,
+                });
+            }
+        }
+        entries
+    }
+
+    /// A yaw probe is its steps' clips, each followed by the gap that holds it
+    /// out to the step's length, and it reads back as that.
+    #[test]
+    fn a_yaw_probe_is_a_sequence_of_one_frame_clips_held_by_gaps() {
+        let reference = |name: &str| EntryDoc {
+            reference: Some(name.to_owned()),
+            ..EntryDoc::default()
+        };
+        let gap = |ms: u32| EntryDoc {
+            gap_ms: Some(ms),
+            ..EntryDoc::default()
+        };
+        let hold = yaw_probe("probe/yaw-hold")
+            .sequence()
+            .expect("the table authors a sequence");
+        assert_eq!(
+            hold.entries,
+            vec![
+                reference("probe/yaw-at/zero"),
+                gap(11_980),
+                reference("probe/yaw-at/plus-1000"),
+                gap(11_980),
+                reference("probe/yaw-at/minus-1000"),
+                gap(11_980),
+                reference("probe/yaw-at/zero"),
+                gap(11_980),
+            ]
+        );
+        let steps = yaw_probe("probe/yaw-step")
+            .sequence()
+            .expect("the table authors a sequence");
+        assert_eq!(
+            steps.entries[..3],
+            [
+                reference("probe/yaw-at/zero"),
+                reference("probe/yaw-at/plus-500"),
+                gap(1480),
+            ]
+        );
+        assert_eq!(
+            steps
+                .entries
+                .iter()
+                .filter(|entry| entry.reference.is_some())
+                .count(),
+            25
+        );
+        for probe in YAW_PROBES {
+            let text = render_sequence(&probe.sequence().expect("the table authors a sequence"));
+            let read = Sequence::from_json(&text).expect("the document reads back");
+            assert_eq!(
+                read.entries(),
+                stated_entries(probe).as_slice(),
+                "{}",
+                probe.name
+            );
+        }
+    }
+
+    /// A step that stands no frames, or a probe with no steps, is refused.
+    #[test]
+    fn a_yaw_step_of_no_frames_is_refused() {
+        const NO_FRAMES: &[YawStep] = &[step(0, 1), step(500, 0)];
+        let probe = YawProbe {
+            name: "probe/yaw-case",
+            description: "",
+            steps: NO_FRAMES,
+        };
+        let refused = probe.sequence().expect_err("a step of no frames");
+        assert!(
+            format!("{refused:#}").contains("stands no frames"),
+            "{refused:#}"
+        );
+        let empty = YawProbe {
+            name: "probe/yaw-case",
+            description: "",
+            steps: &[],
+        };
+        let refused = empty.sequence().expect_err("no steps");
+        assert!(format!("{refused:#}").contains("no steps"), "{refused:#}");
+    }
+
+    /// Each document the tables author appears once: the antenna probes, the
+    /// seven one-frame yaw clips the yaw probes share, and the yaw probes.
+    #[test]
+    fn documents_carry_each_document_once() {
+        let documents = documents(&FOLDS).expect("the tables author their documents");
+        let names: BTreeSet<&str> = documents.iter().map(|doc| doc.name.as_str()).collect();
+        assert_eq!(names.len(), documents.len(), "a name is written twice");
+        assert_eq!(documents.len(), PROBES.len() + 7 + YAW_PROBES.len());
+        for mrad in [0, 500, -500, 1000, -1000, 1500, -1500] {
+            assert!(names.contains(yaw_clip_name(mrad).as_str()), "{mrad}");
+        }
+    }
+
+    /// The yaw probes' documents are all under the yaw-probe prefix and the
+    /// antenna probes' none, so a table of yaw probes is told apart by name; all
+    /// of them are probes, so a tour leaves them out.
+    #[test]
+    fn every_yaw_probe_document_is_under_the_yaw_probe_prefix() {
+        use reachy_edge::names::{PROBE_PREFIX, YAW_PROBE_PREFIX};
+        let clips: BTreeSet<String> = YAW_PROBES
+            .iter()
+            .flat_map(|probe| probe.steps.iter().map(|step| yaw_clip_name(step.mrad)))
+            .collect();
+        for name in clips
+            .iter()
+            .map(String::as_str)
+            .chain(YAW_PROBES.iter().map(|probe| probe.name))
+        {
+            assert!(name.starts_with(YAW_PROBE_PREFIX), "{name}");
+            assert!(name.starts_with(PROBE_PREFIX), "{name}");
+        }
+        for probe in PROBES {
+            assert!(!probe.name.starts_with(YAW_PROBE_PREFIX), "{}", probe.name);
+            assert!(probe.name.starts_with(PROBE_PREFIX), "{}", probe.name);
         }
     }
 }

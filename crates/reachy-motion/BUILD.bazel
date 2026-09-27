@@ -39,6 +39,8 @@ rust_test(
     # no I/O, no clock, no sleep anywhere in the crate.
     size = "small",
     crate = ":reachy_motion",
+    # The bus's bare count conversion, so a spread of readings is built the way the driver builds one.
+    deps = ["//crates/dxl-proto:dxl_proto"],
 )
 
 # The hardware recordings replayed against the bounds they sized. A separate

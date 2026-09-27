@@ -38,7 +38,7 @@
 //! written in milliseconds would be asserting against arithmetic it did not do.
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
-use scenario::author::Step;
+use scenario::author::{Step, StepBase};
 use scenario::{STOW_BUDGET_NS, TAIL_CYCLES, cycle_at, cycles_for, run_end_cycle};
 
 // The shape of an ordinary run, stated once for every scenario: where a run
@@ -160,10 +160,12 @@ pub fn steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(up_start_cycle()),
         end_ns: cycle_at(up_start_cycle() + up_cycles()),
-        pose: Some(scenario::NEUTRAL_POSE),
-        // Slower than the suite's raise: the hand this run lays on the
-        // cranks needs a cycle where the generator has the screening
-        // distance left to travel and has settled before the fault lands.
-        move_ms: Some(scenario::jam_raise_ms()),
+        base: StepBase::Pose {
+            name: scenario::NEUTRAL_POSE,
+            // Slower than the suite's raise: the hand this run lays on the
+            // cranks needs a cycle where the generator has the screening
+            // distance left to travel and has settled before the fault lands.
+            move_ms: Some(scenario::jam_raise_ms()),
+        },
     }]
 }

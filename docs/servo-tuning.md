@@ -482,6 +482,20 @@ notes are what is read. Its capability figures are baked as
 already holds for the class — a re-read outside `CAPABILITY_PLATEAU_RATIO` of it
 is a reading the step does not name and stops it.
 
+**A step probe runs armed.** `docs/fault-management.md` reserves
+`tracking_armed: false` for a capability run commissioned at a servo profile the
+motors cannot follow. That is the library tour at a wide-open profile: sustained
+content streams a prediction that runs away from a joint at its motor's speed,
+and the window exhausts. A step probe is not that. After the one frame that
+writes the goal, the prediction stands still at it. The detector restarts a run
+on every tick the joint regains at least `progress_min_rad` (0.01 rad) on the
+gap it opened at, and a healthy joint closing on a static goal at more than half
+a degree per period does exactly that. A stalled joint (a hand, a snag) does
+not, and is answered with `slow_stow_to_rest` as on any other run. So a probe
+under a wide-open profile runs on the tree's `mover_params.textproto`, armed.
+Every report reads green or fails for a reason, and no configuration with
+`tracking_armed: false` is written for it.
+
 ### 2a. A gain ladder for a class the tour read gain-bound
 
 A class that reads gain-bound has an open question the tour cannot answer: its
@@ -493,8 +507,9 @@ that step 3 confirms one configuration rather than two.
 Per rung, one overlay carrying `servo_gains.textproto` only, the class's P
 doubled and `I`/`D` at zero, and `make motion-run` three times at the shipped
 profile with the detector armed. **The ladder's rows are the antenna rows and
-the judged class's own row**: `cogs/stillness_report.rs` judges only the
-antennas and folds every head row to one unjudged worst hold, so a head class
+the judged class's own row**: `cogs/stillness_report.rs` judges the antennas,
+and folds every head row to one unjudged worst hold except the body yaw under a
+yaw probe, so a head class
 under this ladder is read from that folded line, hold by hold.
 
 **Pass**: every watched hold inside the two-count bound, three runs of three,
@@ -514,6 +529,29 @@ widened.
 - *The ladder is non-monotonic* — a higher rung quieter than a lower one — is a
   reading, not a reason to prefer the higher rung. A rung on which the machine
   showed a limit cycle hunts, whatever the rungs around it did.
+
+**The body yaw's ladder is read off its own probes.** `probe/yaw-step` steps the
+yaw 0.5, 1.0 and 1.5 rad either way from the base and back, each held 1.5 s,
+twelve steps twice. That is 24 goal steps, enough for the capability
+instrument's ramp median and error bands. `probe/yaw-hold` holds it 12 s at the
+base, at 1.0 rad either way, and at the base again: three long holds after a
+full-speed arrival. Each is a sequence of one-frame clips held by the gaps
+between them, since a clip holds at most 1024 frames. A run of either is judged
+under the yaw-probe standard, which prints every body-yaw hold a line each with
+its excursion, mean reversal interval, period, spread and signed mean error. The
+standard judges each hold on the limit cycle's signature, not on the two-count
+bound:
+
+- under three counts is quiet whatever the spread;
+- three counts or more with the spread at most the apparent period (twice the
+  mean interval) **hunts**;
+- three counts or more with the spread past the period, or with no interval to
+  read, is an unexpected reading for a person.
+
+Both of the last two fail the run. The rule reads the P-only record above as
+printed: every limit-cycled hold there is 3.0 counts on a spread under its
+period, and the vendor rung's dither is 2.0 counts at a spread of 26 on a period
+of about 24.
 
 ### 2b. The model, before a pair is confirmed
 

@@ -220,8 +220,7 @@ fn analyze(run: &Run, table: &MotionTable, config: &RunConfig) -> Report {
     window_measurements(&prepared, &planned, &by_id, &mut report);
     whole_stream_measurements(&prepared, run, config, &mut report);
     stillness(&prepared.ordered, held_standard(table), &mut report);
-    let settle_result = settle(run, &prepared.ordered, &planned, config, &mut report);
-    let _ = (&settle_result.moves, &settle_result.maxima);
+    settle(run, &prepared.ordered, &planned, &mut report);
     report
 }
 
@@ -282,12 +281,13 @@ mod tests {
     use super::{
         ANTENNA_CONTACT_BAND_RAD, CHANNELS, DriverEventWire, EventKindWire, HealthReportWire,
         Logged, MotionTable, POSE_CHANNEL, PoseSampleWire, Report, Run, RunConfig, ScriptWire,
-        SessionScheduleWire, TickFaultWire, Window, analyze, settle, windows,
+        SessionScheduleWire, TickFaultWire, Window, analyze, held_standard, settle, windows,
     };
     use motion_run_report::SETTLE_BOUND_COUNTS;
     use pose_reading::TEMPERATURE_STOP_C;
     use reachy_motion::arm::DEFAULT_GAINS;
     use reachy_motion::plant::{ClassProfile, GroupProfiles, SHIPPED_PROFILES};
+    use stillness_report::Standard;
 
     use brenn_reachy__cogs__schedule_clk_rs::OverlayWindowWire;
     use brenn_reachy__cogs__schedule_clk_rs::{ScheduledStepWire, StepKindWire};
@@ -492,7 +492,7 @@ mod tests {
         };
         let ordered = run.ordered_samples();
         let mut report = Report::default();
-        settle(&run, &ordered, &[], &shipped(), &mut report);
+        settle(&run, &ordered, &[], &mut report);
         report
     }
 
@@ -508,15 +508,8 @@ mod tests {
         };
         let ordered = run.ordered_samples();
         let mut report = Report::default();
-        settle(&run, &ordered, planned, &shipped(), &mut report);
+        settle(&run, &ordered, planned, &mut report);
         report
-    }
-
-    /// One sample with one leg's commanded-present error in encoder counts.
-    fn leg_sample(n: i64, leg: usize, counts: f64) -> Logged<PoseSampleWire> {
-        let mut counts_by_leg = [0.0; 6];
-        counts_by_leg[leg] = counts;
-        legs_sample(n, counts_by_leg)
     }
 
     /// One valid sample with an error for each leg.
@@ -529,8 +522,14 @@ mod tests {
         at(n, sample(n, &present, &commanded))
     }
 
+    /// One sample per cycle over `[from, to)`, legs commanded at `counts` and
+    /// present at zero.
+    fn legs_run(from: i64, to: i64, counts: [f64; 6]) -> Vec<Logged<PoseSampleWire>> {
+        (from..to).map(|n| legs_sample(n, counts)).collect()
+    }
+
     #[test]
-    fn base_move_settle_deduplicates_republishes_and_keeps_both_reading_provenances() {
+    fn base_move_settle_deduplicates_republished_schedules() {
         let start = T0;
         let pace = 5 * NOMINAL_CYCLE_NS;
         let end = T0 + 100 * NOMINAL_CYCLE_NS;
@@ -538,14 +537,13 @@ mod tests {
             base_schedule(0, start, end, 7, pace),
             base_schedule(1, start, end, 7, pace),
         ];
-        let report = settle_report(
-            schedules,
-            vec![
-                at(1, sample(1, &[0.0; ROW_COUNT], &[0.0; ROW_COUNT])),
-                legs_sample(10, [SETTLE_BOUND_COUNTS, 10.0, 10.0, 10.0, 10.0, 10.0]),
-                legs_sample(60, [SETTLE_BOUND_COUNTS, 10.0, 10.0, 10.0, 10.0, 10.0]),
-            ],
-        );
+        let mut samples = vec![legs_sample(1, [0.0; 6])];
+        samples.extend(legs_run(
+            10,
+            100,
+            [SETTLE_BOUND_COUNTS, 10.0, 10.0, 10.0, 10.0, 10.0],
+        ));
+        let report = settle_report(schedules, samples);
         assert!(report.findings.is_empty(), "{:?}", report.findings);
         assert!(
             report
@@ -565,62 +563,12 @@ mod tests {
         );
         for leg in 1..=6 {
             assert!(
-                measured(&report, &format!("leg {leg}")),
+                measured(&report, &format!("base-move settled residual leg {leg}")),
                 "{:?}",
                 report.measured
             );
         }
         assert!(measured(&report, "pose 7"), "{:?}", report.measured);
-    }
-
-    #[test]
-    fn base_move_settle_accepts_eighteen_and_rejects_eighteen_point_one_counts() {
-        let schedule = base_schedule(0, T0, T0 + 20 * NOMINAL_CYCLE_NS, 9, 5 * NOMINAL_CYCLE_NS);
-        let clean = settle_report(
-            vec![base_schedule(
-                0,
-                T0,
-                T0 + 20 * NOMINAL_CYCLE_NS,
-                9,
-                5 * NOMINAL_CYCLE_NS,
-            )],
-            vec![
-                legs_sample(1, [0.0; 6]),
-                legs_sample(10, [SETTLE_BOUND_COUNTS; 6]),
-                legs_sample(19, [SETTLE_BOUND_COUNTS; 6]),
-            ],
-        );
-        assert!(clean.findings.is_empty(), "{:?}", clean.findings);
-        let red = settle_report(
-            vec![schedule],
-            vec![
-                legs_sample(1, [0.0; 6]),
-                legs_sample(
-                    10,
-                    [
-                        18.1,
-                        SETTLE_BOUND_COUNTS,
-                        SETTLE_BOUND_COUNTS,
-                        SETTLE_BOUND_COUNTS,
-                        SETTLE_BOUND_COUNTS,
-                        SETTLE_BOUND_COUNTS,
-                    ],
-                ),
-                legs_sample(
-                    19,
-                    [
-                        18.1,
-                        SETTLE_BOUND_COUNTS,
-                        SETTLE_BOUND_COUNTS,
-                        SETTLE_BOUND_COUNTS,
-                        SETTLE_BOUND_COUNTS,
-                        SETTLE_BOUND_COUNTS,
-                    ],
-                ),
-            ],
-        );
-        assert!(found(&red, "leg 1"), "{:?}", red.findings);
-        assert!(found(&red, "18.1 counts"), "{:?}", red.findings);
     }
 
     #[test]
@@ -641,30 +589,30 @@ mod tests {
             no_hold_report
                 .measured
                 .iter()
-                .filter(|line| line.contains("base-move settle") && line.contains("unavailable"))
+                .filter(|line| line.starts_with("base-move ") && line.ends_with(": unavailable"))
                 .count(),
-            6,
+            18,
             "{:?}",
             no_hold_report.measured
         );
 
         let schedule = base_schedule(1, T0, T0 + 20 * NOMINAL_CYCLE_NS, 4, pace);
-        let missing_endpoint = settle_report(
+        let mut short_samples = vec![legs_sample(1, [0.0; 6])];
+        short_samples.extend(legs_run(12, 20, [1.0; 6]));
+        let short_hold = settle_report(
             vec![base_schedule(1, T0, T0 + 20 * NOMINAL_CYCLE_NS, 4, pace)],
-            vec![legs_sample(1, [0.0; 6]), leg_sample(4, 0, 1.0)],
+            short_samples,
         );
         assert!(
-            missing_endpoint
-                .measured
-                .iter()
-                .any(|line| line.contains(&format!(
-                    "hold shorter than the following lag: endpoint {}, first eligible {}, clean end {}",
-                    T0 + 4 * NOMINAL_CYCLE_NS,
-                    T0 + 4 * NOMINAL_CYCLE_NS + 24_000_000,
-                    T0 + 20 * NOMINAL_CYCLE_NS
-                ))),
+            short_hold.measured.iter().any(|line| line
+                == &format!(
+                    "base move pose 4 skipped: unsettled before clean end {}: no complete 200 ms \
+                     of readings after endpoint {}",
+                    T0 + 20 * NOMINAL_CYCLE_NS,
+                    T0 + 12 * NOMINAL_CYCLE_NS
+                )),
             "{:?}",
-            missing_endpoint.measured
+            short_hold.measured
         );
         let mut invalid = sample(10, &[0.0; ROW_COUNT], &[0.0; ROW_COUNT]);
         invalid.set_present_valid(false);
@@ -686,39 +634,17 @@ mod tests {
                 )))
         );
 
-        let mut invalid_endpoint = sample(19, &[0.0; ROW_COUNT], &[COUNT_RAD; ROW_COUNT]);
-        invalid_endpoint.set_present_valid(false);
-        let invalid_endpoint_report = settle_report(
-            vec![base_schedule(0, T0, T0 + 20 * NOMINAL_CYCLE_NS, 4, pace)],
-            vec![
-                at(1, sample(1, &[0.0; ROW_COUNT], &[0.0; ROW_COUNT])),
-                at(4, sample(4, &[0.0; ROW_COUNT], &[COUNT_RAD; ROW_COUNT])),
-                at(19, invalid_endpoint),
-            ],
-        );
-        assert!(
-            invalid_endpoint_report
-                .measured
-                .iter()
-                .any(|line| line.contains(&format!(
-                    "endpoint reading at {} missing commanded or present rows before clean end {}",
-                    T0 + 19 * NOMINAL_CYCLE_NS,
-                    T0 + 20 * NOMINAL_CYCLE_NS
-                ))),
-            "{:?}",
-            invalid_endpoint_report.measured
-        );
-
-        let mut invalid_hold_end = sample(19, &[0.0; ROW_COUNT], &[COUNT_RAD; ROW_COUNT]);
-        invalid_hold_end.set_present_valid(false);
+        let mut gappy = vec![legs_sample(1, [0.0; 6])];
+        for mut logged in legs_run(4, 40, [1.0; 6]) {
+            let cycle = (logged.message.nominal_time().as_nanos() - T0) / NOMINAL_CYCLE_NS;
+            if [8, 18, 28, 38].contains(&cycle) {
+                logged.message.set_present_valid(false);
+            }
+            gappy.push(logged);
+        }
         let malformed = settle_report(
-            vec![base_schedule(0, T0, T0 + 20 * NOMINAL_CYCLE_NS, 5, pace)],
-            vec![
-                at(1, sample(1, &[0.0; ROW_COUNT], &[0.0; ROW_COUNT])),
-                legs_sample(4, [1.0; 6]),
-                legs_sample(10, [1.0; 6]),
-                at(19, invalid_hold_end),
-            ],
+            vec![base_schedule(0, T0, T0 + 40 * NOMINAL_CYCLE_NS, 5, pace)],
+            gappy,
         );
         assert!(
             malformed
@@ -732,7 +658,8 @@ mod tests {
             malformed
                 .measured
                 .iter()
-                .any(|line| line.contains("hold-end reading at 1772000000503456789 missing commanded or present rows before clean end 1772000000523456789")),
+                .any(|line| line.starts_with("base move pose 5 skipped:")
+                    && line.contains("no complete 200 ms of readings")),
             "{:?}",
             malformed.measured
         );
@@ -748,9 +675,9 @@ mod tests {
             malformed
                 .measured
                 .iter()
-                .filter(|line| line.contains("base-move settle") && line.contains("unavailable"))
+                .filter(|line| line.starts_with("base-move ") && line.ends_with(": unavailable"))
                 .count(),
-            6,
+            18,
             "{:?}",
             malformed.measured
         );
@@ -781,44 +708,15 @@ mod tests {
     }
 
     #[test]
-    fn base_move_settle_uses_the_last_sample_before_clean_end_for_hold_end() {
-        let pace = 5 * NOMINAL_CYCLE_NS;
-        let reading = |n: i64, present_count: f64| {
-            let present = [present_count * COUNT_RAD; ROW_COUNT];
-            let commanded = [COUNT_RAD; ROW_COUNT];
-            at(n, sample(n, &present, &commanded))
-        };
-        let report = settle_report(
-            vec![base_schedule(0, T0, T0 + 20 * NOMINAL_CYCLE_NS, 15, pace)],
-            vec![
-                at(1, sample(1, &[0.0; ROW_COUNT], &[0.0; ROW_COUNT])),
-                reading(4, 0.9),
-                reading(10, 0.9),
-                reading(19, 0.0),
-            ],
-        );
-        assert!(
-            report
-                .measured
-                .iter()
-                .any(|line| line.contains(&format!("hold-end at {}", T0 + 19 * NOMINAL_CYCLE_NS))),
-            "{:?}",
-            report.measured
-        );
-    }
-
-    #[test]
     fn base_move_settle_uses_record_changes_and_excludes_overlay_intervals() {
         let start = T0 + NOMINAL_CYCLE_NS;
         let end = T0 + 100 * NOMINAL_CYCLE_NS;
         let samples = || {
-            vec![
-                legs_sample(1, [0.0; 6]),
-                legs_sample(5, [1.0; 6]),
-                legs_sample(9, [2.0; 6]),
-                legs_sample(10, [SETTLE_BOUND_COUNTS; 6]),
-                legs_sample(60, [SETTLE_BOUND_COUNTS; 6]),
-            ]
+            let mut samples = legs_run(1, 5, [0.0; 6]);
+            samples.extend(legs_run(5, 9, [1.0; 6]));
+            samples.push(legs_sample(9, [2.0; 6]));
+            samples.extend(legs_run(10, 100, [SETTLE_BOUND_COUNTS; 6]));
+            samples
         };
         let record_keyed = settle_report(
             vec![base_schedule(0, start, end, 12, 5 * NOMINAL_CYCLE_NS)],
@@ -831,14 +729,18 @@ mod tests {
 
         let mixed_samples = || {
             let mut samples = Vec::new();
-            for (n, legs, antenna) in [
-                (1, 0.0, 0.0),
-                (5, 1.0, 0.0),
-                (9, 2.0, 0.0),
-                (10, 2.0, 1.0),
-                (11, 2.0, 2.0),
-                (60, 2.0, 3.0),
-            ] {
+            for n in 1..100 {
+                let legs = match n {
+                    1..=4 => 0.0,
+                    5..=8 => 1.0,
+                    _ => 2.0,
+                };
+                let antenna = match n {
+                    ..=9 => 0.0,
+                    10 => 1.0,
+                    11..=59 => 2.0,
+                    _ => 3.0,
+                };
                 let mut commanded = [0.0; ROW_COUNT];
                 for leg in 0..6 {
                     commanded[row(JointRef::Leg0).expect("leg row") + leg] = legs;
@@ -858,10 +760,7 @@ mod tests {
             mixed.measured
         );
         assert!(
-            mixed.measured.iter().any(|line| {
-                line.contains("base-move settle leg 1")
-                    && line.contains(&format!("at {}", T0 + 11 * NOMINAL_CYCLE_NS))
-            }),
+            measured(&mixed, &format!("settled at {}", T0 + 9 * NOMINAL_CYCLE_NS)),
             "{:?}",
             mixed.measured
         );
@@ -903,6 +802,32 @@ mod tests {
             "base move pose 15 skipped: no commanded change in [{}, {})",
             start, end
         ))));
+    }
+
+    #[test]
+    fn a_tour_measures_a_look_row() {
+        let mut schedule =
+            base_schedule(0, T0 + NOMINAL_CYCLE_NS, T0 + 100 * NOMINAL_CYCLE_NS, 0, 0);
+        {
+            let mut steps = schedule.message.steps_mut();
+            let step = steps.iter_mut().next().expect("the one base step");
+            step.set_kind(StepKindWire::BASE_LOOK);
+            step.set_bearing_mrad(-611);
+            step.set_elevation_mrad(471);
+        }
+        let mut samples = legs_run(1, 5, [0.0; 6]);
+        samples.extend(legs_run(5, 9, [1.0; 6]));
+        samples.push(legs_sample(9, [2.0; 6]));
+        samples.extend(legs_run(10, 100, [SETTLE_BOUND_COUNTS; 6]));
+        let report = settle_report(vec![schedule], samples);
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.starts_with("base-move look -35°/27° measured: ")),
+            "{:?}",
+            report.measured
+        );
     }
 
     /// Whether any finding says `what`.
@@ -1754,6 +1679,78 @@ mod tests {
                 },
             },
         )])
+    }
+
+    /// The table of a run of the body yaw's probes: one of them, on its own.
+    fn yaw_probe_table() -> MotionTable {
+        MotionTable::of([(
+            "probe/yaw-hold".to_string(),
+            MotionEntry {
+                motion_id: 0,
+                window: PlayWindow {
+                    duration_ms: 400,
+                    blend_out_ms: 200,
+                },
+            },
+        )])
+    }
+
+    /// The table a run was asked for is what picks its stillness standard: the
+    /// yaw's probes alone are judged by the yaw's row, any other probe run by
+    /// the antennas' required hold, and content by the antennas where the head
+    /// stood still.
+    #[test]
+    fn the_table_says_which_standard_a_run_is_held_to() {
+        assert_eq!(held_standard(&yaw_probe_table()), Standard::YawProbe);
+        assert_eq!(
+            held_standard(&probe_table()),
+            Standard::JudgedWhereHeadStillRequired
+        );
+        assert_eq!(held_standard(&table()), Standard::JudgedWhereHeadStill);
+        let entry = |motion_id| MotionEntry {
+            motion_id,
+            window: PlayWindow {
+                duration_ms: 400,
+                blend_out_ms: 200,
+            },
+        };
+        let mixed = MotionTable::of([
+            ("probe/yaw-hold".to_string(), entry(0)),
+            ("probe/antenna-step-a".to_string(), entry(1)),
+        ]);
+        assert_eq!(
+            held_standard(&mixed),
+            Standard::JudgedWhereHeadStillRequired
+        );
+    }
+
+    /// A yaw probe run is judged on the yaw's own holds: a yaw turning every
+    /// cycle three counts wide hunts there, and is the head's unjudged baseline
+    /// under any other probe's standard.
+    ///
+    /// Only the hunt's sentence is read: a hand-built run's scripts and this
+    /// one-motion table disagree about what was asked for, which is not this
+    /// case's subject.
+    #[test]
+    fn a_yaw_probe_run_judges_the_yaw_row() {
+        let yaw = row(JointRef::BodyYaw).expect("a bus row");
+        let samples: Vec<_> = (0..500)
+            .map(|n| {
+                let commanded = [0.0; ROW_COUNT];
+                let mut present = commanded;
+                present[yaw] = if n % 2 == 0 { 1.5 } else { -1.5 } * COUNT_RAD;
+                at(n, sample(n, &present, &commanded))
+            })
+            .collect();
+        let run = Run { samples, ..clean() };
+        let yaw_probe = analyze(&run, &yaw_probe_table(), &shipped());
+        assert!(
+            found(&yaw_probe, "body yaw hunts"),
+            "{:?}",
+            yaw_probe.findings
+        );
+        let probe = analyze(&run, &probe_table(), &shipped());
+        assert!(!found(&probe, "body yaw hunts"), "{:?}", probe.findings);
     }
 
     /// The same run, judged as a probe run: holding nothing with the head still

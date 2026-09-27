@@ -47,7 +47,7 @@
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use reachy_motion::joints::{JointGroup, JointRef, ROW_COUNT, flags};
-use scenario::author::Step;
+use scenario::author::{Step, StepBase};
 use scenario::{STOW_BUDGET_NS, TAIL_CYCLES, answered_within, cycle_at, cycles_for, up_clocks};
 
 // The shape of an ordinary run, stated once for every scenario: where a run
@@ -213,8 +213,10 @@ pub fn steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(up_start_cycle()),
         end_ns: cycle_at(up_start_cycle() + UP_CYCLES),
-        pose: Some(scenario::NEUTRAL_POSE),
-        move_ms: None,
+        base: StepBase::Pose {
+            name: scenario::NEUTRAL_POSE,
+            move_ms: None,
+        },
     }]
 }
 
@@ -224,7 +226,9 @@ pub fn refused_steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(refused_script_cycle()),
         end_ns: cycle_at(end_cycle()),
-        pose: Some(scenario::NEUTRAL_POSE),
-        move_ms: None,
+        base: StepBase::Pose {
+            name: scenario::NEUTRAL_POSE,
+            move_ms: None,
+        },
     }]
 }

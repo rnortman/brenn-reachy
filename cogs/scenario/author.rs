@@ -80,20 +80,40 @@ pub struct Step {
     pub start_ns: i64,
     /// When it ends, exclusive.
     pub end_ns: i64,
-    /// The pose it asks for, named as the emitted library names it, or `None`
-    /// for a step that keeps whatever the machine was last sent to.
+    /// What it asks the base to do. A pose is named as the emitted library
+    /// names it, not by the number the schedule carries, which is looked up
+    /// from the committed sidecar where the script is written.
+    pub base: StepBase,
+}
+
+/// What a step asks the base to do.
+#[derive(Clone, Copy, Debug)]
+pub enum StepBase {
+    /// Go to the pose the emitted library names so.
     ///
     /// A name and not the number the schedule carries: a scenario is authored
     /// against the library's vocabulary, and the number is looked up from the
     /// committed sidecar where the script is written.
-    pub pose: Option<&'static str>,
-    /// How long the move to that pose takes, milliseconds, or `None` for the
-    /// pace the suite states for that pose by default.
-    ///
-    /// A step states its own pace on the wire, so a scenario states one too: the
-    /// two scenarios that lay a hand on the raise want a slower one than the
-    /// rest, and every other scenario wants the suite's.
-    pub move_ms: Option<u32>,
+    Pose {
+        /// The pose, as the emitted library names it.
+        name: &'static str,
+        /// How long the move to that pose takes, milliseconds, or `None` for
+        /// the pace the suite states for that pose by default.
+        ///
+        /// A step states its own pace on the wire, so a scenario states one
+        /// too: the two scenarios that lay a hand on the raise want a slower one
+        /// than the rest, and every other scenario wants the suite's.
+        move_ms: Option<u32>,
+    },
+    /// Keep whatever the machine was last sent to.
+    Keep,
+    /// Face a direction, milliradians, as the wire carries it.
+    Look {
+        /// Milliradians from the base's forward, positive to the robot's left.
+        bearing_mrad: i32,
+        /// Milliradians above level.
+        elevation_mrad: i32,
+    },
 }
 
 /// One overlay window of a script, as a scenario states it.
@@ -263,13 +283,23 @@ impl InputLog {
                     .expect("a script of no more steps than the schema holds");
                 row.set_after_ms(offset_ms(arrival_ns, step.start_ns));
                 row.set_duration_ms(offset_ms(step.start_ns, step.end_ns));
-                match step.pose {
-                    Some(pose) => {
+                match step.base {
+                    StepBase::Pose { name, move_ms } => {
                         row.set_kind(StepKindWire::BASE_POSTURE);
-                        row.set_pose_id(crate::pose_id(pose));
-                        row.set_move_ms(step.move_ms.unwrap_or_else(|| crate::pace_ms(pose)));
+                        row.set_pose_id(crate::pose_id(name));
+                        row.set_move_ms(move_ms.unwrap_or_else(|| crate::pace_ms(name)));
                     }
-                    None => row.set_kind(StepKindWire::BASE_KEEP),
+                    StepBase::Keep => row.set_kind(StepKindWire::BASE_KEEP),
+                    StepBase::Look {
+                        bearing_mrad,
+                        elevation_mrad,
+                    } => {
+                        row.set_kind(StepKindWire::BASE_LOOK);
+                        row.set_bearing_mrad(bearing_mrad);
+                        row.set_elevation_mrad(elevation_mrad);
+                        row.set_pose_id(0);
+                        row.set_move_ms(0);
+                    }
                 }
             }
         }

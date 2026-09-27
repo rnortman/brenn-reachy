@@ -257,6 +257,14 @@ pub const ANTENNAS_FOLLOWING_LAG_US: i64 = 24_000;
 /// processes read.
 pub const TRACKING_ARMED: bool = true;
 
+/// The most of a look's bearing the head carries, radians: 30 degrees, the
+/// share the deployed `MoverParams` ships with.
+pub const LOOK_HEAD_SHARE_RAD: f64 = core::f64::consts::FRAC_PI_6;
+
+/// The head group's clock for a look, milliseconds, as the deployed
+/// `MoverParams` states it.
+pub const LOOK_HEAD_MS: i64 = 400;
+
 /// The servos' Bus Watchdog timeout the commissioning sweep arms, in the
 /// register's 20 ms units.
 ///
@@ -517,6 +525,7 @@ pub fn posture_walk(
                     u64::try_from(duration_ns).expect("a configured duration is a duration"),
                 ),
             ),
+            kind: motion_cogs::GoalKind::Base,
         },
         1e9 / PERIOD_NS as f64,
     )
@@ -1043,6 +1052,7 @@ fn posture_clocks(
                     u64::try_from(duration_ns).expect("a configured duration is a duration"),
                 ),
             ),
+            kind: motion_cogs::GoalKind::Base,
         },
         1e9 / PERIOD_NS as f64,
     );
@@ -1118,6 +1128,54 @@ pub fn stow_pose() -> reachy_motion::joints::JointTargets {
 #[must_use]
 pub fn neutral_pose() -> reachy_motion::joints::JointTargets {
     committed_poses::targets(NEUTRAL_POSE)
+}
+
+/// Where a look at `bearing_mrad`, `elevation_mrad` puts the machine under the
+/// deployed share: `reachy_kin::look::target` at the angles in radians. Stated
+/// here rather than taken from the Mover, so a scenario holds the Mover's
+/// composition to the rule rather than to itself.
+#[must_use]
+pub fn look_pose(bearing_mrad: i32, elevation_mrad: i32) -> reachy_motion::joints::JointTargets {
+    let look = reachy_kin::look::target(
+        f64::from(bearing_mrad) / 1000.0,
+        f64::from(elevation_mrad) / 1000.0,
+        &reachy_kin::LookPolicy {
+            head_share: LOOK_HEAD_SHARE_RAD,
+        },
+    );
+    reachy_motion::joints::JointTargets {
+        head_pose_body: look.head_pose_body,
+        body_yaw: look.body_yaw,
+        antennas: look.antennas,
+    }
+}
+
+/// The clocks a look from `from` to `to` runs on: the deployed head clock,
+/// floored the way the mover floors it.
+///
+/// Assumes the mover clocks a look as it clocks a posture move to the same
+/// targets on the look's head clock.
+#[must_use]
+pub fn look_clocks(
+    from: &reachy_motion::joints::JointTargets,
+    to: &reachy_motion::joints::JointTargets,
+) -> MoveClocks {
+    posture_clocks(from, to, LOOK_HEAD_MS * 1_000_000)
+}
+
+/// How long a step carrying a look from `from` to `to` has to run for the
+/// machine to be asserted arrived on its last cycle: the plant's travel on the
+/// deployed head clock, and the settle room every arrival gets.
+///
+/// # Panics
+///
+/// As [`posture_walk`] does, for a look this machine will not run.
+#[must_use]
+pub fn look_step_cycles(
+    from: &reachy_motion::joints::JointTargets,
+    to: &reachy_motion::joints::JointTargets,
+) -> i64 {
+    posture_walk(from, to, LOOK_HEAD_MS * 1_000_000).travel() + ARRIVAL_SETTLE_CYCLES
 }
 
 /// What a release is judged against, as a checker outside the session process
@@ -1518,6 +1576,8 @@ pub fn check_params(paths: &ConfigPaths<'_>) -> Vec<String> {
             ("lag_k", Value::Int(LAG_K)),
             ("period_ns", Value::Int(PERIOD_NS)),
             ("tracking_armed", Value::Bool(TRACKING_ARMED)),
+            ("look_head_share_rad", Value::Float(LOOK_HEAD_SHARE_RAD)),
+            ("look_head_ms", Value::Int(LOOK_HEAD_MS)),
         ],
         &mut failures,
     );
@@ -1794,10 +1854,10 @@ mod tests {
 
     use super::{
         AUX_RETRIES, AUX_TIMEOUT_NS, BUS_WATCHDOG, ConfigPaths, HEALTH_POLL_PERIOD_NS,
-        HOLD_TIMEOUT_NS, LAG_K, PERIOD_NS, RAIL_STALE_AFTER_NS, SAMPLE_STALE_AFTER,
-        SCRIPT_SPAN_CAP_MS, SESSION_CONFIRM_BUDGET_NS, START_TORQUED, STARTUP_GRACE_NS,
-        STOW_BUDGET_NS, TRACKING_ARMED, check_params, crossing_cycles, head_jam_rows,
-        head_up_travel, jam_on_the_raise, motion_id, motion_table, posture_joints,
+        HOLD_TIMEOUT_NS, LAG_K, LOOK_HEAD_MS, LOOK_HEAD_SHARE_RAD, PERIOD_NS, RAIL_STALE_AFTER_NS,
+        SAMPLE_STALE_AFTER, SCRIPT_SPAN_CAP_MS, SESSION_CONFIRM_BUDGET_NS, START_TORQUED,
+        STARTUP_GRACE_NS, STOW_BUDGET_NS, TRACKING_ARMED, check_params, crossing_cycles,
+        head_jam_rows, head_up_travel, jam_on_the_raise, motion_id, motion_table, posture_joints,
         response_delay_cycles, travel_cycles, unjudgeable_step, up_clocks, up_travel, up_walk,
     };
 
@@ -2059,6 +2119,8 @@ mod tests {
                         ("lag_k", LAG_K.to_string()),
                         ("period_ns", PERIOD_NS.to_string()),
                         ("tracking_armed", TRACKING_ARMED.to_string()),
+                        ("look_head_share_rad", LOOK_HEAD_SHARE_RAD.to_string()),
+                        ("look_head_ms", LOOK_HEAD_MS.to_string()),
                     ],
                 ),
                 (
@@ -2178,8 +2240,14 @@ mod tests {
 
         // One perturbation per pinned key, each a value the field could
         // plausibly drift to.
-        let perturbations: [(&str, &str, &str); 19] = [
+        let perturbations: [(&str, &str, &str); 21] = [
             ("mover_params.textproto", "tracking_armed", "false"),
+            (
+                "mover_params.textproto",
+                "look_head_share_rad",
+                "0.7853981633974483",
+            ),
+            ("mover_params.textproto", "look_head_ms", "401"),
             ("servo_profile.textproto", "legs_profile_acceleration", "21"),
             ("servo_profile.textproto", "legs_profile_velocity", "51"),
             (

@@ -58,7 +58,8 @@ schema ScriptStep
         // How long the move to the pose takes, milliseconds; meaningful only
         // when `kind` is `base_posture`. Positive, which the screen checks.
         // Spelled `move_ms` and not `duration_ms` because on this protocol that
-        // word is the step's own span, and a move's pace is not its span.
+        // word is the step's own span, and a move's pace is not its span. A look
+        // carries none.
         #4 move_ms: UInt32;
 
         // Which pose, as its index in the configured library's poses.
@@ -67,6 +68,15 @@ schema ScriptStep
         // question, asked where the pose becomes a target, and an index it does
         // not hold is a command refused rather than a pose substituted.
         #5 pose_id: UInt16;
+
+        // The direction a `base_look` step faces, milliradians from the base's
+        // forward, positive to the robot's left. Meaningful only when `kind` is
+        // `base_look`.
+        #6 bearing_mrad: Int32;
+
+        // Its elevation above level, milliradians. Meaningful only when `kind`
+        // is `base_look`.
+        #7 elevation_mrad: Int32;
     }
     history
     {

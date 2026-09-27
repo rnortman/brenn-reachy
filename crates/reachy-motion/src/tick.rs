@@ -137,7 +137,10 @@ use crate::joints::{
     flags, group_of, row, worst_joint, worst_row,
 };
 use crate::phase::{AntennaPhaseConfig, PhaseSeparation, PhaseWatch};
-use crate::plant::{GroupPlants, MAX_GAP_PERIODS, Predicted, RESPONSE_DEAD_SAMPLES};
+use crate::plant::{
+    GroupPlants, MAX_GAP_PERIODS, PROFILE_VELOCITY_UNIT_RAD_PER_S, Predicted,
+    RESPONSE_DEAD_SAMPLES, SHIPPED_PROFILES,
+};
 use crate::record;
 use crate::seq::{SeqError, SeqFailureKind, failure};
 use crate::snap::{DurationError, PoseSnapshotError, duration_from_nanos, duration_nanos};
@@ -474,11 +477,16 @@ impl Default for MotionConfig {
                 // leg per period at 50 Hz, dry-sampled through the inverse
                 // kinematics. Better than twice that.
                 legs: 0.15,
-                // Analogy rather than measurement: no yaw speed trial has been
-                // run. The body yaw is the legs' servo model, unloaded and
-                // moving linearly in its own coordinate, so it carries their
-                // figure until a supervised fold measures its own.
-                body_yaw: 0.15,
+                // Derived from the shipped profile so it moves when the yaw is
+                // recommissioned. This paces every body swing this crate
+                // plans, looks included: a min-jerk path stretched to it peaks
+                // at twice the servo's cap, so the setpoint runs ahead of the
+                // shaft mid-move and the shaft trails it in. Content is not
+                // bounded by it.
+                body_yaw: 2.0
+                    * f64::from(SHIPPED_PROFILES.yaw.velocity)
+                    * PROFILE_VELOCITY_UNIT_RAD_PER_S
+                    / FLOOR_TICK_HZ,
                 // The fastest sweep on record — an antenna crossing 3.22 rad in
                 // 0.3 s, 855°/s — plans a peak of 0.403 rad per period at
                 // 50 Hz. Better than half as much again. The normal widest
@@ -4087,14 +4095,32 @@ mod tests {
         assert_eq!(durations, stretch.effective);
     }
 
+    /// The yaw's plan bound is twice the commissioned yaw's own speed per
+    /// period, read here through the plant model the tracking detector
+    /// predicts with rather than through the registers the default is written
+    /// from, so a recommissioned pair moves both or fails this.
+    #[test]
+    fn the_yaw_step_bound_is_twice_the_commissioned_yaw_speed() {
+        assert_eq!(
+            1e9 / SHIPPED_PERIOD_NS as f64,
+            FLOOR_TICK_HZ,
+            "the premise: the shipped period is one period of the floors' tick"
+        );
+        let plants = GroupPlants::from_profiles(&SHIPPED_PROFILES, SHIPPED_PERIOD_NS)
+            .expect("the shipped pairs are generators");
+        let bound = MotionConfig::default().max_step.body_yaw;
+        let twice = 2.0 * plants.yaw.v_max;
+        assert!((bound - twice).abs() <= 1e-15, "{bound} against {twice}");
+    }
+
     /// The recovery this exists for: a body a hand spun to the half turn while
     /// the machine lay limp folds to stow on a clock sized for the half turn,
     /// instead of faulting partway and dropping the head. It is the
     /// unattended-at-boot case: nobody is there to catch the head or to restart
     /// the daemon.
     ///
-    /// Half a turn needs 0.79 s at the measured yaw bound, which a calm
-    /// two-second stow carries outright — asserted here, because it is why the
+    /// Half a turn needs about 2.5 s at the yaw's bound, which a calm
+    /// three-second stow carries outright — asserted here, because it is why the
     /// fold below is driven at a quick gesture's clock instead: that is the
     /// clock a half turn does not fit inside.
     #[test]
@@ -4110,7 +4136,7 @@ mod tests {
         };
         let calm = MotionCommand::MoveTo {
             target: stow,
-            durations: MoveDurations::uniform(secs(2.0)),
+            durations: MoveDurations::uniform(secs(3.0)),
             warp: WarpKind::MinJerk,
         };
         let (state, _) = armed_at(&cfg, &crooked);
@@ -5060,15 +5086,15 @@ mod tests {
     fn the_effective_clock_is_the_requested_one_or_the_floor_and_nothing_between() {
         let cfg = MotionConfig::default();
         let (state, _) = armed_at(&cfg, &JointTargets::default());
-        let span = 1.0;
+        let span = 0.3;
         let floor = duration_floor_s(span, cfg.max_step.body_yaw, FLOOR_TICK_HZ);
 
         // `None` until there is a clock before this one to compare against;
         // nothing is monotone about the first entry of a sequence.
         let mut previous: Option<f64> = None;
-        // Straddling the floor, which the yaw's measured bound puts at a
-        // quarter of a second: a band that sat entirely above it would pass
-        // without ever crossing the thing under test.
+        // Straddling the floor, which the yaw's bound puts just under a
+        // quarter of a second for this span: a band that sat entirely above it
+        // would pass without ever crossing the thing under test.
         for hundredths in 10..=60 {
             let requested = f64::from(hundredths) / 100.0;
             let command = MotionCommand::MoveTo {
@@ -7542,11 +7568,23 @@ mod tests {
     fn a_release_after_a_raise_on_a_saturated_move_still_re_raises() {
         let cfg = armed_shipped();
         let ticks = cfg.tracking.ticks;
-        // Three times the profile velocity at its peak: the goal is far past
-        // the prediction and staying there.
-        let command = yaw_move(&cfg, 2.0, 3.0);
+        // Asked for at three times the profile velocity and floored to the
+        // step bound, as the Mover floors a wide look: the plan peaks at twice
+        // the profile velocity, so the goal runs far past the prediction
+        // through the middle of the move and stays there. The hand goes on
+        // where that lead is widest.
+        let (command, stretch) = floor_move_clock(
+            &cfg,
+            &JointTargets::default(),
+            &yaw_move(&cfg, 2.5, 3.0),
+            FLOOR_TICK_HZ,
+        );
+        assert!(
+            stretch.is_some(),
+            "the ask is past the bound, and the floor paces it"
+        );
         let recovery = cfg.plant.yaw.pass_cycles(cfg.tracking.progress_min_rad) as u32;
-        let run = re_raises(&cfg, &command, 5, Some(ticks - recovery - 1), 300);
+        let run = re_raises(&cfg, &command, 40, Some(ticks - recovery - 1), 300);
         let raises = &run.raises;
 
         assert_eq!(
@@ -7575,7 +7613,7 @@ mod tests {
         // What silences the third window is the joint, at the cap by now,
         // pacing a generator that is still at the cap itself — not the
         // prediction landing, which with the setpoint that far ahead it does
-        // not do for another forty periods.
+        // not do until forty periods after the first raise.
         let anchor = (raises[1].0 + 1) as usize;
         let out = (raises[1].0 + ticks) as usize;
         let generator = run.trajectory[out].position - run.trajectory[anchor].position;

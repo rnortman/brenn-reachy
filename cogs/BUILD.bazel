@@ -491,6 +491,8 @@ rust_test(
         "POSE_DOCUMENTS": "cogs/poses",
     },
     deps = [
+        # The yaw probes' names are pinned under the prefix the report selects their standard by.
+        "//crates/reachy-edge:reachy_edge",
         # The imported vendor clips' base is asserted against the neutral head
         # pose itself.
         "//crates/reachy-kin:reachy_kin",
@@ -642,6 +644,8 @@ rust_test(
     size = "small",
     crate = ":library_tour_report",
     deps = [
+        # The standard a run's table selects is asserted by name.
+        ":stillness_report",
         "//crates/motion-proto:motion_proto",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],
@@ -934,13 +938,16 @@ rust_library(
     ],
 )
 
-# The settle bound's invariant against the envelope's outer clearance, and how
-# schedules end windows and mark seams.
+# The settle bound's invariant against the envelope's outer clearance, how
+# schedules end windows and mark seams, and the settle instrument over synthetic
+# runs.
 rust_test(
     name = "motion_run_report_test",
     size = "small",
     crate = ":motion_run_report",
     deps = [
+        # The bus's bare count conversion, so present readings are built as the driver records them.
+        "//crates/dxl-proto:dxl_proto",
         "//crates/reachy-kin:reachy_kin",
         "@rusty_cogs//crates/clockwork-rs:clockwork_rs",
     ],

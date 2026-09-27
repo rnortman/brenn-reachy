@@ -39,7 +39,7 @@
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use reachy_motion::joints::{JointGroup, JointRef, flags};
-use scenario::author::Step;
+use scenario::author::{Step, StepBase};
 use scenario::{answered_within, cycle_at, cycles_for, run_end_cycle};
 
 // The shape of an ordinary run, stated once for every scenario: where a run
@@ -180,14 +180,18 @@ pub fn steps() -> [Step; 2] {
         Step {
             start_ns: cycle_at(up_start_cycle()),
             end_ns: cycle_at(stow_start_cycle()),
-            pose: Some(scenario::NEUTRAL_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::NEUTRAL_POSE,
+                move_ms: None,
+            },
         },
         Step {
             start_ns: cycle_at(stow_start_cycle()),
             end_ns: cycle_at(disengage_cycle()),
-            pose: Some(scenario::STOW_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::STOW_POSE,
+                move_ms: None,
+            },
         },
     ]
 }

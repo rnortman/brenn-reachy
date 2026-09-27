@@ -689,15 +689,16 @@ library-run: device-host motion-deploy require-bazel
 #
 # `library-run`'s chain over one motion instead of the whole library: the same
 # build, push, fetch and analyzer, and a plan of one script. It is how a
-# `probe/` instrument is played -- a clip that steps the antennas to a pose in
-# one frame and holds it, so the hold after a hard arrival can be judged -- and
-# those motions are not in the tour for that reason.
+# `probe/` instrument is played -- a document that steps the antennas or the
+# body yaw to a pose in one frame and holds it, so the hold after a hard arrival
+# can be judged -- and those motions are not in the tour for that reason.
 #
 # MOTION names the motion, as the committed name table spells it. About a
 # minute of motion with nobody at the machine; `docs/bench-runbook.md` is the
 # procedure.
 #
 #   make motion-probe MOTION=probe/antenna-step-a
+#   make motion-probe MOTION=probe/yaw-hold
 #
 # The name check is a recipe line rather than a prerequisite beside the deploy:
 # independent prerequisites race under `-j`, typed or inherited through

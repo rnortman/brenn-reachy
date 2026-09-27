@@ -18,7 +18,7 @@
 //
 // `base_keep` is not "do nothing": it is "hold whatever the base pose already
 // is", which is what a step that exists to occupy time says. A step naming a
-// pose is the only thing that retargets the base.
+// pose, or a look, is what retargets the base.
 enum StepKind
 {
     uuid: 186ddcf8-bbcd-423c-8544-a4e692c94a5d;
@@ -32,6 +32,9 @@ enum StepKind
         #0 base_keep default { underlying_value: 0; }
         // Move the base to the pose this step names.
         #1 base_posture { underlying_value: 1; }
+        // Face a direction: turn the head and the body toward `bearing_mrad` at
+        // `elevation_mrad`.
+        #2 base_look { underlying_value: 2; }
     }
 }
 
@@ -56,7 +59,8 @@ schema ScheduledStep
         // `base_posture`. Positive: a move given no time is not a move. The
         // commander states it, because choosing where the base goes and how
         // fast it gets there is one choice; a commander that states none is
-        // given the pace the pose library holds for that pose.
+        // given the pace the pose library holds for that pose. A `base_look`
+        // row carries no pace (zero): the mover's configuration paces a look.
         #4 pace: Duration;
 
         // Which pose, as its index in the configured library's poses.
@@ -65,6 +69,15 @@ schema ScheduledStep
         // name: names live at the authoring edge and the number is what the
         // machine commands against.
         #5 pose_id: UInt16;
+
+        // The direction a `base_look` step faces, milliradians from the base's
+        // forward, positive to the robot's left. Meaningful only when `kind` is
+        // `base_look`.
+        #6 bearing_mrad: Int32;
+
+        // Its elevation above level, milliradians. Meaningful only when `kind`
+        // is `base_look`.
+        #7 elevation_mrad: Int32;
     }
     history
     {

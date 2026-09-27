@@ -26,7 +26,7 @@
 //! stated once. Every instant is a cycle count from the epoch unless it says
 //! otherwise.
 
-use scenario::author::{Overlay, Step};
+use scenario::author::{Overlay, Step, StepBase};
 use scenario::{UP_DURATION_NS, cycle_at, cycles_for, run_end_cycle};
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
@@ -221,8 +221,10 @@ pub fn opening_steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(up_start_cycle()),
         end_ns: cycle_at(opening_window_open_cycle()) + (window_span_ms(NOD) + 200) * 1_000_000,
-        pose: Some(scenario::NEUTRAL_POSE),
-        move_ms: None,
+        base: StepBase::Pose {
+            name: scenario::NEUTRAL_POSE,
+            move_ms: None,
+        },
     }]
 }
 
@@ -246,8 +248,10 @@ pub fn replacement_steps(n: usize) -> [Step; 1] {
     [Step {
         start_ns,
         end_ns: start_ns + REPLACEMENT_HOLD_MS * 1_000_000,
-        pose: Some(scenario::NEUTRAL_POSE),
-        move_ms: None,
+        base: StepBase::Pose {
+            name: scenario::NEUTRAL_POSE,
+            move_ms: None,
+        },
     }]
 }
 
@@ -272,14 +276,18 @@ pub fn closing_steps() -> [Step; 2] {
         Step {
             start_ns: cycle_at(closing_cycle()),
             end_ns: cycle_at(stow_start_cycle()),
-            pose: Some(scenario::NEUTRAL_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::NEUTRAL_POSE,
+                move_ms: None,
+            },
         },
         Step {
             start_ns: cycle_at(stow_start_cycle()),
             end_ns: cycle_at(disengage_cycle()),
-            pose: Some(scenario::STOW_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::STOW_POSE,
+                move_ms: None,
+            },
         },
     ]
 }

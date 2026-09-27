@@ -577,7 +577,8 @@ mod tests {
     /// a re-recorded `stow` or a hand-edited `neutral` moves out from under
     /// them. Without it the allowance can stop covering the travel with every
     /// test green, and the watch then reads a rod still arriving as one that
-    /// will not stand still.
+    /// will not stand still. A look holds the antennas at `neutral`'s pair too,
+    /// and `reachy-kin` states it as a literal for the same reason.
     #[test]
     fn the_antennas_are_where_the_stillness_allowance_was_sized_on() {
         assert_eq!(
@@ -589,6 +590,11 @@ mod tests {
             targets(reachy_poses::NEUTRAL_POSE).antennas,
             [-0.1745, 0.1745],
             "crates/reachy-motion/src/stillness.rs states this rest as REST",
+        );
+        assert_eq!(
+            reachy_kin::LOOK_ANTENNAS,
+            targets(reachy_poses::NEUTRAL_POSE).antennas,
+            "crates/reachy-kin/src/look.rs states this pair as LOOK_ANTENNAS"
         );
     }
 }

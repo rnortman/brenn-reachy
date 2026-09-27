@@ -56,6 +56,18 @@ schema MoverParams
         // An attended run is what that state is for, and every analyzer reads
         // a run recorded with it as a failed run.
         #4 tracking_armed: Bool;
+
+        // The most of a look's bearing the head carries, radians; the body yaw
+        // carries the rest. Between zero and the look head-share limit, 54
+        // degrees, one degree inside the head-relative yaw cap; the Mover
+        // refuses anything else at start. Zero is a policy in which the body
+        // carries every bearing.
+        #5 look_head_share_rad: Float64;
+
+        // The head group's clock for a look, milliseconds. Positive. The body's
+        // pace is the tick's step floor, which lengthens this clock for a body
+        // swing it cannot carry.
+        #6 look_head_ms: UInt32;
     }
     history
     {

@@ -9,6 +9,9 @@
 //! `PlayWindow`'s own span — the motion's clock scaled by the speed, plus a
 //! blend-out that is not. A base step names a pose, and the pose resolves the
 //! same way a motion does: to the number the schedule carries, or to a refusal.
+//! A look names a direction, which the schedule carries as the wire stated it.
+//! The machine composes the look's targets and its pace, so a look row states
+//! no pace.
 //!
 //! Two rules are this crate's own, and both are about how a schedule ends.
 //!
@@ -16,7 +19,8 @@
 //! timeout" means stowed at the deadline: the horizon is where the session
 //! concludes the engagement and releases torque, and a release expects the
 //! machine at stow. So a script whose last base step is not a stow gets one
-//! appended, ending exactly at `timeout_ms`.
+//! appended, ending exactly at `timeout_ms` — a timeline that ends on a look
+//! included.
 //!
 //! **A schedule that stows early ends there.** When the script's own last base
 //! step is a stow, the horizon is that stow's end and not the timeout: the wire
@@ -48,7 +52,7 @@
 use brenn_reachy__cogs__schedule_clk_rs::StepKindWire;
 use brenn_reachy__cogs__script_clk_rs::{ScriptOverlayWire, ScriptStepWire, ScriptWire};
 use clockwork_rs::{Clear as _, SyncTime};
-use motion_proto::{MotionScript, STOW_POSE};
+use motion_proto::{Base as WireBase, MotionScript, STOW_POSE};
 use thiserror::Error;
 
 use crate::names::{MotionTable, PoseTable};
@@ -76,16 +80,17 @@ const FULL_GAIN: f64 = 1.0;
 /// sends part of a timeline.
 #[derive(Clone, Debug, PartialEq, Error)]
 pub enum CompileError {
-    /// The timeline commands no pose: no steps at all, or nothing but `keep`.
+    /// The timeline commands no destination: no steps at all, or nothing but
+    /// `keep`.
     ///
     /// `keep` holds a base the machine is already commanding, and a machine at
-    /// rest has none — so a pose-free script means nothing at rest and this
+    /// rest has none — so a script with no destination means nothing at rest and this
     /// edge cannot tell rest from engagement: the phase it holds is narration
     /// the session published, possibly stale, and never an input to a screen.
     /// Compiled and forwarded, this shape would torque a resting head through a
     /// pointless stow-hold cycle. No publisher emits one today.
-    #[error("the script commands no pose; `keep` alone moves nothing")]
-    NoPose,
+    #[error("the script commands no pose and no look; `keep` alone moves nothing")]
+    NoDestination,
 
     /// A base step names a pose the deployed library does not hold. Refused
     /// rather than substituted: a head that stands up because a name did not
@@ -205,14 +210,30 @@ pub enum CompileError {
 
 /// One step of the compiled schedule, before it is written into the message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Row {
+struct Row<'a> {
     after_ms: u64,
     duration_ms: u64,
-    /// Which pose, as the deployed library numbers it. `None` on a row that
-    /// keeps whatever base is commanded.
-    pose: Option<u16>,
-    /// How long the move to `pose` takes. Zero on a row that names none.
-    move_ms: u64,
+    /// What the row asks the base to do.
+    target: Target<'a>,
+}
+
+/// What one compiled row asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target<'a> {
+    /// Keep whatever base is commanded.
+    Keep,
+    /// Go to a pose, as the deployed library numbers it, over `move_ms`. The
+    /// name is kept for the closing-stow decision, which is about the name.
+    Pose {
+        name: &'a str,
+        pose_id: u16,
+        move_ms: u64,
+    },
+    /// Face a direction, milliradians as the wire stated them.
+    Look {
+        bearing_mrad: i32,
+        elevation_mrad: i32,
+    },
 }
 
 /// `script` as the request the session screens, stamped `arrival` and numbered
@@ -263,13 +284,23 @@ pub fn compile(
             let step: &mut ScriptStepWire = steps.try_grow().expect("a screened row count");
             step.set_after_ms(field(row.after_ms));
             step.set_duration_ms(field(row.duration_ms));
-            match row.pose {
-                Some(pose_id) => {
+            match row.target {
+                Target::Keep => step.set_kind(StepKindWire::BASE_KEEP),
+                Target::Pose {
+                    pose_id, move_ms, ..
+                } => {
                     step.set_kind(StepKindWire::BASE_POSTURE);
                     step.set_pose_id(pose_id);
-                    step.set_move_ms(field(row.move_ms));
+                    step.set_move_ms(field(move_ms));
                 }
-                None => step.set_kind(StepKindWire::BASE_KEEP),
+                Target::Look {
+                    bearing_mrad,
+                    elevation_mrad,
+                } => {
+                    step.set_kind(StepKindWire::BASE_LOOK);
+                    step.set_bearing_mrad(bearing_mrad);
+                    step.set_elevation_mrad(elevation_mrad);
+                }
             }
         }
     }
@@ -287,64 +318,70 @@ pub fn compile(
     Ok(message)
 }
 
-/// One base step of the script, resolved: which pose the schedule carries and
-/// how fast the machine goes there, with the name kept for the decisions that
-/// are about the name.
-#[derive(Clone, Copy)]
-struct Base<'a> {
-    pose_id: u16,
-    name: &'a str,
-    pace: u64,
-}
-
 /// The base timeline as intervals, closing stow included.
-fn base_rows(script: &MotionScript, poses: &PoseTable) -> Result<Vec<Row>, CompileError> {
+fn base_rows<'a>(
+    script: &'a MotionScript,
+    poses: &PoseTable,
+) -> Result<Vec<Row<'a>>, CompileError> {
     // Every pose name resolves before anything else is decided, so a name the
     // deployed library does not hold is refused wherever in the timeline it sits
     // rather than only when it happens to be the closing one.
-    let bases: Vec<(u64, Option<Base<'_>>)> = script
+    let bases: Vec<(u64, Target<'_>)> = script
         .steps()
         .iter()
         .filter_map(|step| step.action.base().map(|base| (step.after_ms, base)))
-        .map(|(after_ms, base)| match base.pose() {
-            Some(name) => resolve_pose(name, base.move_ms(), poses).map(|(pose_id, pace)| {
-                (
-                    after_ms,
-                    Some(Base {
-                        pose_id,
-                        name,
-                        pace,
-                    }),
-                )
-            }),
-            None => Ok((after_ms, None)),
+        .map(|(after_ms, base)| match base {
+            WireBase::Pose { name, move_ms } => {
+                resolve_pose(name, *move_ms, poses).map(|(pose_id, pace)| {
+                    (
+                        after_ms,
+                        Target::Pose {
+                            name,
+                            pose_id,
+                            move_ms: pace,
+                        },
+                    )
+                })
+            }
+            WireBase::Look {
+                bearing_mrad,
+                elevation_mrad,
+            } => Ok((
+                after_ms,
+                Target::Look {
+                    bearing_mrad: *bearing_mrad,
+                    elevation_mrad: *elevation_mrad,
+                },
+            )),
+            WireBase::Keep => Ok((after_ms, Target::Keep)),
         })
         .collect::<Result<_, _>>()?;
-    // Which pose closes the timeline is a question about the last step that
-    // states one, not about the last step: a `keep` states none, and a keep
-    // standing after a stow holds that stow rather than ending it. That last
-    // stating step is also the one whose absence means the timeline commands no
-    // pose at all, so both come off this one search.
+    // Which step closes the timeline is a question about the last step that
+    // states a destination — a pose or a look — not about the last step: a
+    // `keep` states none, and a keep standing after a stow holds that stow
+    // rather than ending it. That last stating step is also the one whose
+    // absence means the timeline commands no destination at all, so both come
+    // off this one search.
     let closing = bases
         .iter()
         .enumerate()
-        .filter_map(|(index, (_, base))| base.map(|base| (index, base)))
+        .filter(|(_, (_, base))| !matches!(base, Target::Keep))
+        .map(|(index, (_, base))| (index, *base))
         .next_back();
     let Some((pose_index, closing)) = closing else {
-        return Err(CompileError::NoPose);
+        return Err(CompileError::NoDestination);
     };
 
     let timeout_ms = script.timeout_ms();
-    let stow_terminal = closing.name == STOW_POSE;
+    let stow_terminal = matches!(closing, Target::Pose { name, .. } if name == STOW_POSE);
     // How long the fold that ends this timeline takes. A script closing at the
     // stow itself states the pace, or takes the library's for it; one that does
     // not is given the stow this compile appends, which runs at the library's
     // pace and nobody else's. Either way the room the timeline has to leave is
     // measured against the pace actually used.
-    let stow_ms = if stow_terminal {
-        closing.pace
-    } else {
-        u64::from(poses.stow().duration_ms)
+    let stow_ms = match closing {
+        Target::Pose { move_ms, .. } if stow_terminal => move_ms,
+        _ => u64::from(poses.stow().duration_ms),
     };
     let (last_after, _) = bases[bases.len() - 1];
     if stow_terminal && pose_index + 1 < bases.len() {
@@ -387,16 +424,18 @@ fn base_rows(script: &MotionScript, poses: &PoseTable) -> Result<Vec<Row>, Compi
         rows.push(Row {
             after_ms: *after_ms,
             duration_ms: end - *after_ms,
-            pose: base.map(|base| base.pose_id),
-            move_ms: base.map_or(0, |base| base.pace),
+            target: *base,
         });
     }
     if !stow_terminal {
         rows.push(Row {
             after_ms: last_end,
             duration_ms: stow_ms,
-            pose: Some(poses.stow().pose_id),
-            move_ms: stow_ms,
+            target: Target::Pose {
+                name: STOW_POSE,
+                pose_id: poses.stow().pose_id,
+                move_ms: stow_ms,
+            },
         });
     }
     Ok(rows)
@@ -562,6 +601,8 @@ mod tests {
         kind: StepKindWire,
         pose_id: u16,
         move_ms: u32,
+        bearing_mrad: i32,
+        elevation_mrad: i32,
     }
 
     /// The steps of `message`, in order.
@@ -575,6 +616,8 @@ mod tests {
                 kind: step.kind(),
                 pose_id: step.pose_id(),
                 move_ms: step.move_ms(),
+                bearing_mrad: step.bearing_mrad(),
+                elevation_mrad: step.elevation_mrad(),
             })
             .collect()
     }
@@ -596,6 +639,21 @@ mod tests {
             kind: StepKindWire::BASE_POSTURE,
             pose_id,
             move_ms: if pose_id == STOW_ID { 3000 } else { 800 },
+            bearing_mrad: 0,
+            elevation_mrad: 0,
+        }
+    }
+
+    /// A look row: its two angles, and no pose and no pace.
+    fn look_row(after_ms: u32, duration_ms: u32, bearing_mrad: i32, elevation_mrad: i32) -> Row {
+        Row {
+            after_ms,
+            duration_ms,
+            kind: StepKindWire::BASE_LOOK,
+            pose_id: 0,
+            move_ms: 0,
+            bearing_mrad,
+            elevation_mrad,
         }
     }
 
@@ -614,6 +672,8 @@ mod tests {
                     kind: StepKindWire::BASE_KEEP,
                     pose_id: 0,
                     move_ms: 0,
+                    bearing_mrad: 0,
+                    elevation_mrad: 0,
                 },
                 base_row(7000, 3000, STOW_ID),
             ],
@@ -743,6 +803,8 @@ mod tests {
                     kind: StepKindWire::BASE_KEEP,
                     pose_id: 0,
                     move_ms: 0,
+                    bearing_mrad: 0,
+                    elevation_mrad: 0,
                 },
                 base_row(2, 3000, STOW_ID),
             ],
@@ -759,11 +821,96 @@ mod tests {
 
     #[test]
     fn a_script_that_commands_no_pose_is_dropped() {
-        assert_eq!(compiled(vec![], 5000), Err(CompileError::NoPose));
+        assert_eq!(compiled(vec![], 5000), Err(CompileError::NoDestination));
         assert_eq!(
             compiled(vec![Step::keep(0), Step::keep(1000)], 5000),
-            Err(CompileError::NoPose),
+            Err(CompileError::NoDestination),
             "`keep` alone would torque a resting head through a pointless cycle",
+        );
+    }
+
+    #[test]
+    fn a_look_compiles_to_a_look_row_with_its_angles_and_no_pace() {
+        let message = compiled(
+            vec![
+                Step::look(0, 520, 471),
+                Step::look(1000, -611, 0),
+                stow(4000),
+            ],
+            13_000,
+        )
+        .expect("a lawful script");
+        assert_eq!(
+            rows(&message),
+            vec![
+                look_row(0, 1000, 520, 471),
+                look_row(1000, 3000, -611, 0),
+                base_row(4000, 3000, STOW_ID),
+            ],
+            "the angles are the wire's; the pace is the machine's, so the row states none",
+        );
+    }
+
+    #[test]
+    fn a_look_is_a_destination_and_ends_at_the_synthesized_stow() {
+        assert_eq!(
+            rows(&compiled(vec![Step::look(0, 520, 471)], 10_000).expect("a look commands a base")),
+            vec![look_row(0, 7000, 520, 471), base_row(7000, 3000, STOW_ID)],
+            "a timeline ending on a look is not stow-terminal, so it gets the stow at the \
+             timeout",
+        );
+
+        let led = compiled(vec![Step::keep(0), Step::look(1000, 0, 0)], 10_000)
+            .expect("a keep then a look commands a base");
+        let last = rows(&led).pop().expect("a stow");
+        assert_eq!(last.pose_id, STOW_ID);
+        assert_eq!(
+            u64::from(last.after_ms) + u64::from(last.duration_ms),
+            10_000
+        );
+    }
+
+    #[test]
+    fn a_keep_after_a_look_holds_it_and_a_keep_after_the_closing_stow_is_still_dropped() {
+        assert_eq!(
+            rows(
+                &compiled(vec![Step::look(0, 520, 471), Step::keep(1000)], 10_000)
+                    .expect("a keep holding a look")
+            ),
+            vec![
+                look_row(0, 1000, 520, 471),
+                Row {
+                    after_ms: 1000,
+                    duration_ms: 6000,
+                    kind: StepKindWire::BASE_KEEP,
+                    pose_id: 0,
+                    move_ms: 0,
+                    bearing_mrad: 0,
+                    elevation_mrad: 0,
+                },
+                base_row(7000, 3000, STOW_ID),
+            ],
+        );
+
+        assert_eq!(
+            compiled(
+                vec![Step::look(0, 520, 471), stow(2000), Step::keep(6000)],
+                600_000
+            ),
+            Err(CompileError::KeepAfterStow {
+                after_ms: 6000,
+                stow_after_ms: 2000,
+            }),
+        );
+
+        let reopened = compiled(vec![up(0), stow(2000), Step::look(6000, 0, 0)], 600_000)
+            .expect("a look after a stow closes nothing");
+        let last = rows(&reopened).pop().expect("a stow");
+        assert_eq!(last.pose_id, STOW_ID);
+        assert_eq!(
+            u64::from(last.after_ms) + u64::from(last.duration_ms),
+            600_000,
+            "the look reopens the timeline, so the synthesized stow ends at the timeout",
         );
     }
 

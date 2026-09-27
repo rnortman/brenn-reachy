@@ -34,7 +34,7 @@
 //! Both the author and the checker read this module, so what the run *is* is
 //! stated once. Every instant is a cycle count from the epoch.
 
-use scenario::author::Step;
+use scenario::author::{Step, StepBase};
 use scenario::{cycle_at, cycles_for, run_end_cycle};
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
@@ -164,14 +164,18 @@ pub fn opening_steps() -> [Step; 2] {
         Step {
             start_ns: cycle_at(up_start_cycle()),
             end_ns: cycle_at(stow_start_cycle()),
-            pose: Some(scenario::NEUTRAL_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::NEUTRAL_POSE,
+                move_ms: None,
+            },
         },
         Step {
             start_ns: cycle_at(stow_start_cycle()),
             end_ns: cycle_at(stow_start_cycle() + stow_cycles()),
-            pose: Some(scenario::STOW_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::STOW_POSE,
+                move_ms: None,
+            },
         },
     ]
 }
@@ -188,14 +192,18 @@ pub fn reversal_steps() -> [Step; 2] {
         Step {
             start_ns: cycle_at(reversal_cycle()),
             end_ns: cycle_at(second_stow_start_cycle()),
-            pose: Some(scenario::NEUTRAL_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::NEUTRAL_POSE,
+                move_ms: None,
+            },
         },
         Step {
             start_ns: cycle_at(second_stow_start_cycle()),
             end_ns: cycle_at(disengage_cycle()),
-            pose: Some(scenario::STOW_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::STOW_POSE,
+                move_ms: None,
+            },
         },
     ]
 }

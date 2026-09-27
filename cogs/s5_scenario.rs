@@ -30,7 +30,7 @@
 //! written in milliseconds would be asserting against arithmetic it did not do.
 
 use reachy_motion::joints::JointGroup;
-use scenario::author::Step;
+use scenario::author::{Step, StepBase};
 use scenario::{LAG_K, cycle_at, run_end_cycle};
 
 // The shape of an ordinary run, stated once for every scenario: where a run
@@ -124,14 +124,18 @@ pub fn steps() -> [Step; 2] {
         Step {
             start_ns: cycle_at(up_start_cycle()),
             end_ns: cycle_at(retarget_cycle()),
-            pose: Some(scenario::NEUTRAL_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::NEUTRAL_POSE,
+                move_ms: None,
+            },
         },
         Step {
             start_ns: cycle_at(retarget_cycle()),
             end_ns: cycle_at(disengage_cycle()),
-            pose: Some(scenario::STOW_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::STOW_POSE,
+                move_ms: None,
+            },
         },
     ]
 }

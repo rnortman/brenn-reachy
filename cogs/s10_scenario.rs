@@ -26,7 +26,7 @@
 //! deterministic runner puts every sample on the grid exactly and a scenario
 //! written in milliseconds would be asserting against arithmetic it did not do.
 
-use scenario::author::Step;
+use scenario::author::{Step, StepBase};
 use scenario::{BLIND_CYCLES_BEFORE_BUS_FAILURE, SESSION_CONFIRM_BUDGET_NS, cycle_at, cycles_for};
 
 // The shape of an ordinary run, stated once for every scenario: where a run
@@ -120,7 +120,9 @@ pub fn steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(up_start_cycle()),
         end_ns: cycle_at(end_cycle()),
-        pose: Some(scenario::NEUTRAL_POSE),
-        move_ms: None,
+        base: StepBase::Pose {
+            name: scenario::NEUTRAL_POSE,
+            move_ms: None,
+        },
     }]
 }

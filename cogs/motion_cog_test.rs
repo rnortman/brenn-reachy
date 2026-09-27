@@ -47,8 +47,8 @@ use reachy_clips::envelope::ClipLimits;
 use reachy_clips::format::{Channel as ClipChannel, Clip, ClipDoc, FrameDoc};
 use reachy_driver::{NOMINAL_CYCLE_NS, STARTUP_INIT_BUDGET_NS};
 use reachy_kin::{
-    HeadGeometry, LegAngles, inverse_kinematics, neutral_head_pose, rest_head_pose,
-    sleep_head_pose, wrap_to_pi,
+    HeadGeometry, LOOK_ANTENNAS, LegAngles, LookPolicy, inverse_kinematics, neutral_head_pose,
+    rest_head_pose, sleep_head_pose, wrap_to_pi,
 };
 use reachy_motion::arm::{Gains, SERVO_IDS, row_of_id};
 use reachy_motion::default_motion_config;
@@ -689,7 +689,70 @@ fn params(period_ns: i64) -> MoverParamsWire {
     params.lag_k = u32::try_from(LAG).expect("a small lag");
     params.period_ns = period_ns;
     params.tracking_armed = true.into();
+    params.look_head_share_rad = LOOK_SHARE;
+    params.look_head_ms = u32::try_from(LOOK_HEAD_NS / 1_000_000).expect("a clock in whole ms");
     message
+}
+
+/// The most of a look's bearing the head carries in these cases, radians: the
+/// deployment's 30 degrees.
+const LOOK_SHARE: f64 = core::f64::consts::FRAC_PI_6;
+
+/// The head's clock for a look in these cases, nanoseconds: the deployment's.
+const LOOK_HEAD_NS: i64 = 400_000_000;
+
+/// The bus rows a look at `bearing_mrad`, `elevation_mrad` resolves to under the
+/// cases' own split: the body yaw, the cranks that hold the composed head, and
+/// the antennas where a look holds them.
+fn look_rows(bearing_mrad: i32, elevation_mrad: i32) -> [f64; JOINT_COUNT] {
+    let t = reachy_kin::look::target(
+        f64::from(bearing_mrad) / 1000.0,
+        f64::from(elevation_mrad) / 1000.0,
+        &LookPolicy {
+            head_share: LOOK_SHARE,
+        },
+    );
+    let mut rows = [0.0; JOINT_COUNT];
+    rows[row(JointRef::BodyYaw).expect("a bus row")] = t.body_yaw;
+    let legs = cranks(&t.head_pose_body);
+    for (leg, joint) in [
+        JointRef::Leg0,
+        JointRef::Leg1,
+        JointRef::Leg2,
+        JointRef::Leg3,
+        JointRef::Leg4,
+        JointRef::Leg5,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[row(joint).expect("a bus row")] = legs[leg];
+    }
+    rows[row(JointRef::AntennaRight).expect("a bus row")] = LOOK_ANTENNAS[0];
+    rows[row(JointRef::AntennaLeft).expect("a bus row")] = LOOK_ANTENNAS[1];
+    rows
+}
+
+/// Every row of `found` is the row of `wanted` within `tolerance`, the antennas
+/// read as the direction they point.
+fn assert_rows_at(
+    found: &[f64; JOINT_COUNT],
+    wanted: &[f64; JOINT_COUNT],
+    tolerance: f64,
+    what: &str,
+) {
+    for joint in ROWS {
+        let index = row(joint).expect("a bus row");
+        let (found, wanted) = match group_of(joint).expect("a servo") {
+            JointGroup::Antennas => (direction(found[index]), direction(wanted[index])),
+            _ => (found[index], wanted[index]),
+        };
+        assert!(
+            (found - wanted).abs() < tolerance,
+            "{what}: {} is at {found}, not {wanted}",
+            Name(joint),
+        );
+    }
 }
 
 /// A decision tick under test, with a machine in front of it.
@@ -855,6 +918,74 @@ impl Mover {
             step.set_kind(StepKindWire::BASE_POSTURE);
             step.set_pose_id(pose_id);
             step.set_pace(clockwork_rs::Duration::from_nanos(self.pace.0));
+        }
+        {
+            let mut rows = schedule.overlays_mut();
+            rows.clear();
+            for (motion_id, opens, closes, gain, speed) in windows {
+                let row: &mut OverlayWindowWire = rows.try_grow().expect("four windows fit");
+                row.set_motion_id(*motion_id);
+                row.set_start(SyncTime::from_nanos(T0 + opens * PERIOD));
+                row.set_end(SyncTime::from_nanos(T0 + closes * PERIOD));
+                row.set_gain(*gain);
+                row.set_speed(*speed);
+            }
+        }
+        self.cog
+            .publish_sched(&schedule, SyncTime::from_nanos(self.now));
+    }
+
+    /// Publish an engaged schedule of consecutive look steps from `T0`, each
+    /// given as (cycles, bearing, elevation) in milliradians. A look row states
+    /// no pace and names no pose, so both are written as zero.
+    fn schedule_looks(&mut self, epoch: u32, spans: &[(i64, i32, i32)]) {
+        let mut schedule = SessionScheduleWire::new();
+        schedule.set_engaged(true);
+        schedule.set_epoch(epoch);
+        {
+            let mut steps = schedule.steps_mut();
+            steps.clear();
+            let mut start = T0;
+            for (cycles, bearing_mrad, elevation_mrad) in spans {
+                let end = start + cycles * PERIOD;
+                let step: &mut ScheduledStepWire =
+                    steps.try_grow().expect("sixteen steps is plenty");
+                step.set_start(SyncTime::from_nanos(start));
+                step.set_end(SyncTime::from_nanos(end));
+                step.set_kind(StepKindWire::BASE_LOOK);
+                step.set_pose_id(0);
+                step.set_pace(clockwork_rs::Duration::from_nanos(0));
+                step.set_bearing_mrad(*bearing_mrad);
+                step.set_elevation_mrad(*elevation_mrad);
+                start = end;
+            }
+        }
+        self.cog
+            .publish_sched(&schedule, SyncTime::from_nanos(self.now));
+    }
+
+    /// Publish an overlay schedule over one look step.
+    fn schedule_playing_look(
+        &mut self,
+        epoch: u32,
+        bearing_mrad: i32,
+        elevation_mrad: i32,
+        windows: &[(u16, i64, i64, f64, f64)],
+    ) {
+        let mut schedule = SessionScheduleWire::new();
+        schedule.set_engaged(true);
+        schedule.set_epoch(epoch);
+        {
+            let mut steps = schedule.steps_mut();
+            steps.clear();
+            let step: &mut ScheduledStepWire = steps.try_grow().expect("one step fits");
+            step.set_start(SyncTime::from_nanos(T0));
+            step.set_end(SyncTime::from_nanos(T0 + 1000 * PERIOD));
+            step.set_kind(StepKindWire::BASE_LOOK);
+            step.set_pose_id(0);
+            step.set_pace(clockwork_rs::Duration::from_nanos(0));
+            step.set_bearing_mrad(bearing_mrad);
+            step.set_elevation_mrad(elevation_mrad);
         }
         {
             let mut rows = schedule.overlays_mut();
@@ -2792,6 +2923,236 @@ fn a_control_period_running_backwards_is_refused() {
     mover.step();
 }
 
+// The look cases. A look step names a direction rather than a pose: the Mover
+// composes its target from the configured split and asks for the configured
+// head clock, and the tick's step floor paces the body.
+
+fn mode_of(mover: &Mover) -> MotionMode {
+    state_of(mover.cog.state_ctrl().snap()).mode
+}
+
+/// A look inside the head's share goes where it names, on the head's clock,
+/// and is counted in nothing.
+#[test]
+fn a_look_goes_to_the_direction_it_names_on_the_head_s_clock() {
+    let mut mover = standing_up();
+    mover.run(60);
+    // 20 degrees at 27 degrees up: the head carries it all and the body stays.
+    mover.schedule_looks(2, &[(1000, 349, 471)]);
+    let head_cycles = usize::try_from(LOOK_HEAD_NS / PERIOD).expect("whole cycles");
+    let mut cycles = mover.run(head_cycles - 3);
+    assert_eq!(mode_of(&mover), MotionMode::Moving, "the look is under way");
+    cycles.extend(mover.run(10));
+    assert_eq!(
+        mode_of(&mover),
+        MotionMode::Holding,
+        "and ends on the head's clock"
+    );
+
+    let last = cycles.last().and_then(|cycle| cycle.goal).expect("a goal");
+    assert_rows_at(&last.targets, &look_rows(349, 471), 1e-6, "the look's end");
+    assert!(reports(&cycles).is_empty(), "{:?}", reports(&cycles));
+    assert_steps_fit(&cycles, "a look inside the share");
+    let state = mover.cog.state_ctrl();
+    assert_eq!(state.look_paced(), 0, "the head's clock carried the look");
+    assert_eq!(state.base_stretched(), 0);
+    assert_eq!(state.desired_kind(), StepKindWire::BASE_LOOK);
+    assert_eq!(state.desired_bearing_mrad(), 349);
+    assert_eq!(state.desired_elevation_mrad(), 471);
+    assert_eq!(state.desired_pose_id(), 0);
+}
+
+/// A second look row at the direction already dispatched asks for nothing new.
+#[test]
+fn a_second_look_at_the_same_direction_dispatches_nothing_new() {
+    let mut mover = standing_up();
+    mover.run(60);
+    // The first row lasts 40 cycles from the instant it is published.
+    let first_end = mover.cycles_from_start() + 40;
+    mover.schedule_looks(2, &[(first_end, 349, 471), (1000, 349, 471)]);
+    let answered = mover.cog.state_ctrl().epochs_answered();
+    let arriving = usize::try_from(LOOK_HEAD_NS / PERIOD).expect("whole cycles") + 10;
+    mover.run(arriving);
+    assert_eq!(mode_of(&mover), MotionMode::Holding, "the look arrived");
+    let arrived = mover.step().goal.expect("a goal").targets;
+
+    // Every execution is one sample, so each comparison below crossed the slot.
+    let rest = usize::try_from(first_end - mover.cycles_from_start()).expect("before the end");
+    let across = mover.run(rest + 10);
+    for cycle in &across {
+        assert_eq!(
+            cycle.goal.expect("still commanded").targets,
+            arrived,
+            "the same direction moves nothing",
+        );
+    }
+    assert_eq!(
+        mode_of(&mover),
+        MotionMode::Holding,
+        "no move was started at the row boundary"
+    );
+    assert_eq!(
+        mover.cog.state_ctrl().epochs_answered(),
+        answered + 1,
+        "epoch 2 was answered once, by the first row",
+    );
+}
+
+/// A look at another direction is a fresh ask and dispatches.
+#[test]
+fn a_look_at_another_direction_dispatches() {
+    let mut mover = standing_up();
+    mover.run(60);
+    let first_end = mover.cycles_from_start() + 40;
+    mover.schedule_looks(2, &[(first_end, 349, 471), (1000, -349, 471)]);
+    // The last sample inside the first row: the next one is the second row's.
+    let rest = usize::try_from(first_end - mover.cycles_from_start()).expect("before the end");
+    mover.run(rest - 1);
+    assert_eq!(
+        mode_of(&mover),
+        MotionMode::Holding,
+        "the first look arrived"
+    );
+    mover.run(2);
+    assert_eq!(
+        mode_of(&mover),
+        MotionMode::Moving,
+        "the new direction was dispatched at the boundary"
+    );
+    let cycles = mover.run(60);
+    assert_eq!(mode_of(&mover), MotionMode::Holding);
+    let last = cycles.last().and_then(|cycle| cycle.goal).expect("a goal");
+    assert_rows_at(
+        &last.targets,
+        &look_rows(-349, 471),
+        1e-6,
+        "the second look's end",
+    );
+}
+
+/// A look whose body swing the head's clock cannot carry is lengthened by the
+/// step floor, and that is its pace rather than an anomaly.
+#[test]
+fn a_look_the_head_s_clock_cannot_carry_is_paced_by_the_body_and_counted() {
+    let mut mover = standing_up();
+    mover.run(60);
+    assert_eq!(
+        mover.cog.state_ctrl().base_dephased(),
+        1,
+        "the stand-up parted the pair"
+    );
+    // 150 degrees at a 30 degree share puts the body at 120 degrees.
+    let body = 2.0944;
+    let floor = reachy_motion::tick::duration_floor_s(
+        body,
+        default_motion_config().max_step.body_yaw,
+        1e9 / PERIOD as f64,
+    );
+    assert!(
+        floor > 0.4,
+        "the case needs a body swing the head's clock cannot carry: {floor} s"
+    );
+    mover.schedule_looks(2, &[(1000, 2618, 471)]);
+    let period_s = PERIOD as f64 / 1e9;
+    let moving = (floor / period_s) as usize - 3;
+    let mut cycles = mover.run(moving);
+    assert_eq!(
+        mode_of(&mover),
+        MotionMode::Moving,
+        "the body's pace, not the head's clock, sets the arrival"
+    );
+    let arriving = ((floor + 0.2) / period_s).ceil() as usize - moving;
+    cycles.extend(mover.run(arriving));
+    assert_eq!(
+        mode_of(&mover),
+        MotionMode::Holding,
+        "arrived within {floor} s and 0.2 s"
+    );
+
+    let last = cycles.last().and_then(|cycle| cycle.goal).expect("a goal");
+    assert_rows_at(
+        &last.targets,
+        &look_rows(2618, 471),
+        1e-6,
+        "the wide look's end",
+    );
+    assert!(reports(&cycles).is_empty(), "{:?}", reports(&cycles));
+    assert_steps_fit(&cycles, "a look paced by the body");
+    let state = mover.cog.state_ctrl();
+    assert_eq!(state.look_paced(), 1, "the look's pace is counted once");
+    assert_eq!(state.base_stretched(), 0, "and is not the anomaly");
+    assert_eq!(state.base_dephased(), 1, "the antennas did not move");
+}
+
+/// A look the envelope refuses is reported and the machine stays where it is.
+#[test]
+fn a_look_the_envelope_refuses_is_reported_and_moves_nothing() {
+    let mut mover = standing_up();
+    mover.run(60);
+    let standing = mover.present;
+    // 40 degrees up, past the cone.
+    mover.schedule_looks(2, &[(1000, 0, 698)]);
+    let first = mover.step();
+    let report = first.report.expect("a refused look is reported");
+    assert_eq!(report.kind, FaultKindWire::COMMAND_REJECTED);
+    assert!(
+        first.goal.is_some(),
+        "a refusal changes nothing, and holding is still commanding",
+    );
+    mover.run(5);
+    assert_rows_at(&mover.present, &standing, 1e-6, "after the refusal");
+    assert_eq!(mode_of(&mover), MotionMode::Holding, "no move was started");
+}
+
+/// A look head clock of no length is refused at the first execution. The
+/// refusal's own words are pinned by `motion_cogs`' unit cases. This shows it
+/// stops the first execution.
+#[test]
+#[should_panic(expected = "execute() failed")]
+fn a_look_head_clock_of_no_length_is_refused() {
+    let mut damaged = params(PERIOD);
+    damaged.set_look_head_ms(0);
+    let mut mover = Mover::on(&damaged);
+    mover.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
+    mover.step();
+}
+
+/// A look head share at the head-relative yaw cap itself is refused: the load
+/// stops a degree inside the cap. The refusal's own words are pinned by
+/// `motion_cogs`' unit cases. This shows it stops the first execution.
+#[test]
+#[should_panic(expected = "execute() failed")]
+fn a_look_head_share_at_the_relative_yaw_cap_is_refused() {
+    let mut damaged = params(PERIOD);
+    damaged.set_look_head_share_rad(55.0_f64.to_radians());
+    let mut mover = Mover::on(&damaged);
+    mover.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
+    mover.step();
+}
+
+/// Standing up and commanding on a configuration with this share.
+fn stands_up_with_share(share: f64) {
+    let mut configured = params(PERIOD);
+    configured.set_look_head_share_rad(share);
+    let mut mover = Mover::on(&configured);
+    mover.schedule(true, 1, &[(1000, Some(up_pose_id()))]);
+    let cycles = mover.run(5);
+    assert!(
+        cycles.iter().all(|cycle| cycle.goal.is_some()),
+        "the machine is commanded on a share of {share} rad",
+    );
+}
+
+#[test]
+fn a_look_head_share_at_its_limit_is_a_policy() {
+    stands_up_with_share(reachy_kin::LOOK_HEAD_SHARE_LIMIT);
+}
+
+#[test]
+fn a_look_head_share_of_zero_is_a_policy() {
+    stands_up_with_share(0.0);
+}
+
 // The overlay layer's cases. A machine driven through the wrapper with a clip
 // library bound, so what is under test is the whole of what a period does: the
 // screen, the handover, the composition, the re-anchor that hands the base back,
@@ -3249,6 +3610,42 @@ fn an_overlay_window_composes_over_the_base_and_hands_it_back() {
         mover.at(JointRef::AntennaRight),
         bare.at(JointRef::AntennaRight),
     );
+}
+
+/// The overlay case with a look as the base step: the window closing hands the
+/// base back to the look it was riding, and the standing goal after the
+/// hand-back is the dispatch's.
+#[test]
+fn a_window_closing_over_a_look_hands_the_base_back_to_the_look() {
+    const OPENS: i64 = 5;
+    const CLOSES: i64 = 15;
+    let library = one_motion(0.02, 40);
+    let mut mover = Mover::playing(&params(PERIOD), &library);
+    mover.schedule_playing_look(1, 349, 471, &[(0, OPENS, CLOSES, 1.0, 1.0)]);
+
+    let mut bare = Mover::new();
+    bare.schedule_looks(1, &[(1000, 349, 471)]);
+
+    let mut composed = Vec::new();
+    for _ in 0..100 {
+        composed.push(mover.step());
+        bare.step();
+    }
+
+    assert_steps_fit(&composed, "a window opening and closing over a look");
+    assert_continuous_across(
+        &composed,
+        usize::try_from(CLOSES).expect("a few cycles") - 1,
+        "the window closing over a look",
+    );
+    assert!(reports(&composed).is_empty(), "{:?}", reports(&composed));
+    assert_rows_at(
+        &mover.present,
+        &look_rows(349, 471),
+        1e-3,
+        "the handed-back look",
+    );
+    assert_rows_at(&bare.present, &look_rows(349, 471), 1e-3, "the plain look");
 }
 
 /// A window naming a motion the library does not have is refused once for the
@@ -4380,6 +4777,59 @@ fn an_accepted_script_becomes_the_schedule_the_session_holds() {
     assert_eq!(step.end().as_nanos(), arrival + 2_500_000_000);
     assert_eq!(step.kind(), StepKindWire::BASE_POSTURE);
     assert_eq!(step.pose_id(), up_pose_id());
+}
+
+/// A look step as a script carries it: a direction and no pace.
+fn look_script(
+    script_id: u32,
+    arrival_ns: i64,
+    after_ms: u32,
+    duration_ms: u32,
+    bearing_mrad: i32,
+    elevation_mrad: i32,
+) -> ScriptWire {
+    let mut msg = ScriptWire::new();
+    msg.set_script_id(script_id);
+    msg.set_arrival(SyncTime::from_nanos(arrival_ns));
+    {
+        let mut rows = msg.steps_mut();
+        rows.clear();
+        let row: &mut ScriptStepWire = rows.try_grow().expect("one step fits");
+        row.set_after_ms(after_ms);
+        row.set_duration_ms(duration_ms);
+        row.set_kind(StepKindWire::BASE_LOOK);
+        row.set_pose_id(0);
+        row.set_move_ms(0);
+        row.set_bearing_mrad(bearing_mrad);
+        row.set_elevation_mrad(elevation_mrad);
+    }
+    msg.overlays_mut().clear();
+    msg
+}
+
+/// A look row crosses the screen with its direction and no pace, and is not
+/// refused for stating none: a look's clock is the Mover's configuration.
+#[test]
+fn a_look_row_plans_with_its_direction_and_no_pace() {
+    let mut cog = resting_session();
+    let arrival = T0 + LAPSE_NS;
+
+    cog.publish_script(
+        &look_script(7, arrival, 500, 2000, -611, 471),
+        SyncTime::from_nanos(arrival),
+    );
+    let report = wake(&mut cog, arrival + 1).expect("an acceptance is narrated");
+    assert_eq!(report.kind, ReportKindWire::SCRIPT_ACCEPTED);
+
+    let state = cog.state_sess();
+    assert_eq!(state.scripts_refused(), 0);
+    let schedule = state.schedule();
+    assert_eq!(schedule.steps().len(), 1);
+    let step = schedule.steps().get(0).expect("the one step");
+    assert_eq!(step.kind(), StepKindWire::BASE_LOOK);
+    assert_eq!(step.bearing_mrad(), -611);
+    assert_eq!(step.elevation_mrad(), 471);
+    assert_eq!(step.pace().as_nanos(), 0);
 }
 
 /// Two scripts in one window are answered one at a time, and the first one

@@ -248,7 +248,7 @@ fn a_driver_status_is_the_bytes_it_was() {
 /// a distinct value so a layout change that swaps two of them is a difference in
 /// the bytes.
 ///
-/// The message is 352 bytes whatever it carries -- the step and overlay arrays
+/// The message is 544 bytes whatever it carries -- the step and overlay arrays
 /// are fixed-capacity -- so most of the vector is the zeros of the rows this
 /// script does not use, and the count fields are what say how far the used part
 /// reaches.
@@ -269,12 +269,16 @@ fn a_script_is_the_bytes_it_was() {
         up.set_kind(StepKindWire::BASE_POSTURE);
         up.set_pose_id(5);
         up.set_move_ms(600);
+        up.set_bearing_mrad(520);
+        up.set_elevation_mrad(471);
         let stow: &mut ScriptStepWire = steps.try_grow().expect("the schema holds sixteen");
         stow.set_after_ms(10_000);
         stow.set_duration_ms(3000);
         stow.set_kind(StepKindWire::BASE_POSTURE);
         stow.set_pose_id(9);
         stow.set_move_ms(1500);
+        stow.set_bearing_mrad(-611);
+        stow.set_elevation_mrad(-35);
     }
     {
         let mut overlays = msg.overlays_mut();
@@ -289,7 +293,11 @@ fn a_script_is_the_bytes_it_was() {
     pins(
         "Script",
         blob_as_bytes(&msg),
-        "401f0000d0070000580200000500010010270000b80b0000dc05000009000100\
+        "401f0000d00700005802000008020000d70100000500010010270000b80b0000\
+         dc0500009dfdffffddffffff0900010000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
          0000000000000000000000000000000000000000000000000000000000000000\
          0000000000000000000000000000000000000000000000000000000000000000\
          0000000000000000000000000000000000000000000000000000000000000000\
@@ -308,7 +316,7 @@ fn a_script_is_the_bytes_it_was() {
 /// The session's narration as it goes out on 7410: two rows and a count of rows
 /// that fell off the front.
 ///
-/// Fixed at 2064 bytes for the same reason the script is fixed at 352 -- the
+/// Fixed at 2064 bytes for the same reason the script is fixed at 544 -- the
 /// entry array is the message -- so this vector is mostly the unused rows.
 #[test]
 fn a_timeline_is_the_bytes_it_was() {

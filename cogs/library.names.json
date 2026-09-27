@@ -306,18 +306,46 @@
     },
     {
       "clip_id": 76,
-      "name": "bench/sway"
+      "name": "probe/yaw-at/minus-1000"
     },
     {
       "clip_id": 77,
-      "name": "bench/tip"
+      "name": "probe/yaw-at/minus-1500"
     },
     {
       "clip_id": 78,
-      "name": "wave_left"
+      "name": "probe/yaw-at/minus-500"
     },
     {
       "clip_id": 79,
+      "name": "probe/yaw-at/plus-1000"
+    },
+    {
+      "clip_id": 80,
+      "name": "probe/yaw-at/plus-1500"
+    },
+    {
+      "clip_id": 81,
+      "name": "probe/yaw-at/plus-500"
+    },
+    {
+      "clip_id": 82,
+      "name": "probe/yaw-at/zero"
+    },
+    {
+      "clip_id": 83,
+      "name": "bench/sway"
+    },
+    {
+      "clip_id": 84,
+      "name": "bench/tip"
+    },
+    {
+      "clip_id": 85,
+      "name": "wave_left"
+    },
+    {
+      "clip_id": 86,
       "name": "wave_right"
     }
   ],
@@ -779,33 +807,87 @@
       "name": "probe/antenna-sweep"
     },
     {
+      "blend_out_ms": 20,
+      "duration_ms": 20,
+      "motion_id": 76,
+      "name": "probe/yaw-at/minus-1000"
+    },
+    {
+      "blend_out_ms": 20,
+      "duration_ms": 20,
+      "motion_id": 77,
+      "name": "probe/yaw-at/minus-1500"
+    },
+    {
+      "blend_out_ms": 20,
+      "duration_ms": 20,
+      "motion_id": 78,
+      "name": "probe/yaw-at/minus-500"
+    },
+    {
+      "blend_out_ms": 20,
+      "duration_ms": 20,
+      "motion_id": 79,
+      "name": "probe/yaw-at/plus-1000"
+    },
+    {
+      "blend_out_ms": 20,
+      "duration_ms": 20,
+      "motion_id": 80,
+      "name": "probe/yaw-at/plus-1500"
+    },
+    {
+      "blend_out_ms": 20,
+      "duration_ms": 20,
+      "motion_id": 81,
+      "name": "probe/yaw-at/plus-500"
+    },
+    {
+      "blend_out_ms": 20,
+      "duration_ms": 20,
+      "motion_id": 82,
+      "name": "probe/yaw-at/zero"
+    },
+    {
+      "blend_out_ms": 20,
+      "duration_ms": 48000,
+      "motion_id": 83,
+      "name": "probe/yaw-hold"
+    },
+    {
+      "blend_out_ms": 20,
+      "duration_ms": 36020,
+      "motion_id": 84,
+      "name": "probe/yaw-step"
+    },
+    {
       "blend_out_ms": 200,
       "duration_ms": 800,
-      "motion_id": 76,
+      "motion_id": 85,
       "name": "bench/sway"
     },
     {
       "blend_out_ms": 200,
       "duration_ms": 500,
-      "motion_id": 77,
+      "motion_id": 86,
       "name": "bench/tip"
     },
     {
       "blend_out_ms": 200,
       "duration_ms": 1701,
-      "motion_id": 78,
+      "motion_id": 87,
       "name": "bench/tour"
     },
     {
       "blend_out_ms": 200,
       "duration_ms": 2720,
-      "motion_id": 79,
+      "motion_id": 88,
       "name": "wave_left"
     },
     {
       "blend_out_ms": 200,
       "duration_ms": 2720,
-      "motion_id": 80,
+      "motion_id": 89,
       "name": "wave_right"
     }
   ],

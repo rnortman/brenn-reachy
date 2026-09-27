@@ -14,7 +14,8 @@
 //! The timeline carries two kinds of step, and they are two timelines in one
 //! list. A **base** step ([`Base`]) says where the head is going — a pose the
 //! daemon's library holds under that name, optionally at a pace this command
-//! picks, or `keep`, which is "hold the base where it is commanded now". A
+//! picks; `keep`, which is "hold the base where it is commanded now"; or a
+//! look, a direction the daemon composes into head and body targets itself. A
 //! **play** step
 //! ([`Play`]) starts an overlay: a named motion the daemon looks up in its own
 //! library and layers on top of whatever the base is doing, at a speed the
@@ -78,6 +79,20 @@ pub const MOTION_SCRIPT_TYPE: &str = "motion-script";
 /// has not started playing moves no horizon — so reaching this ceiling honestly
 /// takes a single synthesized clip over ten minutes long.
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
+
+/// The largest bearing a look may carry, milliradians either side of the
+/// base's forward: the representable half turn, 3141 < 1000·π.
+///
+/// The wire's representable range, not the range a launcher may aim at: which
+/// directions the machine is sent toward is the host's policy.
+pub const MAX_LOOK_BEARING_MRAD: i32 = 3141;
+
+/// The largest elevation a look may carry, milliradians above or below level:
+/// the representable quarter turn, 1570 < 500·π.
+///
+/// The wire's representable range, not the range a launcher may aim at: which
+/// elevations the machine is sent toward is the host's policy.
+pub const MAX_LOOK_ELEVATION_MRAD: i32 = 1570;
 
 /// The one pose name this contract reserves: where the machine rests.
 ///
@@ -156,7 +171,9 @@ pub const MAX_ASSET_NAME_LEN: usize = 128;
 /// how many there are, is the deployed library's business, and a closed
 /// vocabulary here would mean a wire change for every new pose. `Keep` has
 /// no pose and no holdable meaning in a library: it is an instruction to the
-/// timeline, not a place to be, so it lives here as the other arm instead.
+/// timeline, not a place to be, so it lives here as the other arm instead. A
+/// look names a direction, not a place in any library, so it carries no name
+/// and no pace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Base {
     /// Go to, or stay at, the pose the library holds under this name.
@@ -187,27 +204,26 @@ pub enum Base {
     /// It never wakes a resting machine: a machine at rest has no commanded
     /// pose to keep, and a script that wants motion from rest names a pose.
     Keep,
+    /// Face a world direction: bearing from the base's forward, milliradians,
+    /// positive to the robot's left, |bearing| ≤ [`MAX_LOOK_BEARING_MRAD`];
+    /// elevation above level, milliradians, |elevation| ≤
+    /// [`MAX_LOOK_ELEVATION_MRAD`]. How the head and the body share the
+    /// bearing, and the pace, are the machine's.
+    Look {
+        /// Milliradians from the base's forward, positive to the robot's left.
+        bearing_mrad: i32,
+        /// Milliradians above level.
+        elevation_mrad: i32,
+    },
 }
 
 impl Base {
-    /// The base command as the wire spells it: the pose name, or [`KEEP_BASE`].
-    ///
-    /// What a consumer that logs a base step writes, so a JSONL line joins
-    /// against the scripter's own capture with no translation table between.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Pose { name, .. } => name,
-            Self::Keep => KEEP_BASE,
-        }
-    }
-
-    /// The pose this names, or `None` for `keep`.
+    /// The pose this names, or `None` for `keep` and for a look.
     #[must_use]
     pub fn pose(&self) -> Option<&str> {
         match self {
             Self::Pose { name, .. } => Some(name),
-            Self::Keep => None,
+            Self::Keep | Self::Look { .. } => None,
         }
     }
 
@@ -217,14 +233,21 @@ impl Base {
     pub fn move_ms(&self) -> Option<u64> {
         match self {
             Self::Pose { move_ms, .. } => *move_ms,
-            Self::Keep => None,
+            Self::Keep | Self::Look { .. } => None,
         }
     }
 }
 
 impl std::fmt::Display for Base {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        match self {
+            Self::Pose { name, .. } => f.write_str(name),
+            Self::Keep => f.write_str(KEEP_BASE),
+            Self::Look {
+                bearing_mrad,
+                elevation_mrad,
+            } => write!(f, "look {bearing_mrad}/{elevation_mrad} mrad"),
+        }
     }
 }
 
@@ -371,6 +394,19 @@ impl Step {
         }
     }
 
+    /// A base step at `after_ms` facing the direction `bearing_mrad`,
+    /// `elevation_mrad` (milliradians; see [`Base::Look`]).
+    #[must_use]
+    pub const fn look(after_ms: u64, bearing_mrad: i32, elevation_mrad: i32) -> Self {
+        Self {
+            after_ms,
+            action: Action::Base(Base::Look {
+                bearing_mrad,
+                elevation_mrad,
+            }),
+        }
+    }
+
     /// A step starting `play` as an overlay at `after_ms`.
     #[must_use]
     pub fn play(after_ms: u64, play: Play) -> Self {
@@ -399,14 +435,14 @@ impl Step {
     }
 }
 
-/// The step's JSON shape: the three things a step can be, as three mutually
-/// exclusive optional fields. Exactly one is set, and the hand-written codec
-/// beside this enforces that rather than resolving a precedence nobody would
-/// remember.
+/// The step's JSON shape: the four things a step can be — `pose`, `keep`,
+/// `play` and `look` — as four mutually exclusive optional fields. Exactly one
+/// is set, and the hand-written codec beside this enforces that rather than
+/// resolving a precedence nobody would remember.
 ///
 /// No `deny_unknown_fields`, matching the envelope around it: a scripter may
 /// add a field before its daemon knows it. So a step spelled in a vocabulary
-/// this one does not carry sets none of the three and is refused as a step that
+/// this one does not carry sets none of the four and is refused as a step that
 /// names no action.
 #[derive(Serialize, Deserialize)]
 struct StepWire {
@@ -417,6 +453,8 @@ struct StepWire {
     keep: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     play: Option<PlayWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    look: Option<LookWire>,
     /// The pace of a move to `pose`, milliseconds. Only a step that names a
     /// pose may carry it; absent means the library's own pace for that pose.
     ///
@@ -434,31 +472,61 @@ struct PlayWire {
     speed: f64,
 }
 
+/// A look's direction as the wire spells it. Both fields are required, so a
+/// look missing either is malformed rather than a direction nobody stated.
+#[derive(Serialize, Deserialize)]
+struct LookWire {
+    bearing_mrad: i32,
+    elevation_mrad: i32,
+}
+
 impl Serialize for Step {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let (pose, keep, play, move_ms) = match &self.action {
-            Action::Base(Base::Pose { name, move_ms }) => {
-                (Some(name.clone()), None, None, *move_ms)
-            }
-            Action::Base(Base::Keep) => (None, Some(true), None, None),
-            Action::Play(play) => (
-                None,
-                None,
-                Some(PlayWire {
+        let after_ms = self.after_ms;
+        let wire = match &self.action {
+            Action::Base(Base::Pose { name, move_ms }) => StepWire {
+                after_ms,
+                pose: Some(name.clone()),
+                keep: None,
+                play: None,
+                look: None,
+                move_ms: *move_ms,
+            },
+            Action::Base(Base::Keep) => StepWire {
+                after_ms,
+                pose: None,
+                keep: Some(true),
+                play: None,
+                look: None,
+                move_ms: None,
+            },
+            Action::Base(Base::Look {
+                bearing_mrad,
+                elevation_mrad,
+            }) => StepWire {
+                after_ms,
+                pose: None,
+                keep: None,
+                play: None,
+                look: Some(LookWire {
+                    bearing_mrad: *bearing_mrad,
+                    elevation_mrad: *elevation_mrad,
+                }),
+                move_ms: None,
+            },
+            Action::Play(play) => StepWire {
+                after_ms,
+                pose: None,
+                keep: None,
+                play: Some(PlayWire {
                     name: play.name.clone(),
                     speed: play.speed,
                 }),
-                None,
-            ),
+                look: None,
+                move_ms: None,
+            },
         };
-        StepWire {
-            after_ms: self.after_ms,
-            pose,
-            keep,
-            play,
-            move_ms,
-        }
-        .serialize(serializer)
+        wire.serialize(serializer)
     }
 }
 
@@ -476,10 +544,11 @@ impl<'de> Deserialize<'de> for Step {
         }
         let named = usize::from(wire.pose.is_some())
             + usize::from(wire.keep.is_some())
-            + usize::from(wire.play.is_some());
+            + usize::from(wire.play.is_some())
+            + usize::from(wire.look.is_some());
         if named != 1 {
             return Err(serde::de::Error::custom(format!(
-                "a step names {named} of `pose`, `keep` and `play`; a step does exactly one of them"
+                "a step names {named} of `pose`, `keep`, `play` and `look`; a step does exactly one of them"
             )));
         }
         // A pace without a destination is a publisher having meant something
@@ -498,6 +567,11 @@ impl<'de> Deserialize<'de> for Step {
             })
         } else if wire.keep.is_some() {
             Action::Base(Base::Keep)
+        } else if let Some(look) = wire.look {
+            Action::Base(Base::Look {
+                bearing_mrad: look.bearing_mrad,
+                elevation_mrad: look.elevation_mrad,
+            })
         } else {
             let play = wire.play.expect("exactly one field is set");
             Action::Play(Play {
@@ -712,6 +786,25 @@ pub enum ScriptError {
         index: usize,
         /// What it asked for.
         move_ms: u64,
+    },
+
+    /// A look names a bearing or an elevation the wire cannot represent: past
+    /// [`MAX_LOOK_BEARING_MRAD`] or [`MAX_LOOK_ELEVATION_MRAD`] either way. The
+    /// publisher's arithmetic, refused rather than wrapped or clamped. Whether a
+    /// representable direction is one the machine can face is the daemon's
+    /// question, answered by its envelope check.
+    #[error(
+        "step {index} looks at bearing {bearing_mrad} mrad, elevation {elevation_mrad} mrad; \
+         a look's bearing is within ±{MAX_LOOK_BEARING_MRAD} mrad and its elevation within \
+         ±{MAX_LOOK_ELEVATION_MRAD} mrad"
+    )]
+    LookOutOfBounds {
+        /// Which step looked.
+        index: usize,
+        /// The bearing it named.
+        bearing_mrad: i32,
+        /// The elevation it named.
+        elevation_mrad: i32,
     },
 
     /// A play step comes due before any base step does.
@@ -1035,7 +1128,7 @@ impl MotionScript {
 ///
 /// Everything checkable without a library: the timeout bounds, the ascending
 /// timeline, a usable pose name and a pace inside the bounds on every base
-/// step, and — for play steps — a usable motion name, a speed inside the bounds
+/// step, a representable direction on every look, and — for play steps — a usable motion name, a speed inside the bounds
 /// both ends share, and a base step ahead of every overlay.
 fn validate(steps: &[Step], timeout_ms: u64) -> Result<(), ScriptError> {
     if timeout_ms == 0 {
@@ -1084,6 +1177,20 @@ fn validate(steps: &[Step], timeout_ms: u64) -> Result<(), ScriptError> {
                     && (move_ms == 0 || move_ms > MAX_TIMEOUT_MS)
                 {
                     return Err(ScriptError::MoveOutOfBounds { index, move_ms });
+                }
+                if let Base::Look {
+                    bearing_mrad,
+                    elevation_mrad,
+                } = base
+                    && !((-MAX_LOOK_BEARING_MRAD..=MAX_LOOK_BEARING_MRAD).contains(bearing_mrad)
+                        && (-MAX_LOOK_ELEVATION_MRAD..=MAX_LOOK_ELEVATION_MRAD)
+                            .contains(elevation_mrad))
+                {
+                    return Err(ScriptError::LookOutOfBounds {
+                        index,
+                        bearing_mrad: *bearing_mrad,
+                        elevation_mrad: *elevation_mrad,
+                    });
                 }
             }
             Action::Play(play) => {
@@ -1164,6 +1271,7 @@ mod tests {
             vec![],
             vec![Step::new(0, NEUTRAL)],
             vec![Step::new(0, NEUTRAL), Step::new(6740, STOW_POSE)],
+            vec![Step::look(0, 520, 471), Step::new(6740, STOW_POSE)],
         ] {
             let script = MotionScript::new("reachy00", 1_786_543_210_123, steps, 30_000)
                 .expect("a lawful script");
@@ -1207,7 +1315,6 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&text).expect("it is json");
             assert_eq!(value["steps"][0]["pose"], pose);
             let base = pose_base(pose);
-            assert_eq!(base.as_str(), pose);
             assert_eq!(base.to_string(), pose);
             assert_eq!(base.pose(), Some(pose));
         }
@@ -1305,6 +1412,7 @@ mod tests {
             );
             let printed = refused.to_string();
             assert!(printed.contains("a step names 0 of"), "{printed}");
+            assert!(printed.contains("`look`"), "{printed}");
             assert!(printed.contains("does exactly one of them"), "{printed}");
         }
     }
@@ -1607,6 +1715,7 @@ mod tests {
             Step::timed(1_000, "peek", 600),
             Step::keep(2_000),
             Step::play(2_100, Play::at_speed("pod/wiggle", 1.5)),
+            Step::look(3_000, -611, 471),
         ];
         let script = script(steps.clone(), 30_000);
         let encoded: serde_json::Value =
@@ -1626,7 +1735,6 @@ mod tests {
         assert_eq!(script.base_at(0), Some(&Base::Keep));
         assert_eq!(script.base_at(0).and_then(Base::pose), None);
 
-        assert_eq!(Base::Keep.as_str(), KEEP_BASE);
         assert_eq!(Base::Keep.to_string(), KEEP_BASE);
 
         // And a pose *named* `keep` is refused, so the two spellings can never
@@ -1726,7 +1834,7 @@ mod tests {
         assert_eq!(script.base_at(2_000).and_then(Base::move_ms), None);
         // The pace is not part of the name, so the spelling a consumer logs is
         // the pose either way.
-        assert_eq!(script.base_at(0).map(Base::as_str), Some("peek"));
+        assert_eq!(script.base_at(0).and_then(Base::pose), Some("peek"));
 
         let value: serde_json::Value = serde_json::from_str(&script.encode()).expect("it is json");
         assert_eq!(value["steps"][0]["pose"], "peek");
@@ -1864,8 +1972,8 @@ mod tests {
         assert_eq!(script.next_step_ms(500), Some(600));
     }
 
-    /// A step does exactly one thing. Any two of `pose`, `keep` and `play`, all
-    /// three, or none of them is the publisher having built a step it could not
+    /// A step does exactly one thing. Any two of `pose`, `keep`, `play` and
+    /// `look`, three or all four of them, or none of them is the publisher having built a step it could not
     /// have meant, and each is refused where the body is read rather than
     /// resolved by a precedence rule. The refusal names the count it saw,
     /// because that is what tells the publisher which end of the rule it broke.
@@ -1884,6 +1992,22 @@ mod tests {
             (
                 r#"[{"after_ms":0,"pose":"neutral","keep":true,"play":{"name":"pod/nod"}}]"#,
                 3,
+            ),
+            (
+                r#"[{"after_ms":0,"pose":"neutral","look":{"bearing_mrad":0,"elevation_mrad":0}}]"#,
+                2,
+            ),
+            (
+                r#"[{"after_ms":0,"keep":true,"look":{"bearing_mrad":0,"elevation_mrad":0}}]"#,
+                2,
+            ),
+            (
+                r#"[{"after_ms":0,"play":{"name":"pod/nod"},"look":{"bearing_mrad":0,"elevation_mrad":0}}]"#,
+                2,
+            ),
+            (
+                r#"[{"after_ms":0,"pose":"neutral","keep":true,"play":{"name":"pod/nod"},"look":{"bearing_mrad":0,"elevation_mrad":0}}]"#,
+                4,
             ),
             (r#"[{"after_ms":0}]"#, 0),
         ] {
@@ -2282,6 +2406,193 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&decoded.encode()).expect("it is json");
         assert_eq!(value["steps"][0], json_step(0, NEUTRAL));
         assert_eq!(value["steps"][1], json_step(6740, STOW_POSE));
+    }
+
+    /// A look rides its own field as a two-number object and nothing else: no
+    /// pose, no `keep`, no `play` and no pace, in both directions, whatever the
+    /// signs.
+    #[test]
+    fn a_look_step_is_the_wire_shape() {
+        let script = script(
+            vec![
+                Step::look(0, 520, 471),
+                Step::look(1_000, -611, -35),
+                Step::new(4_000, STOW_POSE),
+            ],
+            30_000,
+        );
+        let value: serde_json::Value = serde_json::from_str(&script.encode()).expect("it is json");
+        assert_eq!(value["steps"][0], json_look(0, 520, 471));
+        assert_eq!(value["steps"][1], json_look(1_000, -611, -35));
+        assert_eq!(
+            MotionScript::decode(&script.encode()).expect("it decodes"),
+            script
+        );
+
+        let text = r#"{"type":"motion-script","pod":"reachy00","seq":1,"steps":[{"after_ms":0,"look":{"bearing_mrad":520,"elevation_mrad":471}}],"timeout_ms":30000}"#;
+        assert_eq!(
+            MotionScript::decode(text).expect("a lawful look").steps(),
+            [Step::look(0, 520, 471)]
+        );
+    }
+
+    /// A direction the wire cannot represent is refused by both doors, and
+    /// the refusal names the step and both numbers. The bounds themselves are
+    /// lawful at every sign; the most negative integer is refused rather than
+    /// overflowing an absolute value on the way.
+    #[test]
+    fn a_look_outside_its_bounds_is_refused_by_both_doors() {
+        for (bearing_mrad, elevation_mrad) in
+            [(3142, 0), (-3142, 0), (0, 1571), (0, -1571), (i32::MIN, 0)]
+        {
+            let refusal = ScriptError::LookOutOfBounds {
+                index: 0,
+                bearing_mrad,
+                elevation_mrad,
+            };
+            assert_eq!(
+                MotionScript::new(
+                    "reachy00",
+                    1,
+                    vec![Step::look(0, bearing_mrad, elevation_mrad)],
+                    30_000,
+                )
+                .expect_err("not representable"),
+                refusal
+            );
+            let text = format!(
+                r#"{{"type":"motion-script","pod":"reachy00","seq":1,
+                    "steps":[{{"after_ms":0,"look":{{"bearing_mrad":{bearing_mrad},"elevation_mrad":{elevation_mrad}}}}}],
+                    "timeout_ms":30000}}"#
+            );
+            assert_eq!(
+                MotionScript::decode(&text).expect_err("not representable"),
+                DecodeError::Invalid(refusal)
+            );
+        }
+
+        assert_eq!(
+            MotionScript::new(
+                "reachy00",
+                1,
+                vec![Step::new(0, NEUTRAL), Step::look(10, 3142, 0)],
+                30_000,
+            )
+            .expect_err("not representable"),
+            ScriptError::LookOutOfBounds {
+                index: 1,
+                bearing_mrad: 3142,
+                elevation_mrad: 0,
+            }
+        );
+
+        for bearing_mrad in [-MAX_LOOK_BEARING_MRAD, MAX_LOOK_BEARING_MRAD] {
+            for elevation_mrad in [-MAX_LOOK_ELEVATION_MRAD, MAX_LOOK_ELEVATION_MRAD] {
+                script(vec![Step::look(0, bearing_mrad, elevation_mrad)], 30_000);
+            }
+        }
+
+        let printed = ScriptError::LookOutOfBounds {
+            index: 2,
+            bearing_mrad: 4000,
+            elevation_mrad: -2000,
+        }
+        .to_string();
+        assert!(printed.contains("step 2"), "{printed}");
+        assert!(printed.contains("4000"), "{printed}");
+        assert!(printed.contains("-2000"), "{printed}");
+        assert!(printed.contains("3141"), "{printed}");
+        assert!(printed.contains("1570"), "{printed}");
+    }
+
+    /// A look's clock is the machine's, so a pace beside one is refused the
+    /// way a pace without a pose is; and a look missing half its direction is
+    /// malformed rather than a direction nobody stated.
+    #[test]
+    fn a_pace_with_a_look_is_refused() {
+        let paced = r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                        "steps":[{"after_ms":0,"look":{"bearing_mrad":0,"elevation_mrad":0},"move_ms":600}],
+                        "timeout_ms":30000}"#;
+        let refused = MotionScript::decode(paced).expect_err("a look states no pace");
+        assert!(
+            matches!(refused, DecodeError::Malformed { .. }),
+            "{refused}"
+        );
+        let printed = refused.to_string();
+        assert!(printed.contains("move_ms"), "{printed}");
+        assert!(printed.contains("pose"), "{printed}");
+
+        let half = r#"{"type":"motion-script","pod":"reachy00","seq":1,
+                       "steps":[{"after_ms":0,"look":{"bearing_mrad":0}}],
+                       "timeout_ms":30000}"#;
+        let refused = MotionScript::decode(half).expect_err("no elevation");
+        assert!(
+            matches!(refused, DecodeError::Malformed { .. }),
+            "{refused}"
+        );
+    }
+
+    /// A look is a base step for every rule the timeline keeps: it defines the
+    /// base a play rides once it is due, it collapses with the other base
+    /// steps, and a later base step supersedes it.
+    #[test]
+    fn a_look_is_a_base_step() {
+        let script = script(
+            vec![
+                Step::look(0, 300, 200),
+                Step::play(10, Play::new("pod/nod")),
+                Step::keep(2_000),
+                Step::look(3_000, -300, 0),
+                Step::new(5_000, STOW_POSE),
+            ],
+            30_000,
+        );
+        let first = Base::Look {
+            bearing_mrad: 300,
+            elevation_mrad: 200,
+        };
+        assert_eq!(script.base_at(0), Some(&first));
+        assert_eq!(script.base_at(1_999), Some(&first));
+        assert_eq!(script.base_at(2_500), Some(&Base::Keep));
+        assert_eq!(
+            script.base_at(3_000),
+            Some(&Base::Look {
+                bearing_mrad: -300,
+                elevation_mrad: 0,
+            })
+        );
+
+        assert!(matches!(
+            MotionScript::new(
+                "reachy00",
+                1,
+                vec![Step::play(0, Play::new("pod/nod")), Step::look(10, 0, 0)],
+                30_000,
+            )
+            .expect_err("the base is not defined yet"),
+            ScriptError::PlayBeforeBase { index: 0, .. }
+        ));
+    }
+
+    /// A look answers `None` to the questions a pose answers, and renders as
+    /// its direction; its capture is the wire's own shape.
+    #[test]
+    fn a_look_names_no_pose() {
+        let look = Base::Look {
+            bearing_mrad: 520,
+            elevation_mrad: 471,
+        };
+        assert_eq!(look.pose(), None);
+        assert_eq!(look.move_ms(), None);
+        assert_eq!(look.to_string(), "look 520/471 mrad");
+        assert_eq!(Step::look(0, 520, 471).capture(), json_look(0, 520, 471));
+    }
+
+    fn json_look(after_ms: u64, bearing_mrad: i32, elevation_mrad: i32) -> serde_json::Value {
+        serde_json::json!({
+            "after_ms": after_ms,
+            "look": { "bearing_mrad": bearing_mrad, "elevation_mrad": elevation_mrad },
+        })
     }
 
     fn json_step(after_ms: u64, pose: &str) -> serde_json::Value {

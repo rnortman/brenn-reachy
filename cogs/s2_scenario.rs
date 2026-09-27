@@ -35,7 +35,7 @@
 
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use reachy_motion::joints::JointGroup;
-use scenario::author::Step;
+use scenario::author::{Step, StepBase};
 use scenario::{
     STOW_BUDGET_NS, TAIL_CYCLES, cycle_at, cycles_for, engage_allowance_cycles,
     release_allowance_cycles, run_end_cycle,
@@ -213,11 +213,13 @@ pub fn steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(up_start_cycle()),
         end_ns: cycle_at(up_start_cycle() + up_cycles()),
-        pose: Some(scenario::NEUTRAL_POSE),
-        // Slower than the suite's raise: the hand this run lays on the
-        // cranks needs a cycle where the generator has the screening
-        // distance left to travel and has settled before the fault lands.
-        move_ms: Some(scenario::jam_raise_ms()),
+        base: StepBase::Pose {
+            name: scenario::NEUTRAL_POSE,
+            // Slower than the suite's raise: the hand this run lays on the
+            // cranks needs a cycle where the generator has the screening
+            // distance left to travel and has settled before the fault lands.
+            move_ms: Some(scenario::jam_raise_ms()),
+        },
     }]
 }
 
@@ -237,14 +239,18 @@ pub fn second_steps() -> [Step; 2] {
         Step {
             start_ns: cycle_at(second_step_cycle()),
             end_ns: cycle_at(second_stow_cycle()),
-            pose: Some(scenario::NEUTRAL_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::NEUTRAL_POSE,
+                move_ms: None,
+            },
         },
         Step {
             start_ns: cycle_at(second_stow_cycle()),
             end_ns: cycle_at(second_disengage_cycle()),
-            pose: Some(scenario::STOW_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::STOW_POSE,
+                move_ms: None,
+            },
         },
     ]
 }

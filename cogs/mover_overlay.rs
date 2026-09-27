@@ -57,6 +57,18 @@ pub struct Goal {
     /// How long each mechanical group takes to get there, as configured. Only
     /// ever lengthened from here, never shortened.
     pub durations: MoveDurations,
+    /// What the plan is for, which decides the total an adjusted clock counts
+    /// in.
+    pub kind: GoalKind,
+}
+
+/// What a base plan is for, which decides the total an adjusted clock counts in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoalKind {
+    /// A pose, a hold where the base stands, or a carry-on along the move it is on.
+    Base,
+    /// A look: the head's clock is configured and the body's is the step floor.
+    Look,
 }
 
 /// What the overlay layer found this execution.
@@ -332,6 +344,7 @@ pub(crate) fn decide(
         let goal = ask.fresh.or(ask.standing).unwrap_or(Goal {
             target: base.targets,
             durations: MoveDurations::uniform(ask.period),
+            kind: GoalKind::Base,
         });
         return Commanded {
             command: Some(planned(cfg, &setpoint, goal, ask.tick_hz, counters)),
@@ -358,6 +371,7 @@ pub(crate) fn decide(
             .map_or(MoveDurations::uniform(ask.period), |run| {
                 run.path.durations()
             }),
+        kind: GoalKind::Base,
     };
 
     // The rows this period, and whether a window closed out from under one or
@@ -434,9 +448,10 @@ pub(crate) fn release(state: &mut MoverStateWire, now_ns: i64) {
 /// was never sized for steps past the per-tick guard partway through and
 /// abandons the move. The pair's phase is the second thing a clock has to carry,
 /// and the same pass asks for it. Both are reported rather than silent, in the
-/// two totals `count_adjustment` tells apart: a span being lengthened is
-/// configuration that no longer describes the move, and a pair being parted is
-/// the geometry doing what it is there for.
+/// totals `count_adjustment` tells apart: a span being lengthened is
+/// configuration that no longer describes the move, unless the move is a look,
+/// whose body is paced by the floor on purpose; and a pair being parted is the
+/// geometry doing what it is there for.
 fn planned(
     cfg: &MotionConfig,
     start: &JointTargets,
@@ -446,7 +461,7 @@ fn planned(
 ) -> MotionCommand {
     let asked = asked_move(goal);
     let (floored, stretch) = floor_move_clock(cfg, start, &asked, tick_hz);
-    count_adjustment(stretch, counters);
+    count_adjustment(stretch, goal.kind, counters);
     floored
 }
 
@@ -511,24 +526,29 @@ pub fn floored_clocks(
     }
 }
 
-/// Count what the library did to a plan's clocks, in the one of the two totals
-/// that says what it means.
+/// Count what the library did to a plan's clocks, in the one of the three
+/// totals that says what it means.
 ///
-/// A de-phasing is what the pair's own geometry asks for on every move that
+/// `base_stretched` is the anomaly: a pair no clock could part, whatever the
+/// plan was for, or a base plan whose clock could not carry its own span. A
+/// look's span stretch, parted or not, is its pace -- its clock is sized for
+/// the head and the body is paced by the floor -- and counts in `look_paced`.
+/// A plan that was only de-phased counts in `base_dephased`, for a look as for
+/// a pose: that is what the pair's own geometry asks for on every move that
 /// sweeps both antennas between the stow and the working posture, so counting
 /// it beside the anomalies would leave `base_stretched` climbing on a perfectly
-/// healthy machine and saying nothing. The anomalous bucket takes the combined
-/// case: a clock lengthened for its span and then de-phased is a span anomaly
-/// whatever else happened to it.
-fn count_adjustment(stretch: Option<ClockStretch>, counters: &mut MoverCounters) {
+/// healthy machine and saying nothing. Each plan counts in exactly one.
+fn count_adjustment(stretch: Option<ClockStretch>, kind: GoalKind, counters: &mut MoverCounters) {
     let Some(stretch) = stretch else {
         return;
     };
     let unmet = stretch
         .separation
         .is_some_and(|pair| !pair.met(stretch.separation_required));
-    if stretch.span_stretched || unmet {
+    if unmet || (stretch.span_stretched && kind == GoalKind::Base) {
         counters.base_stretched += 1;
+    } else if stretch.span_stretched {
+        counters.look_paced += 1;
     } else {
         counters.base_dephased += 1;
     }
@@ -560,7 +580,7 @@ fn steer(
         Some(margin),
     ) {
         Ok((path, stretch)) => {
-            count_adjustment(stretch, counters);
+            count_adjustment(stretch, goal.kind, counters);
             base.retarget(&path);
         }
         Err(_) => counters.refused_base += 1,
@@ -828,11 +848,16 @@ mod tests {
         }
     }
 
-    /// Which of the two totals a report lands in.
-    fn counted(stretch: Option<ClockStretch>) -> (u64, u64) {
+    /// Which of the three totals a report on a plan of `kind` lands in:
+    /// `(base_stretched, base_dephased, look_paced)`.
+    fn counted(stretch: Option<ClockStretch>, kind: GoalKind) -> (u64, u64, u64) {
         let mut counters = MoverCounters::default();
-        count_adjustment(stretch, &mut counters);
-        (counters.base_stretched, counters.base_dephased)
+        count_adjustment(stretch, kind, &mut counters);
+        (
+            counters.base_stretched,
+            counters.base_dephased,
+            counters.look_paced,
+        )
     }
 
     /// Every shape of report the library produces is counted, in exactly one of
@@ -846,26 +871,65 @@ mod tests {
     /// figure that is expected to climb.
     #[test]
     fn a_pair_nothing_could_part_is_an_anomaly_and_a_parted_one_is_not() {
-        assert_eq!(counted(None), (0, 0), "nothing to say is nothing to count");
+        let base = GoalKind::Base;
         assert_eq!(
-            counted(Some(stretch(false, true, Some(parted(0.61))))),
-            (0, 1),
+            counted(None, base),
+            (0, 0, 0),
+            "nothing to say is nothing to count"
+        );
+        assert_eq!(
+            counted(Some(stretch(false, true, Some(parted(0.61)))), base),
+            (0, 1, 0),
             "a pair parted at its crossing is the geometry working"
         );
         assert_eq!(
-            counted(Some(stretch(true, false, None))),
-            (1, 0),
+            counted(Some(stretch(true, false, None)), base),
+            (1, 0, 0),
             "a clock that could not carry its own span is news"
         );
         assert_eq!(
-            counted(Some(stretch(true, true, Some(parted(0.61))))),
-            (1, 0),
+            counted(Some(stretch(true, true, Some(parted(0.61)))), base),
+            (1, 0, 0),
             "a span stretched and then parted is still a span anomaly"
         );
         assert_eq!(
-            counted(Some(stretch(false, false, Some(parted(0.09))))),
-            (1, 0),
+            counted(Some(stretch(false, false, Some(parted(0.09)))), base),
+            (1, 0, 0),
             "a pair the pass could not part is the anomaly this total is for"
+        );
+    }
+
+    /// A look's clock is sized for the head and its body is paced by the
+    /// floor, so a span stretch on a look is its pace and lands in
+    /// `look_paced`; a de-phasing on a look is routine as on any move, and a
+    /// pair nothing could part is the anomaly whatever the plan was for.
+    #[test]
+    fn a_look_s_span_stretch_is_its_pace_and_not_an_anomaly() {
+        let look = GoalKind::Look;
+        assert_eq!(
+            counted(Some(stretch(true, false, None)), look),
+            (0, 0, 1),
+            "a look lengthened for its span is paced, not stretched"
+        );
+        assert_eq!(
+            counted(Some(stretch(true, true, Some(parted(0.61)))), look),
+            (0, 0, 1),
+            "a look lengthened and then parted is still its pace"
+        );
+        assert_eq!(
+            counted(Some(stretch(false, true, Some(parted(0.61)))), look),
+            (0, 1, 0),
+            "a look only de-phased is the geometry working"
+        );
+        assert_eq!(
+            counted(Some(stretch(false, false, Some(parted(0.09)))), look),
+            (1, 0, 0),
+            "an unparted pair is the anomaly on a look too"
+        );
+        assert_eq!(
+            counted(None, look),
+            (0, 0, 0),
+            "nothing to say is nothing to count"
         );
     }
 
@@ -989,6 +1053,7 @@ mod tests {
             Goal {
                 target,
                 durations: MoveDurations::uniform(Duration::from_secs(8)),
+                kind: GoalKind::Base,
             },
             TICK_HZ,
         )
@@ -1594,6 +1659,7 @@ mod tests {
             Goal {
                 target: to,
                 durations: asked,
+                kind: GoalKind::Base,
             },
             TICK_HZ,
         );
@@ -1609,6 +1675,7 @@ mod tests {
             Goal {
                 target: to,
                 durations: roomy,
+                kind: GoalKind::Base,
             },
             TICK_HZ,
         );
@@ -1676,6 +1743,7 @@ mod tests {
         let standing = Goal {
             target: raised,
             durations: MoveDurations::uniform(Duration::from_millis(800)),
+            kind: GoalKind::Base,
         };
         // A window covering the first period takes the base over, and the
         // second period, with no window, hands it back.

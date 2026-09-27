@@ -524,6 +524,17 @@ cog Mover
             post_aggregation: ["final_value"];
             multi_instance: true;
         }
+
+        // How many look plans were lengthened for their span. Expected nonzero
+        // on any machine that looks wide: a look's clock is sized for the head,
+        // the body's pace is the step floor, and a body swing the head's clock
+        // cannot carry is lengthened by design rather than counted in
+        // `base_stretched`.
+        look_paced: signal UInt64
+        {
+            post_aggregation: ["final_value"];
+            multi_instance: true;
+        }
     }
 
     inputs

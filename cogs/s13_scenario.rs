@@ -24,6 +24,11 @@
 //! wake -- after the release's last write, which is the ordering that matters:
 //! torque comes back on only once it has fully come off.
 //!
+//! The second session's schedule raises the head, turns it to a look past the
+//! head's share -- so the head and the body both turn -- and folds. What the run
+//! says about it is that the look lands where the Mover composes it, on the head
+//! clock the deployed configuration states.
+//!
 //! Nothing is done to the plant. Every hold, the one refusal and both
 //! engagements are the system's own answer to four messages, so every assertion
 //! in the checker is a statement about the session rather than about the
@@ -32,7 +37,7 @@
 //! Both the author and the checker read this module, so what the run *is* is
 //! stated once. Every instant is a cycle count from the epoch.
 
-use scenario::author::Step;
+use scenario::author::{Step, StepBase};
 use scenario::{cycle_at, release_allowance_cycles, run_end_cycle};
 
 // The shape of an ordinary run, stated once for every scenario: where a run
@@ -101,6 +106,13 @@ pub const CLOSING_AFTER_RELEASE: i64 = 20;
 /// screen a hold applies to the script already waiting.
 pub const DUPLICATE_AFTER_CLOSING: i64 = 20;
 
+/// The bearing the second session looks at, milliradians: the talker 40° to the
+/// robot's left, past the head's share so the body turns too.
+pub const LOOK_BEARING_MRAD: i32 = 698;
+
+/// The elevation it looks at, milliradians: the launcher's 27°.
+pub const LOOK_ELEVATION_MRAD: i32 = 471;
+
 /// How long the second session holds the machine up, in cycles: the same travel
 /// as the first session's raise.
 #[must_use]
@@ -160,10 +172,26 @@ pub fn second_up_start_cycle() -> i64 {
     disengage_cycle() + release_allowance_cycles()
 }
 
+/// How long the look's own step lasts, in cycles: the travel from the upright
+/// the second session's first step settles on to the look, plus room to settle.
+#[must_use]
+pub fn look_cycles() -> i64 {
+    scenario::look_step_cycles(
+        &scenario::neutral_pose(),
+        &scenario::look_pose(LOOK_BEARING_MRAD, LOOK_ELEVATION_MRAD),
+    )
+}
+
+/// The cycle the second session's look begins on.
+#[must_use]
+pub fn second_look_start_cycle() -> i64 {
+    second_up_start_cycle() + second_up_cycles()
+}
+
 /// The cycle the second session's fold begins on.
 #[must_use]
 pub fn second_stow_start_cycle() -> i64 {
-    second_up_start_cycle() + second_up_cycles()
+    second_look_start_cycle() + look_cycles()
 }
 
 /// The cycle the second schedule runs out on, which is what ends the second
@@ -185,8 +213,10 @@ pub fn opening_steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(up_start_cycle()),
         end_ns: cycle_at(up_start_cycle() + OPENING_CYCLES),
-        pose: Some(scenario::NEUTRAL_POSE),
-        move_ms: None,
+        base: StepBase::Pose {
+            name: scenario::NEUTRAL_POSE,
+            move_ms: None,
+        },
     }]
 }
 
@@ -198,34 +228,51 @@ pub fn held_steps() -> [Step; 2] {
         Step {
             start_ns: cycle_at(up_start_cycle()),
             end_ns: cycle_at(stow_start_cycle()),
-            pose: Some(scenario::NEUTRAL_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::NEUTRAL_POSE,
+                move_ms: None,
+            },
         },
         Step {
             start_ns: cycle_at(stow_start_cycle()),
             end_ns: cycle_at(disengage_cycle()),
-            pose: Some(scenario::STOW_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::STOW_POSE,
+                move_ms: None,
+            },
         },
     ]
 }
 
-/// The two steps of the script held through the release: the second session's
-/// whole schedule, which starts once the machine has been engaged again.
+/// The three steps of the script held through the release: the second
+/// session's whole schedule, which starts once the machine has been engaged
+/// again -- up, the look, and the fold.
 #[must_use]
-pub fn closing_steps() -> [Step; 2] {
+pub fn closing_steps() -> [Step; 3] {
     [
         Step {
             start_ns: cycle_at(second_up_start_cycle()),
+            end_ns: cycle_at(second_look_start_cycle()),
+            base: StepBase::Pose {
+                name: scenario::NEUTRAL_POSE,
+                move_ms: None,
+            },
+        },
+        Step {
+            start_ns: cycle_at(second_look_start_cycle()),
             end_ns: cycle_at(second_stow_start_cycle()),
-            pose: Some(scenario::NEUTRAL_POSE),
-            move_ms: None,
+            base: StepBase::Look {
+                bearing_mrad: LOOK_BEARING_MRAD,
+                elevation_mrad: LOOK_ELEVATION_MRAD,
+            },
         },
         Step {
             start_ns: cycle_at(second_stow_start_cycle()),
             end_ns: cycle_at(second_disengage_cycle()),
-            pose: Some(scenario::STOW_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::STOW_POSE,
+                move_ms: None,
+            },
         },
     ]
 }
@@ -237,7 +284,7 @@ pub fn closing_steps() -> [Step; 2] {
 /// and they are the well-formed schedule the first copy carried so that the
 /// refusal cannot be the times being wrong.
 #[must_use]
-pub fn duplicate_steps() -> [Step; 2] {
+pub fn duplicate_steps() -> [Step; 3] {
     closing_steps()
 }
 
@@ -251,14 +298,33 @@ pub fn keep_steps() -> [Step; 2] {
         Step {
             start_ns: cycle_at(keep_stamped_cycle()),
             end_ns: cycle_at(stow_start_cycle()),
-            pose: None,
-            move_ms: None,
+            base: StepBase::Keep,
         },
         Step {
             start_ns: cycle_at(stow_start_cycle()),
             end_ns: cycle_at(disengage_cycle()),
-            pose: Some(scenario::STOW_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::STOW_POSE,
+                move_ms: None,
+            },
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LOOK_BEARING_MRAD, LOOK_ELEVATION_MRAD, look_cycles};
+
+    /// The run moves the body: the look's bearing is past the head's share, so
+    /// the head carries the share and the body the rest.
+    #[test]
+    fn the_look_turns_the_head_to_its_share_and_the_body_the_rest() {
+        let body_yaw = scenario::look_pose(LOOK_BEARING_MRAD, LOOK_ELEVATION_MRAD).body_yaw;
+        assert!(
+            (body_yaw - (0.698 - scenario::LOOK_HEAD_SHARE_RAD)).abs() < 1e-12,
+            "{body_yaw}"
+        );
+        assert!(body_yaw > 0.1, "{body_yaw}");
+        assert!(look_cycles() > 0);
+    }
 }

@@ -23,21 +23,31 @@
 //! the harness run, whose whole point is one long hold, prints every hold it
 //! has.
 //!
-//! Only the antennas are judged. Nobody has complained about a head row and
-//! this package has no measurement to bound one with, so the head is reported
-//! as its worst hold apiece and never fails — the baseline for the day somebody
-//! does complain. What a failing antenna hold *means* is the caller's: the
+//! The antennas are judged, and so is the body yaw under a yaw probe. Otherwise
+//! the head is reported as its worst hold apiece and never fails, as the
+//! baseline for the day somebody does complain.
+//!
+//! The yaw probe is the exception because the yaw campaign needs a verdict on
+//! its loop. That verdict is not the antennas' two-count flicker bound, since the
+//! yaw carries the head on a geared shaft whose dither is a count or two with no
+//! mechanism to grow. It is the limit cycle's signature: three counts or more,
+//! turning regularly.
+//!
+//! What a failing antenna hold *means* is the caller's: the
 //! harness report exists to produce one long hold and judge it, and the speech
 //! report prints the same finding as a figure until the bound has been baked
 //! from a hardware run.
 
+use std::time::Duration;
+
 use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
 use motion_slots::joint_set;
 use reachy_motion::joints::{
-    JointGroup, JointVector, Name, ROW_COUNT, ROWS, group_of, row, vector_of, write_rows,
+    JointGroup, JointRef, JointVector, Name, ROW_COUNT, ROWS, group_of, row, vector_of, write_rows,
 };
 use reachy_motion::stillness::{
-    COUNT_RAD, HoldWindow, Sample, StillnessConfig, StillnessCounts, StillnessWatch, Wobbled, judge,
+    COUNT_RAD, HoldWindow, Sample, StillnessConfig, StillnessCounts, StillnessWatch, Wobbled,
+    judge, whole_counts,
 };
 use run_report::Report;
 
@@ -48,6 +58,55 @@ use run_report::Report;
 /// conversation would. The verdict does not depend on it: what folds is still
 /// judged, as the widest of what it folded.
 const ANTENNA_LINES: usize = 24;
+
+/// How many body-yaw holds are printed one line each; a probe holds at most
+/// four.
+const YAW_LINES: usize = 24;
+
+/// The fewest counts of excursion at which a body-yaw hold can hunt.
+///
+/// Chosen from the P-only ladder's record: every limit-cycled hold read 3.0 counts
+/// or more, and every dither hold 2.0 or less.
+pub const YAW_HUNT_MIN_COUNTS: f64 = 3.0;
+
+/// What a judged body-yaw hold reads as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YawHold {
+    /// Under three counts, whatever its spread: dither of a loaded, geared joint.
+    Quiet,
+    /// Three counts or more, turning regularly: the spread of its reversal
+    /// intervals is at most its apparent period.
+    Hunts,
+    /// Three counts or more and not regular: a spread past the period, or no
+    /// interval to read. An unexpected reading, for a person.
+    Unexpected,
+}
+
+impl YawHold {
+    /// The word a hold's line ends on.
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Quiet => "quiet",
+            Self::Hunts => "hunts",
+            Self::Unexpected => "neither quiet nor a hunt",
+        }
+    }
+}
+
+/// What a judged body-yaw hold reads as, by the limit cycle's signature.
+#[must_use]
+pub fn yaw_hold(read: &Wobbled) -> YawHold {
+    if whole_counts(read.excursion_rad) < YAW_HUNT_MIN_COUNTS {
+        return YawHold::Quiet;
+    }
+    match (
+        read.reversal_interval_spread_samples,
+        read.apparent_period_samples(),
+    ) {
+        (Some(spread), Some(period)) if spread <= period => YawHold::Hunts,
+        _ => YawHold::Unexpected,
+    }
+}
 
 /// Whether a hold past the bound is a finding or a figure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +133,17 @@ pub enum Standard {
     /// arrive or whose head was commanded across it, and a green verdict there
     /// would make a rung's *quiet* reading vacuously true over nothing.
     JudgedWhereHeadStillRequired,
+    /// For a run of the body yaw's probes. The yaw steps and holds while the
+    /// antennas stand at the base. Each antenna hold is judged only where the head
+    /// stood still across it, and a run with none says so without failing. That is
+    /// the rule of [`Standard::JudgedWhereHeadStill`], and under a yaw probe every
+    /// antenna hold spans the yaw's motion. Every body-yaw hold is printed a line
+    /// each and judged by [`yaw_hold`], not by the two-count bound: a yaw hold that
+    /// hunts fails the run, and so does an unexpected one. A run whose yaw stood at
+    /// one setpoint long enough to judge, and which judged no yaw hold, fails. A
+    /// run whose yaw never stood that long (the step probe) says so and does not
+    /// fail.
+    YawProbe,
     /// Every hold is a number, whatever it says.
     Printed,
 }
@@ -84,7 +154,7 @@ impl Standard {
     const fn head_still_only(self) -> bool {
         matches!(
             self,
-            Self::JudgedWhereHeadStill | Self::JudgedWhereHeadStillRequired
+            Self::JudgedWhereHeadStill | Self::JudgedWhereHeadStillRequired | Self::YawProbe
         )
     }
 }
@@ -111,6 +181,16 @@ pub struct Stillness {
     /// One entry per head row that held at all, and nothing more however many
     /// holds a run contains.
     heads: Vec<Head>,
+    /// The first [`YAW_LINES`] body-yaw holds, which a yaw probe's standard
+    /// prints a line each and judges. They are folded into `heads` as well.
+    yaw_windows: Vec<Hold>,
+    /// The body-yaw holds past that cap, folded to the widest by excursion.
+    yaw_beyond: Option<Head>,
+    /// The body yaw's current commanded value, and the sample instant it was
+    /// first commanded.
+    yaw_setpoint: Option<(f64, i64)>,
+    /// The longest stretch one commanded body-yaw value has stood, nanoseconds.
+    yaw_longest_ns: i64,
     /// Where the watch hands a closed hold over, drained on every sample so it
     /// never grows and nothing allocates per cycle.
     closed: Vec<HoldWindow>,
@@ -159,6 +239,24 @@ pub struct Head {
     pub holds: usize,
 }
 
+impl Head {
+    /// A row's first hold.
+    fn of(hold: Hold) -> Self {
+        Self {
+            worst: hold,
+            holds: 1,
+        }
+    }
+
+    /// Count `hold` among the row's holds, keeping the widest.
+    fn fold(&mut self, hold: Hold) {
+        self.holds += 1;
+        if hold.window.readings.excursion_rad > self.worst.window.readings.excursion_rad {
+            self.worst = hold;
+        }
+    }
+}
+
 impl Default for Stillness {
     fn default() -> Self {
         Self {
@@ -166,6 +264,10 @@ impl Default for Stillness {
             windows: Vec::new(),
             beyond: Vec::new(),
             heads: Vec::new(),
+            yaw_windows: Vec::new(),
+            yaw_beyond: None,
+            yaw_setpoint: None,
+            yaw_longest_ns: 0,
             closed: Vec::new(),
             first_ns: None,
             unreadable: 0,
@@ -209,6 +311,21 @@ impl Stillness {
         };
         let t_ns = sample.sample_time().as_nanos();
         self.first_ns.get_or_insert(t_ns);
+        match commanded
+            .get(JointRef::BodyYaw)
+            .filter(|_| sample.commanded_valid())
+        {
+            Some(goal) => {
+                // Exact equality: any change to the commanded value starts a new stretch.
+                let since = match self.yaw_setpoint {
+                    Some((held, since)) if held == goal => since,
+                    _ => t_ns,
+                };
+                self.yaw_setpoint = Some((goal, since));
+                self.yaw_longest_ns = self.yaw_longest_ns.max(t_ns - since);
+            }
+            None => self.yaw_setpoint = None,
+        }
         let cycle = Sample {
             t_ns,
             present_valid: sample.present_valid(),
@@ -229,6 +346,16 @@ impl Stillness {
             // still: the row in question *is* the head.
             let head_still = !antenna || window.platform_still;
             let hold = Hold { window, head_still };
+            if window.joint == JointRef::BodyYaw {
+                if self.yaw_windows.len() < YAW_LINES {
+                    self.yaw_windows.push(hold);
+                } else {
+                    match &mut self.yaw_beyond {
+                        Some(folded) => folded.fold(hold),
+                        None => self.yaw_beyond = Some(Head::of(hold)),
+                    }
+                }
+            }
             if antenna && self.windows.len() < ANTENNA_LINES {
                 self.windows.push(hold);
                 continue;
@@ -242,17 +369,8 @@ impl Stillness {
                 head.worst.window.joint == hold.window.joint
                     && head.worst.head_still == hold.head_still
             }) {
-                Some(head) => {
-                    head.holds += 1;
-                    if hold.window.readings.excursion_rad > head.worst.window.readings.excursion_rad
-                    {
-                        head.worst = hold;
-                    }
-                }
-                None => into.push(Head {
-                    worst: hold,
-                    holds: 1,
-                }),
+                Some(head) => head.fold(hold),
+                None => into.push(Head::of(hold)),
             }
         }
     }
@@ -315,6 +433,26 @@ impl Stillness {
     #[must_use]
     pub fn config(&self) -> StillnessConfig {
         self.watch.config()
+    }
+
+    /// The body-yaw holds printed a line each under [`Standard::YawProbe`]: every
+    /// one the run held, up to [`YAW_LINES`].
+    #[must_use]
+    pub fn yaw_windows(&self) -> &[Hold] {
+        &self.yaw_windows
+    }
+
+    /// The body-yaw holds past that cap, folded to the widest, if there were any.
+    #[must_use]
+    pub fn yaw_beyond(&self) -> Option<&Head> {
+        self.yaw_beyond.as_ref()
+    }
+
+    /// The longest the body yaw stood at one commanded value, which says whether
+    /// a run with no judged yaw hold could have held one.
+    #[must_use]
+    pub fn yaw_longest_setpoint(&self) -> Duration {
+        Duration::from_nanos(self.yaw_longest_ns.max(0).unsigned_abs())
     }
 
     /// How many samples this build could not read.
@@ -415,7 +553,7 @@ fn period(read: &Wobbled) -> String {
 /// Every antenna hold is printed up to the cap and the rest fold to one line
 /// per row; each head row is printed once, as the widest hold it showed. Under
 /// each hold goes the settle line, the arrival the hold's own figures skip. The
-/// judging is the antennas' alone, folded or not, and the two sentences it can
+/// judging is the antennas', folded or not, and the two sentences it can
 /// produce are the ones the bring-up assertion is made of: a hold that moved
 /// further than a still joint may, and a run that never held one long enough to
 /// ask.
@@ -424,6 +562,9 @@ fn period(read: &Wobbled) -> String {
 /// across is printed with what it read and no verdict, because what it read is
 /// the platform; the run's own sentence then asks for a head-still hold rather
 /// than any hold.
+///
+/// Under [`Standard::YawProbe`] the body yaw's holds leave the head's folded
+/// lines and are printed a line each, judged by [`yaw_hold`].
 pub fn say(held: &Stillness, standard: Standard, report: &mut Report) {
     let counts = held.counts();
     let cfg = held.config();
@@ -480,6 +621,9 @@ pub fn say(held: &Stillness, standard: Standard, report: &mut Report) {
         verdict(&folded.worst, standard, &cfg, report);
     }
     for head in held.heads() {
+        if standard == Standard::YawProbe && head.worst.window.joint == JointRef::BodyYaw {
+            continue;
+        }
         report.note(format!(
             "{}, the widest of {} hold(s) this row held",
             line(held, &head.worst.window),
@@ -488,6 +632,9 @@ pub fn say(held: &Stillness, standard: Standard, report: &mut Report) {
         if let Some(settling) = settle_line(held, &head.worst.window) {
             report.note(settling);
         }
+    }
+    if standard == Standard::YawProbe {
+        say_yaw(held, &cfg, report);
     }
     // What the run has to have held for its verdict to mean anything: any
     // antenna hold, or — where the head's motion disqualifies one — a hold the
@@ -528,7 +675,90 @@ pub fn say(held: &Stillness, standard: Standard, report: &mut Report) {
         Standard::Judged | Standard::JudgedWhereHeadStillRequired => report.fail(says),
         // A content tour holds the antennas almost only while the head moves,
         // and having taken no reading of the loop is a reading of the content.
-        Standard::JudgedWhereHeadStill | Standard::Printed => report.note(says),
+        Standard::JudgedWhereHeadStill | Standard::YawProbe | Standard::Printed => {
+            report.note(says);
+        }
+    }
+}
+
+/// The body yaw's holds under [`Standard::YawProbe`]: a line each with its
+/// verdict, and what a run that judged none says.
+fn say_yaw(held: &Stillness, cfg: &StillnessConfig, report: &mut Report) {
+    for hold in held.yaw_windows() {
+        report.note(yaw_line(held, hold, None));
+        if let Some(settling) = settle_line(held, &hold.window) {
+            report.note(settling);
+        }
+        yaw_verdict(held, hold, report);
+    }
+    if let Some(folded) = held.yaw_beyond() {
+        report.note(yaw_line(held, &folded.worst, Some(folded.holds)));
+        if let Some(settling) = settle_line(held, &folded.worst.window) {
+            report.note(settling);
+        }
+        yaw_verdict(held, &folded.worst, report);
+    }
+    if held.yaw_windows().is_empty() {
+        let says = format!(
+            "no body-yaw hold was judged: the yaw's longest setpoint stood {:.2} s, against the \
+             {:.1} s settle and {:.1} s hold a judgement needs, so this run says nothing about \
+             whether the yaw hunts",
+            held.yaw_longest_setpoint().as_secs_f64(),
+            cfg.settle.as_secs_f64(),
+            cfg.min_hold.as_secs_f64()
+        );
+        // A setpoint that stood long enough to judge and was not judged is a run
+        // whose readings never arrived; one that never stood that long is the
+        // step probe, which is not a hold instrument.
+        if held.yaw_longest_setpoint() >= cfg.settle + cfg.min_hold {
+            report.fail(says);
+        } else {
+            report.note(says);
+        }
+    }
+}
+
+/// One body-yaw hold as a yaw probe prints it: the hold's line, its mean
+/// reversal interval, and what the limit-cycle rule reads it as.
+fn yaw_line(held: &Stillness, hold: &Hold, folded: Option<usize>) -> String {
+    let read = &hold.window.readings;
+    let fold = folded.map_or_else(String::new, |holds| {
+        format!(", the widest of {holds} further hold(s) this row held")
+    });
+    let interval = read
+        .reversal_interval_mean_samples
+        .map_or_else(|| "none".to_string(), |mean| format!("{mean:.2} samples"));
+    format!(
+        "{}{fold}, mean reversal interval {interval}, {}",
+        line(held, &hold.window),
+        yaw_hold(read).word()
+    )
+}
+
+/// Whether a body-yaw hold fails the run under the limit-cycle rule.
+fn yaw_verdict(held: &Stillness, hold: &Hold, report: &mut Report) {
+    let window = &hold.window;
+    let read = &window.readings;
+    match yaw_hold(read) {
+        YawHold::Quiet => {}
+        YawHold::Hunts => report.fail(format!(
+            "{} hunts at {:+.4} rad: {:.1} counts peak to peak on a regular turning, {}, over a \
+             {:.2} s hold from the recording's {}",
+            Name(JointRef::BodyYaw),
+            window.held_rad,
+            read.excursion_counts(),
+            period(read),
+            read.length().as_secs_f64(),
+            held.run_offset(read.start_ns)
+        )),
+        YawHold::Unexpected => report.fail(format!(
+            "{} at {:+.4} rad read {:.1} counts with {}: past dither and not a regular turning, \
+             an unexpected reading for a person before the rung is read",
+            Name(JointRef::BodyYaw),
+            window.held_rad,
+            read.excursion_counts(),
+            period(read)
+        )),
     }
 }
 
@@ -550,7 +780,8 @@ fn verdict(hold: &Hold, standard: Standard, cfg: &StillnessConfig, report: &mut 
         match standard {
             Standard::Judged
             | Standard::JudgedWhereHeadStill
-            | Standard::JudgedWhereHeadStillRequired => report.fail(err.to_string()),
+            | Standard::JudgedWhereHeadStillRequired
+            | Standard::YawProbe => report.fail(err.to_string()),
             Standard::Printed => report.note(err.to_string()),
         }
     }
@@ -645,10 +876,10 @@ pub mod fixture {
 #[cfg(test)]
 mod tests {
     use super::fixture;
-    use super::{ROW_COUNT, Standard, Stillness, row, say};
+    use super::{ROW_COUNT, Standard, Stillness, YawHold, row, say, yaw_hold};
     use brenn_reachy__driver__pose_clk_rs::PoseSampleWire;
     use reachy_motion::joints::JointRef;
-    use reachy_motion::stillness::COUNT_RAD;
+    use reachy_motion::stillness::{COUNT_RAD, Wobbled};
     use run_report::Report;
 
     /// The driver's cycle, nanoseconds.
@@ -1455,6 +1686,154 @@ mod tests {
                 .any(|line| line.contains("right antenna over a") && line.contains("0.0 counts")),
             "{:?}",
             report.measured
+        );
+    }
+
+    /// An eight-second judged stretch reading `counts` of excursion, with the
+    /// reversal intervals' spread and the apparent period given, or neither.
+    fn read(counts: f64, spread_period: Option<(f64, f64)>) -> Wobbled {
+        Wobbled {
+            start_ns: 0,
+            end_ns: 8_000_000_000,
+            samples: 400,
+            excursion_rad: counts * COUNT_RAD,
+            reversals_per_s: 0.0,
+            reversal_interval_mean_samples: spread_period.map(|(_, period)| period / 2.0),
+            reversal_interval_spread_samples: spread_period.map(|(spread, _)| spread),
+        }
+    }
+
+    /// The rule reads the P-only ladder's holds as printed: its limit cycles
+    /// hunt, its dither is quiet whatever the spread, and three counts that are
+    /// not regular are for a person.
+    #[test]
+    fn the_yaw_hunt_rule_reads_the_p_only_record() {
+        let cases = [
+            (3.0, Some((3.6, 4.7)), YawHold::Hunts),
+            (3.0, Some((2.9, 5.9)), YawHold::Hunts),
+            (2.0, Some((2.4, 4.9)), YawHold::Quiet),
+            (2.0, Some((26.0, 24.0)), YawHold::Quiet),
+            (3.0, Some((26.0, 24.0)), YawHold::Unexpected),
+            (3.0, None, YawHold::Unexpected),
+            (3.0, Some((4.0, 4.0)), YawHold::Hunts),
+        ];
+        for (counts, spread_period, expected) in cases {
+            assert_eq!(
+                yaw_hold(&read(counts, spread_period)),
+                expected,
+                "{counts} counts, {spread_period:?}"
+            );
+        }
+    }
+
+    /// A yaw turning every cycle three counts wide is a limit cycle: the yaw
+    /// probe's standard prints it on its own line and fails the run, where every
+    /// other standard folds it into the head's unjudged baseline.
+    #[test]
+    fn a_yaw_turning_regularly_past_three_counts_hunts_under_the_yaw_probe_standard() {
+        let held = wobbling(JointRef::BodyYaw, 600, 1.5 * COUNT_RAD);
+        let report = said(&held, Standard::YawProbe);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert!(
+            report.findings[0].contains("body yaw hunts"),
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("body yaw over a")
+                    && line.contains("mean reversal interval 1.00 samples, hunts")),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            !report
+                .measured
+                .iter()
+                .any(|line| line.contains("body yaw over a")
+                    && line.contains("hold(s) this row held")),
+            "{:?}",
+            report.measured
+        );
+        let judged = said(&held, Standard::Judged);
+        assert!(judged.findings.is_empty(), "{:?}", judged.findings);
+        assert!(
+            judged
+                .measured
+                .iter()
+                .any(|line| line.contains("body yaw over a")
+                    && line.contains("the widest of 1 hold(s) this row held")),
+            "{:?}",
+            judged.measured
+        );
+    }
+
+    /// A yaw standing still is quiet, and says so on its line.
+    #[test]
+    fn a_steady_yaw_is_quiet_under_the_yaw_probe_standard() {
+        let held = wobbling(JointRef::BodyYaw, 600, 0.0);
+        let report = said(&held, Standard::YawProbe);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            report
+                .measured
+                .iter()
+                .any(|line| line.contains("body yaw over a") && line.contains(", quiet")),
+            "{:?}",
+            report.measured
+        );
+    }
+
+    /// The step probe: a yaw that never stands long enough to judge is a run
+    /// that says nothing about a hunt, noted rather than failed.
+    #[test]
+    fn a_yaw_probe_run_of_short_holds_notes_that_it_judged_none() {
+        let mut held = Stillness::default();
+        for n in 0..1000 {
+            let goal = if (n / 75) % 2 == 0 { 0.0 } else { 0.5 };
+            held.sample(&sample(n, JointRef::BodyYaw, goal, Some(goal)));
+        }
+        held.finish();
+        let report = said(&held, Standard::YawProbe);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert!(
+            says(&report.measured, "no body-yaw hold was judged"),
+            "{:?}",
+            report.measured
+        );
+        assert!(
+            held.yaw_longest_setpoint().as_secs_f64() < 1.5,
+            "{:?}",
+            held.yaw_longest_setpoint()
+        );
+    }
+
+    /// A yaw commanded to one value long enough to judge, over which nothing
+    /// was read, measured nothing it was asked to: that fails.
+    #[test]
+    fn a_yaw_probe_run_whose_long_setpoint_was_never_judged_fails() {
+        let mut held = Stillness::default();
+        for n in 0..600 {
+            held.sample(&fixture::blind(fixture::cycle(
+                T0 + n * PERIOD_NS,
+                &[0.0; ROW_COUNT],
+                Some(&[0.0; ROW_COUNT]),
+            )));
+        }
+        held.finish();
+        let report = said(&held, Standard::YawProbe);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert!(
+            report.findings[0].contains("no body-yaw hold was judged"),
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            held.yaw_longest_setpoint().as_secs_f64() >= 6.0,
+            "{:?}",
+            held.yaw_longest_setpoint()
         );
     }
 }

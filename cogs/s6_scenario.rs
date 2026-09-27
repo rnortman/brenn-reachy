@@ -24,7 +24,7 @@
 //! Both the author and the checker read this module, so what the run *is* is
 //! stated once. Every instant is a cycle count from the epoch.
 
-use scenario::author::{Overlay, Step};
+use scenario::author::{Overlay, Step, StepBase};
 use scenario::{TAIL_CYCLES, UP_DURATION_NS, cycle_at, cycles_for, run_end_cycle};
 
 // The shape of an ordinary run, stated once for every scenario: where a run
@@ -206,14 +206,18 @@ pub fn steps() -> [Step; 2] {
         Step {
             start_ns: cycle_at(up_start_cycle()),
             end_ns: cycle_at(stow_start_cycle()),
-            pose: Some(scenario::NEUTRAL_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::NEUTRAL_POSE,
+                move_ms: None,
+            },
         },
         Step {
             start_ns: cycle_at(stow_start_cycle()),
             end_ns: cycle_at(disengage_cycle()),
-            pose: Some(scenario::STOW_POSE),
-            move_ms: None,
+            base: StepBase::Pose {
+                name: scenario::STOW_POSE,
+                move_ms: None,
+            },
         },
     ]
 }
@@ -241,7 +245,9 @@ pub fn second_steps() -> [Step; 1] {
     [Step {
         start_ns: cycle_at(second_script_cycle() + 5),
         end_ns: cycle_at(second_script_cycle() + 55),
-        pose: Some(scenario::NEUTRAL_POSE),
-        move_ms: None,
+        base: StepBase::Pose {
+            name: scenario::NEUTRAL_POSE,
+            move_ms: None,
+        },
     }]
 }
