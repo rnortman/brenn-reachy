@@ -33,7 +33,7 @@ use serde_json::json;
 use speech_surface::server::Server;
 use speech_surface::{
     ANNOUNCE_QUEUE_DEPTH, AlertInbox, AnnounceRefused, Announcement, Announcer, Config,
-    ConfigError, Sinks, announce_seam, jsonl,
+    ConfigError, Sinks, WakeGaze, announce_seam, jsonl,
 };
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
@@ -132,6 +132,9 @@ impl Voice {
     /// that fails drops it, so the raiser its caller kept refuses every alert
     /// rather than appearing to carry one.
     ///
+    /// `gaze` is asked where the head looks on each wake; `None` leaves every
+    /// wake at the configured wake pose.
+    ///
     /// The announcement seam is minted here rather than handed in, because both
     /// of its ends belong to this run: the sentence a Critical carries is
     /// spoken by the pipeline's own voice, and a caller has nothing to say
@@ -162,6 +165,7 @@ impl Voice {
         intents: Intents,
         lines: Arc<dyn Lines>,
         alerts: AlertInbox,
+        gaze: Option<Arc<dyn WakeGaze>>,
     ) -> Result<Self, NotRunning> {
         let settings = Config::load(config).map_err(|error| match &error {
             ConfigError::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
@@ -198,6 +202,7 @@ impl Voice {
         let sinks = Sinks {
             scripts: Some(Arc::new(ScripterIntents::new(intents.clone(), lines))),
             intents: Some(Arc::new(BusIntents::new(intents))),
+            gaze,
         };
 
         let (announcer, announce_inbox) = announce_seam(ANNOUNCE_QUEUE_DEPTH);
@@ -544,12 +549,26 @@ mod tests {
         speech_fixture::carrying(dir, speech_fixture::Events::File(&events))
     }
 
+    /// A gaze policy that is never asked: the runs it is handed to script no head.
+    struct Unasked;
+
+    impl WakeGaze for Unasked {
+        fn choose(
+            &self,
+            _pod: &speech_pipeline::PodId,
+            _doa: &[speech_surface::DoaSample],
+            _wake_end_sample: u64,
+        ) -> Option<speech_surface::GazePose> {
+            None
+        }
+    }
+
     #[test]
     fn a_configuration_this_host_can_run_becomes_a_listening_pipeline() {
         let dir = scratch_dir("reachy-host-composed");
         let path = runnable(dir.as_ref());
         let (intents, _waiting) = queue();
-        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox(), None) {
             Ok(voice) => voice,
             Err(refused) => panic!("a configuration this host can run: {refused}"),
         };
@@ -580,7 +599,7 @@ mod tests {
         let dir = scratch_dir("reachy-host-serving");
         let path = runnable(dir.as_ref());
         let (intents, _waiting) = queue();
-        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox(), None) {
             Ok(voice) => voice,
             Err(refused) => panic!("a configuration this host can run: {refused}"),
         };
@@ -589,6 +608,44 @@ mod tests {
             "a pipeline nobody has asked to stop is still serving"
         );
         assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
+    }
+
+    #[test]
+    fn a_gaze_handed_in_reaches_the_pipeline() {
+        // The fixture scripts no head, so the pipeline names a gaze it was handed
+        // as unused: that line is the proof the policy reached the server, and its
+        // absence without one is the proof nothing else put it there.
+        for (tag, gaze, said) in [
+            (
+                "reachy-host-gaze-given",
+                Some(Arc::new(Unasked) as Arc<dyn WakeGaze>),
+                1_usize,
+            ),
+            ("reachy-host-gaze-absent", None, 0),
+        ] {
+            let dir = scratch_dir(tag);
+            let path = runnable(dir.as_ref());
+            let (intents, _waiting) = queue();
+            let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox(), gaze) {
+                Ok(voice) => voice,
+                Err(refused) => panic!("a configuration this host can run: {refused}"),
+            };
+            assert!(voice.stop().is_none(), "a pipeline asked to stop stops");
+            let events =
+                std::fs::read_to_string(dir.join("events.jsonl")).expect("the drained event sink");
+            let unused: Vec<serde_json::Value> = events
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .unwrap_or_else(|_| panic!("one line of JSON: {line}"))
+                })
+                .filter(|v| v["event"] == "gaze_seam_unused")
+                .collect();
+            assert_eq!(unused.len(), said, "{tag}: {events}");
+            if said == 1 {
+                assert_eq!(unused[0]["reason"], "no scripter", "{events}");
+            }
+        }
     }
 
     #[test]
@@ -622,7 +679,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("the fixture");
         std::fs::write(&path, text.replace("127.0.0.1:0", "0.0.0.0:7380")).expect("a file");
         let (intents, _waiting) = queue();
-        let refused = Voice::start(&path, intents, Arc::new(Stdout), inbox())
+        let refused = Voice::start(&path, intents, Arc::new(Stdout), inbox(), None)
             .err()
             .expect("a configuration this host will not run");
         assert!(
@@ -639,7 +696,7 @@ mod tests {
         let (intents, _waiting) = queue();
         // `err()` rather than `expect_err`: a running `Voice` owns a runtime and
         // is deliberately not `Debug`, and the failure is the whole assertion.
-        let refused = Voice::start(&path, intents, Arc::new(Stdout), inbox())
+        let refused = Voice::start(&path, intents, Arc::new(Stdout), inbox(), None)
             .err()
             .expect("a configuration this host will not run on");
         assert!(
@@ -654,7 +711,7 @@ mod tests {
         let path = dir.join("nokeys.toml");
         std::fs::write(&path, NO_KEYS).expect("a file");
         let (intents, _waiting) = queue();
-        let refused = Voice::start(&path, intents, Arc::new(Stdout), inbox())
+        let refused = Voice::start(&path, intents, Arc::new(Stdout), inbox(), None)
             .err()
             .expect("a key table that is not there");
         assert!(
@@ -667,9 +724,15 @@ mod tests {
     fn a_configuration_that_is_not_on_the_machine_is_absent() {
         let dir = scratch_dir("reachy-host-absent");
         let (intents, _waiting) = queue();
-        let refused = Voice::start(&dir.join("speech.toml"), intents, Arc::new(Stdout), inbox())
-            .err()
-            .expect("a path with no file at it");
+        let refused = Voice::start(
+            &dir.join("speech.toml"),
+            intents,
+            Arc::new(Stdout),
+            inbox(),
+            None,
+        )
+        .err()
+        .expect("a path with no file at it");
         assert!(matches!(refused, NotRunning::Absent), "{refused}");
     }
 
@@ -683,7 +746,7 @@ mod tests {
         let path = dir.join("speech.toml");
         std::fs::create_dir_all(&path).expect("a directory where a file should be");
         let (intents, _waiting) = queue();
-        let refused = Voice::start(&path, intents, Arc::new(Stdout), inbox())
+        let refused = Voice::start(&path, intents, Arc::new(Stdout), inbox(), None)
             .err()
             .expect("a configuration this host cannot read");
         assert!(
@@ -776,7 +839,7 @@ mod tests {
         let dir = scratch_dir("reachy-host-alertless");
         let path = runnable(dir.as_ref());
         let (intents, _waiting) = queue();
-        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox(), None) {
             Ok(voice) => voice,
             Err(refused) => panic!("a configuration this host can run: {refused}"),
         };
@@ -794,7 +857,7 @@ mod tests {
         let dir = scratch_dir("reachy-host-alerting");
         let path = carrying(dir.as_ref());
         let (intents, _waiting) = queue();
-        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox(), None) {
             Ok(voice) => voice,
             Err(refused) => panic!("a configuration this host can run: {refused}"),
         };
@@ -813,7 +876,7 @@ mod tests {
         let dir = scratch_dir("reachy-host-speaking");
         let path = carrying(dir.as_ref());
         let (intents, _waiting) = queue();
-        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox(), None) {
             Ok(voice) => voice,
             Err(refused) => panic!("a configuration this host can run: {refused}"),
         };
@@ -863,7 +926,7 @@ mod tests {
         let dir = scratch_dir("reachy-host-mute");
         let path = runnable(dir.as_ref());
         let (intents, _waiting) = queue();
-        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox(), None) {
             Ok(voice) => voice,
             Err(refused) => panic!("a configuration this host can run: {refused}"),
         };
@@ -898,7 +961,7 @@ mod tests {
         )
         .expect("a file");
         let (intents, _waiting) = queue();
-        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox()) {
+        let voice = match Voice::start(&path, intents, Arc::new(Stdout), inbox(), None) {
             Ok(voice) => voice,
             Err(refused) => panic!("a configuration this host can run: {refused}"),
         };

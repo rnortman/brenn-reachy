@@ -21,6 +21,10 @@
 //! loop ([`idle`]), which dances a playlist while nobody is speaking, sent
 //! through the same gate, and yielding the head to speech.
 //!
+//! Where the head is, the control process says on a loopback feed of its own;
+//! [`pose_feed`] keeps the last of it, and [`gaze`] reads it with the array's
+//! reading to choose where the head looks when the wake word is heard.
+//!
 //! [`HostEdge`]: reachy_edge::HostEdge
 //!
 //! The process boundary between this and the control process is architectural,
@@ -40,22 +44,30 @@
 
 pub mod check;
 pub mod edge;
+pub mod gaze;
 pub mod idle;
 pub mod intents;
 pub mod params;
+pub mod pose_feed;
 pub mod sinks;
 pub mod voice;
 pub mod words;
 
 pub use check::{Conclusion, conclusion_line, inspect, name_tables, settled};
 pub use edge::{Console, Speaker, Unspoken};
+pub use gaze::{
+    Decision, Decline, Elevation, ElevationError, Gaze, LADDER, Look, MAX_POSE_AGE, decide,
+    gaze_line, rung,
+};
 pub use idle::{Idle, IdleError, Playlist, Poll, Verdict};
 pub use intents::{INTENT_BACKLOG, Intents, NotOffered, Waiting, queue};
 pub use params::{HostSettings, ParamsError, ParamsErrorKind, load, parse};
+pub use pose_feed::{HeadAttitude, LastPose, PoseFeed, PoseReader, WrongSize};
 pub use sinks::{BusIntents, Lines, ScripterIntents, Stdout};
 pub use voice::{Composition, Voice, absent_line, composed_line, silent_line};
 pub use words::{
-    AWAITING_SPEECH_CONFIG, COMPOSED, IDLE_BACKOFF, IDLE_DROPPED_STOW, IDLE_NO_STORY, IDLE_OPENED,
-    IDLE_PARKED, IDLE_REFUSED, IDLE_REPLACED, IDLE_RESUMED, IDLE_SCRIPT_KINDS, IDLE_SUSPENDED,
-    REFUSAL_PREFIX, STARTED, UNOFFERED, UNPUBLISHED, UNSENT, UNSPOKEN, VOICELESS,
+    AWAITING_SPEECH_CONFIG, COMPOSED, GAZE, IDLE_BACKOFF, IDLE_DROPPED_STOW, IDLE_NO_STORY,
+    IDLE_OPENED, IDLE_PARKED, IDLE_REFUSED, IDLE_REPLACED, IDLE_RESUMED, IDLE_SCRIPT_KINDS,
+    IDLE_SUSPENDED, POSE_UNFED, POSE_WRONG_SIZE, REFUSAL_PREFIX, STARTED, UNOFFERED, UNPUBLISHED,
+    UNSENT, UNSPOKEN, VOICELESS,
 };

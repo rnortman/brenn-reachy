@@ -6,9 +6,10 @@
 // the plant; here six UDP sockets carry the driver contract across a process
 // boundary to `reachy-motord`, which owns the serial port and the bus cycle.
 // The core is `motion::MotionCore` in both, stated once, so the two systems
-// cannot drift apart in topology. Two more sockets carry the intent edge: a
-// script arriving from the process that asked for it, and the session's
-// narration leaving for that same process.
+// cannot drift apart in topology. Two more carry the intent edge: a script
+// arriving from the process that asked for it, and the session's narration
+// leaving for that same process; and one more carries the head's pose estimates
+// to that same process.
 //
 // Why the driver is a process and not a cog: it must hold a serial port across
 // executions and block on multi-millisecond bus transactions. A Rust cog's only
@@ -17,7 +18,7 @@
 // blocking bus work in an execute body spends half the pool; and an input
 // overrun on a slow cog ends the whole process. So the driver is an OS process
 // that is no Clockwork process, composed in no box, and this file's business
-// with it is the seven sockets it owns of the nine below.
+// with it is the seven sockets it owns of the ten below.
 //
 // A socket occupies exactly the slot a cog does: it publishes to a channel or
 // subscribes to one, and a channel does not say what filled it. So each
@@ -184,9 +185,27 @@ udp_socket ReportsOut
     message_type: Tachyon<timeline::Timeline>;
 }
 
-// The control loop as it runs on a machine: the core three cogs and nine
+// Where the head is, leaving for the voice host: every estimate the pose solver
+// makes, one per sample, as the schema's bytes. The voice host keeps the newest
+// usable one and reads the head's attitude off it; nothing in this process
+// waits on it, and nothing reads anything back.
+//
+// `port` on an outgoing socket is the destination, as `ReportsOut`'s is, so 7411
+// is the port the voice host binds and not one this process holds. With nothing
+// bound there -- a motion run, or a host that is not running -- the send goes
+// nowhere and says nothing: the socket is unconnected, so the loopback's refusal
+// never reaches it.
+udp_socket EstimatesOut
+{
+    address: 127.0.0.1;
+    port: 7411;
+    direction: outgoing;
+    message_type: Tachyon<pose::PoseEstimate>;
+}
+
+// The control loop as it runs on a machine: the core three cogs and ten
 // sockets -- seven in place of the modelled driver, two carrying the intent
-// edge.
+// edge, one carrying the head's pose to the voice host.
 //
 // The topology is `SimBox`'s with two publishers replaced. Where that box puts
 // a cog at the driver's end and reads its scripts out of an input log, this one
@@ -196,8 +215,8 @@ udp_socket ReportsOut
 //
 // Every channel has exactly one publisher here too. The core's own self-loop --
 // the decision tick reading back the goal channel it publishes -- adds a
-// subscriber and no publisher, and the outgoing sockets on `DriverCmd` and
-// `ReportsOut` are subscribers beside the cogs that read them.
+// subscriber and no publisher, and the outgoing sockets on `DriverCmd`,
+// `ReportsOut` and `Estimates` are subscribers beside whatever else reads them.
 box RobotBox
 {
     new core: motion::MotionCore;
@@ -211,6 +230,11 @@ box RobotBox
 
     new reports_out: ReportsOut;
     connect motion::ReportsOut to reports_out;
+
+    // The head's attitude, leaving for the voice host, which chooses where to
+    // look from it.
+    new estimates_out: EstimatesOut;
+    connect motion::Estimates to estimates_out;
 
     // The sample stream, arriving from the driver process. The core's two
     // control-rate cogs run on it and the session reads it for one thing only:

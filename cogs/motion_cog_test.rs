@@ -2183,6 +2183,98 @@ fn a_step_that_keeps_the_base_and_a_gap_both_hold() {
     );
 }
 
+/// A keep step stops the move it lands on, once: the first sample it covers
+/// commands a hold, the tick goes `Holding` there, and every later sample under
+/// the same keep commands nothing and publishes the goal the stop left.
+#[test]
+fn a_keep_step_stops_the_move_it_covers_once() {
+    const KEEP_AT: i64 = 20;
+    let mut mover = Mover::new();
+    mover.schedule(true, 1, &[(KEEP_AT, Some(up_pose_id())), (1000, None)]);
+
+    let mut cycles = mover.run(usize::try_from(KEEP_AT - 1).expect("a small count"));
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(snap.mode, MotionMode::Moving, "the raise is under way");
+    assert!(
+        snap.moving_elapsed.as_nanos() < UP_NS,
+        "with room left to run: {:?}",
+        snap.moving_elapsed,
+    );
+    let last = cycles
+        .last()
+        .and_then(|cycle| cycle.goal)
+        .expect("a moving machine is commanded")
+        .targets;
+
+    let first = mover.step();
+    let snap = state_of(mover.cog.state_ctrl().snap());
+    assert_eq!(snap.mode, MotionMode::Holding, "the keep stopped the raise");
+    assert_eq!(
+        snap.moving_elapsed,
+        SlotDuration::from_nanos(0),
+        "a hold leaves no move behind",
+    );
+    assert_eq!(
+        first.goal.expect("a held machine is commanded").targets,
+        last,
+        "stopped where it stood",
+    );
+    cycles.push(first);
+
+    for cycle in mover.run(5) {
+        assert_eq!(
+            cycle.goal.expect("a held machine is commanded").targets,
+            last,
+            "nothing moves under the keep",
+        );
+        assert_eq!(
+            state_of(mover.cog.state_ctrl().snap()).mode,
+            MotionMode::Holding,
+        );
+        cycles.push(cycle);
+    }
+    assert_eq!(reports(&cycles), Vec::new(), "a keep is not a fault");
+}
+
+/// A keep that was already under way on the period before the first sample
+/// that sees its schedule still stops the move: what decides it is the tick's
+/// own mode, not whether the previous period was a keep.
+#[test]
+fn a_keep_under_way_before_its_schedule_lands_still_stops_the_move() {
+    let mut mover = standing_up();
+    let cycles = mover.run(10);
+    assert_eq!(
+        state_of(mover.cog.state_ctrl().snap()).mode,
+        MotionMode::Moving,
+        "the raise is under way",
+    );
+    let last = cycles
+        .last()
+        .and_then(|cycle| cycle.goal)
+        .expect("a moving machine is commanded")
+        .targets;
+
+    // The keep began two periods before the next sample, so it covers that
+    // sample's previous period too.
+    let now = mover.cycles_from_start();
+    mover.schedule(true, 2, &[(now - 1, Some(up_pose_id())), (1000, None)]);
+
+    let first = mover.step();
+    assert_eq!(
+        state_of(mover.cog.state_ctrl().snap()).mode,
+        MotionMode::Holding,
+        "the keep stopped the raise",
+    );
+    assert_eq!(first.goal.expect("commanded").targets, last);
+    for cycle in mover.run(3) {
+        assert_eq!(cycle.goal.expect("commanded").targets, last);
+        assert_eq!(
+            state_of(mover.cog.state_ctrl().snap()).mode,
+            MotionMode::Holding,
+        );
+    }
+}
+
 /// The burst rule, which only a scheduling stall produces online: the goals are
 /// superseded, so the last of them wins the one output slot, and the state
 /// effects of the rest are already folded into the snapshot.

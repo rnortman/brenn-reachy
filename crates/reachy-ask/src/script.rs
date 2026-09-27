@@ -92,6 +92,22 @@ mod tests {
             "settle-evidence-2",
             include_str!("../fixtures/settle-evidence-2.json"),
         ),
+        (
+            "settle-evidence-3",
+            include_str!("../fixtures/settle-evidence-3.json"),
+        ),
+        (
+            "settle-evidence-4",
+            include_str!("../fixtures/settle-evidence-4.json"),
+        ),
+        (
+            "settle-evidence-5",
+            include_str!("../fixtures/settle-evidence-5.json"),
+        ),
+        (
+            "settle-evidence-6",
+            include_str!("../fixtures/settle-evidence-6.json"),
+        ),
     ];
 
     struct Sink {
@@ -351,7 +367,7 @@ mod tests {
             candidate_counts.push(steps.len() - 1);
         }
 
-        assert_eq!(candidate_counts, vec![10, 12]);
+        assert_eq!(candidate_counts, vec![10, 12, 14, 14, 14, 14]);
         let names: Vec<_> = poses.entries().map(|(name, _)| name.to_owned()).collect();
         let expected: std::collections::BTreeSet<_> = names
             .iter()

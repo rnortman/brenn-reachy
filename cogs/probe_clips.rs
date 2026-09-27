@@ -28,11 +28,11 @@
 //!   trusted: a ramp whose successor does not start where it was heading never
 //!   reaches its pose, which no reader of the table would see.
 
-use std::fmt::Write as _;
-
 use anyhow::{Context as _, bail};
 
-use reachy_clips::format::{CLIP_KIND, Channel, ClipDoc, FORMAT_VERSION, FrameDoc};
+use reachy_clips::format::{
+    CLIP_KIND, Channel, ClipDoc, FORMAT_VERSION, FrameDoc, render_document,
+};
 use reachy_poses::format::Pose as LoadedPose;
 
 const SIDEWAYS_PROBE: [f64; 2] = [-core::f64::consts::FRAC_PI_2, core::f64::consts::FRAC_PI_2];
@@ -271,7 +271,7 @@ impl Probe {
     /// Whatever [`Probe::antenna_frames`] refuses.
     pub fn document(&self, folds: &Folds) -> anyhow::Result<String> {
         let frames = self.antenna_frames(folds)?;
-        Ok(render(&ClipDoc {
+        Ok(render_document(&ClipDoc {
             base: None,
             version: FORMAT_VERSION,
             kind: CLIP_KIND.to_owned(),
@@ -296,41 +296,6 @@ impl Probe {
     pub fn path(&self, clips: &std::path::Path) -> std::path::PathBuf {
         clips.join(format!("{}.json", self.name))
     }
-}
-
-/// A clip document as the tree commits one: `serde`'s own JSON, laid out with
-/// the frame track one frame per line.
-///
-/// The layout is what makes a committed document reviewable — 775 frames on one
-/// line is a diff nobody reads — and it is all this function decides. Every key
-/// and every value comes from the format's own serialisation, so the two are
-/// never spelled twice.
-fn render(doc: &ClipDoc) -> String {
-    let value = serde_json::to_value(doc).expect("a clip document is JSON");
-    let fields = value
-        .as_object()
-        .expect("a clip document is a JSON object")
-        .clone();
-    let mut out = String::from("{\n");
-    for (index, (key, field)) in fields.iter().enumerate() {
-        let comma = if index + 1 == fields.len() { "" } else { "," };
-        let key = serde_json::to_string(key).expect("a key is JSON");
-        match field.as_array().filter(|_| key == "\"frames\"") {
-            Some(frames) => {
-                let _ = writeln!(out, "  {key}: [");
-                for (index, frame) in frames.iter().enumerate() {
-                    let inner = if index + 1 == frames.len() { "" } else { "," };
-                    let _ = writeln!(out, "    {frame}{inner}");
-                }
-                let _ = writeln!(out, "  ]{comma}");
-            }
-            None => {
-                let _ = writeln!(out, "  {key}: {field}{comma}");
-            }
-        }
-    }
-    out.push_str("}\n");
-    out
 }
 
 /// Every probe document the tree carries.

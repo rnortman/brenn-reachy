@@ -78,6 +78,6 @@ pub use narrate::{
     refusal_line, refusal_line_with, restart_line, row_says, row_word, severity_word,
     timeline_line,
 };
-pub use ports::{LOOPBACK, REPORTS_OUT_PORT, SCRIPTS_IN_PORT};
+pub use ports::{ESTIMATES_OUT_PORT, LOOPBACK, REPORTS_OUT_PORT, SCRIPTS_IN_PORT};
 pub use run::{DATAGRAM_CAP, HostEdge, POLL, Surface, alert_line, now};
 pub use story::{NotAStory, Story, Update};

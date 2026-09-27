@@ -211,9 +211,49 @@ impl InputLog {
         steps: &[Step],
         overlays: &[Overlay],
     ) -> Result<(), LogError> {
+        self.write_script(at_ns, at_ns, script_id, steps, overlays)
+    }
+
+    /// Ask the machine to run a script sent at `at_ns` and stamped `arrival_ns`:
+    /// a sender whose receipt preceded delivery, which is what a script crossing
+    /// the edge and the session before the mover sees it looks like. Offsets are
+    /// measured from the stamp.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the writer refuses.
+    ///
+    /// # Panics
+    ///
+    /// On the same statements [`Self::script`] refuses, and for a stamp later
+    /// than the send.
+    pub fn script_stamped(
+        &mut self,
+        at_ns: i64,
+        arrival_ns: i64,
+        script_id: u32,
+        steps: &[Step],
+    ) -> Result<(), LogError> {
+        assert!(
+            arrival_ns <= at_ns,
+            "a script is stamped no later than it is sent"
+        );
+        self.write_script(at_ns, arrival_ns, script_id, steps, &[])
+    }
+
+    /// Write a script sent at `at_ns` and stamped `arrival_ns`, every offset in
+    /// it measured from the stamp.
+    fn write_script(
+        &mut self,
+        at_ns: i64,
+        arrival_ns: i64,
+        script_id: u32,
+        steps: &[Step],
+        overlays: &[Overlay],
+    ) -> Result<(), LogError> {
         let mut message = ScriptWire::new();
         message.set_script_id(script_id);
-        message.set_arrival(SyncTime::from_nanos(at_ns));
+        message.set_arrival(SyncTime::from_nanos(arrival_ns));
         {
             let mut rows = message.steps_mut();
             rows.clear();
@@ -221,7 +261,7 @@ impl InputLog {
                 let row: &mut ScriptStepWire = rows
                     .try_grow()
                     .expect("a script of no more steps than the schema holds");
-                row.set_after_ms(offset_ms(at_ns, step.start_ns));
+                row.set_after_ms(offset_ms(arrival_ns, step.start_ns));
                 row.set_duration_ms(offset_ms(step.start_ns, step.end_ns));
                 match step.pose {
                     Some(pose) => {
@@ -241,7 +281,7 @@ impl InputLog {
                     .try_grow()
                     .expect("a script of no more windows than the schema holds");
                 row.set_motion_id(overlay.motion_id);
-                row.set_after_ms(offset_ms(at_ns, overlay.start_ns));
+                row.set_after_ms(offset_ms(arrival_ns, overlay.start_ns));
                 row.set_duration_ms(offset_ms(overlay.start_ns, overlay.end_ns));
                 row.set_gain(overlay.gain);
                 row.set_speed(overlay.speed);

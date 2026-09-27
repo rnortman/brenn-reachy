@@ -672,6 +672,29 @@ rust_test(
     crate = ":log_read",
 )
 
+# The clip mirroring tool, run as
+# `bazel run //cogs:mirror_clip -- --in <clip.json> --out <mirror.json> --name
+# <name> [--copy-head]` and followed by `make library-config`. Offline and
+# host-side: it writes the left-right mirror of one clip document, which is then
+# committed and screened like any other.
+rust_binary(
+    name = "mirror_clip",
+    srcs = ["mirror_clip.rs"],
+    edition = "2024",
+    deps = [
+        "//crates/reachy-clips:reachy_clips",
+        "@brenn_reachy_crates//:anyhow",
+        "@brenn_reachy_crates//:serde_json",
+    ],
+)
+
+# The map, the base rule and the command line, over in-memory documents.
+rust_test(
+    name = "mirror_clip_test",
+    size = "small",
+    crate = ":mirror_clip",
+)
+
 # What this system's channels are called, and nothing else. Its own crate because
 # the operator's report and the scenario harness both name the same channels and
 # must not reach each other's crates to do it: a rename that lands in one Rust
@@ -1201,10 +1224,10 @@ rust_clk_module(
 )
 
 # The online composition: the seven sockets to the driver process, the two that
-# carry the intent edge, the box that closes the loop around the control core
-# with them, the logger box that watches it, and the two processes that host
-# them. No `cpp_cog` -- the module declares no cogs, and the logger's two are the
-# framework's own.
+# carry the intent edge, the one that carries the head's pose to the voice host,
+# the box that closes the loop around the control core with them, the logger box
+# that watches it, and the two processes that host them. No `cpp_cog` -- the
+# module declares no cogs, and the logger's two are the framework's own.
 # `cpp_exe` synthesizes the one process executable both processes are started
 # from, whose name is derived from the file stem and is therefore the name
 # `robot.clk`'s `Process(executable=...)` spells.
@@ -1625,7 +1648,8 @@ scenario_suite(
 # S13, a wake at the wrong moments: the same four cogs S1 runs on, with scripts
 # arriving while the engagement they opened is in flight and while the machine is
 # being let go of -- each held and answered on the phase the maneuver ends in,
-# and a duplicate number refused.
+# and a duplicate number refused -- and a wake answered by a keep while the raise
+# is under way, which stops it where it stands.
 scenario_suite(
     name = "s13",
     author_deps = [],

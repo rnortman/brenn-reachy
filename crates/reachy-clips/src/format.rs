@@ -24,6 +24,7 @@
 //! possible fix and is worth the one field.
 
 use std::fmt;
+use std::fmt::Write as _;
 
 use nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -666,6 +667,46 @@ pub struct ClipDoc {
     pub blend_out_ms: Option<u32>,
     /// The frame track, uniformly sampled at `frame_hz`.
     pub frames: Vec<FrameDoc>,
+}
+
+/// A clip document as the tree commits one: `serde`'s own JSON, laid out with
+/// the frame track one frame per line.
+///
+/// The layout is what makes a committed document reviewable — 775 frames on one
+/// line is a diff nobody reads — and it is all this function decides. Every key
+/// and every value comes from the format's own serialisation, so the two are
+/// never spelled twice.
+///
+/// # Panics
+///
+/// Never for a document this type can hold: its serialisation is a JSON object.
+#[must_use]
+pub fn render_document(doc: &ClipDoc) -> String {
+    let value = serde_json::to_value(doc).expect("a clip document is JSON");
+    let fields = value
+        .as_object()
+        .expect("a clip document is a JSON object")
+        .clone();
+    let mut out = String::from("{\n");
+    for (index, (key, field)) in fields.iter().enumerate() {
+        let comma = if index + 1 == fields.len() { "" } else { "," };
+        let key = serde_json::to_string(key).expect("a key is JSON");
+        match field.as_array().filter(|_| key == "\"frames\"") {
+            Some(frames) => {
+                let _ = writeln!(out, "  {key}: [");
+                for (index, frame) in frames.iter().enumerate() {
+                    let inner = if index + 1 == frames.len() { "" } else { "," };
+                    let _ = writeln!(out, "    {frame}{inner}");
+                }
+                let _ = writeln!(out, "  ]{comma}");
+            }
+            None => {
+                let _ = writeln!(out, "  {key}: {field}{comma}");
+            }
+        }
+    }
+    out.push_str("}\n");
+    out
 }
 
 /// One validated frame: the deltas for one instant, present exactly for the

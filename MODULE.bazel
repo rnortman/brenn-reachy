@@ -90,7 +90,8 @@ register_toolchains("@rust_toolchains//:all")
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 
 # f64 linear algebra for the head kinematics. reachy-kin, reachy-motion,
-# reachy-clips and reachy-poses.
+# reachy-clips, reachy-poses and reachy-host (the head's attitude off the pose
+# feed).
 crate.spec(
     package = "nalgebra",
     version = "0.35",
@@ -259,7 +260,7 @@ crate.spec(
 # read.
 BRENN_POD_GIT = "https://github.com/rnortman/brenn-pod.git"
 
-BRENN_POD_REV = "7283854b643dd1d5940aa67cebf048b3786acb5b"
+BRENN_POD_REV = "781a38a19edc1a6ebce5c0a4be2f2de101421f1e"
 
 # Developing a seam that lands on both sides of this dependency arrow: replace
 # each spec's `git`/`rev` pair with `path = "../brenn-pod/<crate path>"` to

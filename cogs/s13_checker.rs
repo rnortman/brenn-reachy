@@ -26,31 +26,34 @@ use scenario::check;
 use scenario::read::Run;
 
 use s13_scenario::{
-    CLOSING_SCRIPT_ID, HELD_SCRIPT_ID, OPENING_SCRIPT_ID, closing_cycle, disengage_cycle,
-    duplicate_cycle, end_cycle, script_sent_cycle, second_disengage_cycle, second_stow_start_cycle,
-    stow_start_cycle,
+    CLOSING_SCRIPT_ID, HELD_SCRIPT_ID, KEEP_SCRIPT_ID, OPENING_SCRIPT_ID, closing_cycle,
+    disengage_cycle, duplicate_cycle, end_cycle, keep_sent_cycle, keep_stamped_cycle,
+    script_sent_cycle, second_disengage_cycle, second_stow_start_cycle, stow_start_cycle,
 };
 
 fn main() -> ExitCode {
     check::main("s13_checker", |run, failures| {
         check::heartbeat(run, end_cycle(), failures);
         check::readings_present(run, failures);
-        // The four things the scenario said, in the order it said them: two at
-        // one instant, and the last two the same number twice.
-        check::scripts_sent(
+        // The five things the scenario said, in the order it said them: two at
+        // one instant, a keep stamped ahead of its sending, and the last two
+        // the same number twice.
+        let sent = script_sent_cycle();
+        check::scripts_sent_stamped(
             run,
             &[
-                (OPENING_SCRIPT_ID, script_sent_cycle()),
-                (HELD_SCRIPT_ID, script_sent_cycle()),
-                (CLOSING_SCRIPT_ID, closing_cycle()),
-                (CLOSING_SCRIPT_ID, duplicate_cycle()),
+                (OPENING_SCRIPT_ID, sent, sent),
+                (HELD_SCRIPT_ID, sent, sent),
+                (KEEP_SCRIPT_ID, keep_sent_cycle(), keep_stamped_cycle()),
+                (CLOSING_SCRIPT_ID, closing_cycle(), closing_cycle()),
+                (CLOSING_SCRIPT_ID, duplicate_cycle(), duplicate_cycle()),
             ],
             failures,
         );
         // The first session's whole life, and then the second one the drained
         // script opens: the machine is engaged again, runs a schedule and is let
         // go of, so the run carries two of every phase an engagement has.
-        let (engaged, second) = check::engagement_cycles(
+        let (engaged, second) = check::ordinary_life(
             run,
             &[
                 (SessionPhaseWire::ENGAGING, SessionPhaseWire::RESTING),
@@ -58,6 +61,16 @@ fn main() -> ExitCode {
                 (SessionPhaseWire::STOPPING, SessionPhaseWire::ACTIVE),
                 (SessionPhaseWire::RESTING, SessionPhaseWire::STOPPING),
             ],
+            failures,
+        );
+        check::survey_cost(run, engaged.map(|engaged| engaged.commissioned), failures);
+        // The first session publishes its arming, the keep's replacement and
+        // the schedule nobody is running; the second session's pair follows.
+        check::schedules_under_one_engagement(
+            run,
+            &["the arming", "the keep"],
+            check::Tail::FurtherSessions,
+            engaged,
             failures,
         );
         // The second session's cycles, named by the change each one is rather
@@ -123,6 +136,7 @@ fn main() -> ExitCode {
         check::estimates_per_sample(run, failures);
         check::estimates_valid(run, failures);
         check_arrival(run, failures);
+        check_keep_froze_the_raise(run, failures);
         if let Some(rested) = engaged.and_then(|engaged| engaged.rested) {
             check_torque_off_before_the_second_ask(run, rested, failures);
         }
@@ -135,20 +149,13 @@ fn main() -> ExitCode {
     })
 }
 
-/// The machine arrives at what each session's schedule asked for: upright by the
-/// end of the step that sends it there, and stowed by the end of the fold.
+/// The machine arrives at what each session's schedule asked for: stowed by the
+/// end of the first session's fold, and upright and then stowed in the second.
 ///
-/// The first session's postures are the *held* script's, which is the whole
-/// point of the drain: the schedule the machine ran is the one that was waiting
-/// rather than the one the acceptance carried.
+/// The first session's fold is the keep script's, and "stowed" is what shows the
+/// drained schedule ran: the opening script has no fold. Its raise is not
+/// asserted upright, because the keep stops it partway.
 fn check_arrival(run: &Run, failures: &mut Vec<String>) {
-    check::arrived_at(
-        run,
-        "upright",
-        stow_start_cycle() - 1,
-        &scenario::neutral_pose(),
-        failures,
-    );
     check::arrived_at(
         run,
         "stowed",
@@ -235,5 +242,38 @@ fn check_torque_off_before_the_second_ask(run: &Run, rested: i64, failures: &mut
              rest on {rested}: a script held through a release is drained on the wake the release \
              confirms, and that wake takes the engagement's first bus step"
         ));
+    }
+}
+
+/// The keep that arrived mid-raise stopped the raise where it stood: the goal
+/// was still moving on the cycles before it arrived, and it does not move again
+/// until the fold.
+///
+/// The mover acts on the new schedule on the cycle it arrives or the one after,
+/// and either way every goal from the cycle after it arrived on is the held one.
+fn check_keep_froze_the_raise(run: &Run, failures: &mut Vec<String>) {
+    let arrived = keep_sent_cycle();
+    let before = check::goal_at_or(run, arrived - 2, "raising", failures);
+    let last = check::goal_at_or(run, arrived - 1, "raising", failures);
+    let (Some(before), Some(last)) = (before, last) else {
+        return;
+    };
+    if before == last {
+        failures.push(format!(
+            "the raise had stopped before the keep arrived at cycle {arrived}; this run no longer \
+             tests a keep landing on a moving tick"
+        ));
+    }
+    let Some(held) = check::goal_at_or(run, arrived + 1, "held by the keep", failures) else {
+        return;
+    };
+    for cycle in arrived + 2..stow_start_cycle() {
+        if check::goal_at(run, cycle) != Some(held) {
+            failures.push(format!(
+                "the goal moved on cycle {cycle} under the keep that arrived on {arrived}: a keep \
+                 stops the move it lands on"
+            ));
+            return;
+        }
     }
 }

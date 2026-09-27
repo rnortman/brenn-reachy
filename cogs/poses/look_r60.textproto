@@ -1,0 +1,9 @@
+name: "look_r60"
+description: "Head turned 45 degrees to the robot's right from neutral, a pure yaw about the body's vertical axis, level and at nominal height, and the body yawed 15 degrees further right, so the head faces 60 degrees right of the base's zero; antennas as neutral's. The head carries the first 45 degrees because it is fast; the slow body carries only the rest. Written from the figures, not recorded. A rung of the voice host's gaze ladder."
+# Head relative to the neutral head pose: metres, unit quaternion [w, x, y, z].
+dt: [0.0, 0.0, 0.0]
+dq: [0.9238795325112867, 0.0, 0.0, -0.3826834323650898]
+body_yaw: -0.2617993877991494
+# Right, then left; radians, a direction.
+antennas: [-0.1745, 0.1745]
+duration_ms: 900

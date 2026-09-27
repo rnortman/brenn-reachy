@@ -1,18 +1,18 @@
 //! The port numbers on this machine's two seams, as the artifacts state them.
 //!
 //! Two named sets: the driver seam (`crates/reachy-motord/src/ports.rs`) and the
-//! intent edge (`crates/reachy-edge/src/ports.rs`). Neither can see the other,
-//! and neither can see the compositions: `robot.clk` and `robot_host.clk`
-//! restate the numbers as bare literals, and a `const` assert in Rust says
-//! nothing about a `.clk` file. This is the join, and it is the only place the
+//! voice host's (`crates/reachy-edge/src/ports.rs`): the intent edge and the
+//! pose feed. Neither can see the other, and neither can see the compositions:
+//! `robot.clk` and `robot_host.clk` restate the numbers as bare literals, and a
+//! `const` assert in Rust says nothing about a `.clk` file. This is the join, and it is the only place the
 //! whole range is looked at at once.
 //!
 //! Three claims. No number serves two subjects across both sets, because a
 //! workstation runs the lot on one loopback and a datagram's port is the whole
 //! of its type. The sockets the control box declares are exactly the two sets
-//! together -- the driver seam and the intent edge both terminate in that one
-//! composition -- so a subject added on one side and not the other fails here
-//! rather than as a datagram decoded under the wrong schema. And every port
+//! together -- the driver seam, the intent edge and the pose feed all terminate
+//! in that one composition -- so a subject added on one side and not the other
+//! fails here rather than as a datagram decoded under the wrong schema. And every port
 //! bound anywhere in the host composition is bound once: that composition puts
 //! the control box's
 //! incoming sockets and the simulated plant's on one loopback, so two of them

@@ -49,6 +49,9 @@
 //! the way the run reads it: through the run's own loader, against the name
 //! table the host configuration names.
 //!
+//! With the gaze on, the ladder's five poses are the third set of names the
+//! deployed table is held to.
+//!
 //! The recording directory is held to the same rule for the opposite reason.
 //! It is the one path the configuration names that the run *creates* rather
 //! than reads, so an absolute one is not a file the unit fails to find — it is
@@ -110,6 +113,9 @@ pub struct Conclusion {
 /// against the name table the host configuration names; an unnamed one is not a
 /// finding.
 ///
+/// With `gaze`, whether the name table the host configuration names holds every
+/// pose the gaze ladder chooses among.
+///
 /// The last conclusion is the verdict, so a reader of the stream has the answer
 /// without accumulating the lines before it.
 #[must_use]
@@ -117,6 +123,7 @@ pub fn inspect(
     config: &Path,
     speech_config: Option<&Path>,
     idle: Option<&Path>,
+    gaze: bool,
     base: &Path,
 ) -> Vec<Conclusion> {
     let mut found = Vec::new();
@@ -177,6 +184,10 @@ pub fn inspect(
         if let Some(brenn) = voice.brenn.as_ref() {
             found.push(commandable(&host.library_names, brenn, base));
         }
+    }
+
+    if gaze {
+        found.push(ladder(host.as_ref(), base));
     }
 
     if let Some(path) = idle {
@@ -258,10 +269,23 @@ fn commandable(
     base: &Path,
 ) -> Conclusion {
     let at = base.join(library_names);
-    let named = [
-        ("presence_wake_pose", brenn.presence_wake_pose.as_str()),
-        ("presence_turn_pose", brenn.presence_turn_pose.as_str()),
-    ];
+    let wake_keeps = brenn.presence_wake_pose == motion_proto::KEEP_BASE;
+    let mut named: Vec<(&str, &str)> = Vec::with_capacity(2);
+    if !wake_keeps {
+        named.push(("presence_wake_pose", brenn.presence_wake_pose.as_str()));
+    }
+    named.push(("presence_turn_pose", brenn.presence_turn_pose.as_str()));
+    let kept = if wake_keeps {
+        "`presence_wake_pose` is `keep`, which freezes the head where it stands and names no \
+         pose; "
+    } else {
+        ""
+    };
+    let (resolve, numbers) = if wake_keeps {
+        ("it resolves", "it")
+    } else {
+        ("both resolve", "both")
+    };
     let poses = match read_poses(&at) {
         Ok(poses) => poses,
         Err(detail) => {
@@ -270,7 +294,7 @@ fn commandable(
                 subject: PRESENCE_POSES.to_owned(),
                 held: false,
                 says: format!(
-                    "{}, and both resolve through {} — which {detail}",
+                    "{kept}{}, and {resolve} through {} — which {detail}",
                     named
                         .iter()
                         .map(|(field, name)| format!("`{field}` names `{name}`"))
@@ -281,39 +305,119 @@ fn commandable(
             };
         }
     };
-    let missing: Vec<String> = named
-        .iter()
-        .filter(|(_, name)| poses.resolve(name).is_none())
-        .map(|(field, name)| format!("`{field}` names `{name}`"))
-        .collect();
-    if missing.is_empty() {
-        let resolved: Vec<String> = named
-            .iter()
-            .map(|(field, name)| {
-                let entry = poses.resolve(name).expect("a pose none of them missed");
-                format!("`{field}` names `{name}`, pose {}", entry.pose_id)
-            })
-            .collect();
-        return Conclusion {
-            kind: "poses",
-            subject: PRESENCE_POSES.to_owned(),
-            held: true,
-            says: format!("{}; {} numbers both", resolved.join(" and "), at.display(),),
-        };
+    match resolve_all(
+        &poses,
+        named.iter().map(|&(field, name)| ((field, name), name)),
+    ) {
+        Ok(resolved) => {
+            let resolved: Vec<String> = resolved
+                .into_iter()
+                .map(|((field, name), id)| format!("`{field}` names `{name}`, pose {id}"))
+                .collect();
+            Conclusion {
+                kind: "poses",
+                subject: PRESENCE_POSES.to_owned(),
+                held: true,
+                says: format!(
+                    "{kept}{}; {} numbers {numbers}",
+                    resolved.join(" and "),
+                    at.display(),
+                ),
+            }
+        }
+        Err(missing) => {
+            let missing: Vec<String> = missing
+                .into_iter()
+                .map(|(field, name)| format!("`{field}` names `{name}`"))
+                .collect();
+            let holds: Vec<&str> = poses.entries().map(|(name, _)| name).collect();
+            Conclusion {
+                kind: "poses",
+                subject: PRESENCE_POSES.to_owned(),
+                held: false,
+                says: format!(
+                    "{kept}{}, which {} does not hold — it holds {}. The edge refuses a script \
+                     naming a pose the deployed library lacks, so every raise this configuration \
+                     authors would be refused and the head would not move all run",
+                    missing.join(" and "),
+                    at.display(),
+                    listed(&holds),
+                ),
+            }
+        }
     }
-    let holds: Vec<&str> = poses.entries().map(|(name, _)| name).collect();
-    Conclusion {
-        kind: "poses",
-        subject: PRESENCE_POSES.to_owned(),
-        held: false,
-        says: format!(
-            "{}, which {} does not hold — it holds {}. The edge refuses a script naming a pose \
-             the deployed library lacks, so every raise this configuration authors would be \
-             refused and the head would not move all run",
-            missing.join(" and "),
-            at.display(),
-            listed(&holds),
-        ),
+}
+
+/// The subject of the conclusion about the gaze ladder's poses.
+const GAZE_POSES: &str = "gaze poses";
+
+/// Whether the name table the host configuration names holds every pose the
+/// gaze ladder chooses among.
+///
+/// The gaze names a ladder pose on a wake and the edge resolves it against that
+/// table, so a rung the library lacks is a script the edge refuses on every wake
+/// whose talker stands at that rung's bearing.
+fn ladder(host: Option<&params::HostSettings>, base: &Path) -> Conclusion {
+    let conclusion = |held: bool, says: String| Conclusion {
+        kind: "gaze",
+        subject: GAZE_POSES.to_owned(),
+        held,
+        says,
+    };
+    let Some(host) = host else {
+        return conclusion(
+            false,
+            "the gaze ladder's poses resolve through the name table the host configuration \
+             names, and that configuration did not load"
+                .to_owned(),
+        );
+    };
+    let at = base.join(&host.library_names);
+    let poses = match read_poses(&at) {
+        Ok(poses) => poses,
+        Err(detail) => {
+            return conclusion(
+                false,
+                format!(
+                    "the gaze ladder's poses resolve through {}, which {detail}",
+                    at.display()
+                ),
+            );
+        }
+    };
+    match resolve_all(
+        &poses,
+        crate::gaze::LADDER.iter().map(|&(name, _)| (name, name)),
+    ) {
+        Ok(resolved) => {
+            let resolved: Vec<String> = resolved
+                .into_iter()
+                .map(|(name, id)| format!("`{name}`, pose {id}"))
+                .collect();
+            conclusion(
+                true,
+                format!(
+                    "`--gaze-elevation-deg` is set and the ladder it chooses among resolves: {}; \
+                     {} numbers them",
+                    resolved.join(", "),
+                    at.display(),
+                ),
+            )
+        }
+        Err(missing) => {
+            let holds: Vec<&str> = poses.entries().map(|(name, _)| name).collect();
+            conclusion(
+                false,
+                format!(
+                    "`--gaze-elevation-deg` is set and {} does not hold {} — it holds {}. A wake \
+                     whose gaze chose one of them would author a script the edge refuses, and the \
+                     head would answer neither that wake nor its reply",
+                    at.display(),
+                    listed(&missing),
+                    listed(&holds),
+                ),
+            )
+        }
     }
 }
 
@@ -357,10 +461,11 @@ fn playlist(host: Option<&params::HostSettings>, path: &Path, base: &Path) -> Co
         Ok(list) => conclusion(
             true,
             format!(
-                "{} is a playlist of {} motions, every one in the name table and none a probe or \
-                 bench motion",
+                "{} is a playlist of {} motions played at speed {}, every one in the name table \
+                 and none a probe or bench motion",
                 at.display(),
-                list.len()
+                list.len(),
+                list.speed()
             ),
         ),
         Err(error) => conclusion(false, one_line(&error.to_string())),
@@ -375,6 +480,28 @@ fn playlist(host: Option<&params::HostSettings>, path: &Path, base: &Path) -> Co
 /// fragment rather than two conclusions.
 fn read_poses(at: &Path) -> Result<PoseTable, String> {
     name_tables(at).map(|(_, poses)| poses)
+}
+
+/// Each named pose resolved through `poses` in one pass: every label with
+/// its pose id when all of them resolve, otherwise the labels of those that
+/// do not, in the order asked.
+fn resolve_all<'n, L>(
+    poses: &PoseTable,
+    named: impl IntoIterator<Item = (L, &'n str)>,
+) -> Result<Vec<(L, u16)>, Vec<L>> {
+    let mut resolved = Vec::new();
+    let mut missing = Vec::new();
+    for (label, name) in named {
+        match poses.resolve(name) {
+            Some(entry) => resolved.push((label, entry.pose_id)),
+            None => missing.push(label),
+        }
+    }
+    if missing.is_empty() {
+        Ok(resolved)
+    } else {
+        Err(missing)
+    }
 }
 
 /// `names` as a sentence lists them, each in backticks.
@@ -714,7 +841,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         assert!(about(&found, "pod_psk_file").held, "{found:?}");
         assert!(about(&found, "brenn.bridge.token_file").held, "{found:?}");
@@ -735,7 +862,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         assert!(
             !found
@@ -770,7 +897,7 @@ mod tests {
         );
         std::fs::remove_file(dir.join(file)).expect("a file the fixture wrote");
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let missing = about(&found, field);
         assert_eq!(missing.kind, "names", "{missing:?}");
@@ -804,7 +931,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         for (field, file) in MODELLED {
             let names = about(&found, field);
@@ -851,7 +978,7 @@ mod tests {
             &["reachy00", "reachy01"],
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let addressee = about(&found, "pod");
         assert_eq!(addressee.kind, "addressee", "{addressee:?}");
@@ -875,7 +1002,7 @@ mod tests {
             &["fixture-reachy", "reachy00"],
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let addressee = about(&found, "pod");
         assert!(addressee.held, "{addressee:?}");
@@ -897,7 +1024,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let addressee = about(&found, "pod");
         assert!(addressee.held, "{addressee:?}");
@@ -922,7 +1049,7 @@ mod tests {
             &["reachy00"],
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         assert!(
             !found
@@ -944,7 +1071,7 @@ mod tests {
         );
         std::fs::remove_file(dir.join("psk.toml")).expect("the fixture's key table");
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let names = about(&found, "pod_psk_file");
         assert!(!names.held, "{names:?}");
@@ -969,7 +1096,7 @@ mod tests {
         library_names(dir.as_ref(), "names.json");
         let speech = speech_fixture::carrying(dir.as_ref(), speech_fixture::Events::Dropped);
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         for field in ["pod_psk_file", "brenn.bridge.token_file"] {
             let refused = about(&found, field);
@@ -995,7 +1122,7 @@ mod tests {
         );
         speech_fixture::records(&speech, Path::new("framelogs"), 64 * 1024 * 1024);
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let says = speech_says(&found, &speech);
         assert!(
@@ -1028,7 +1155,7 @@ mod tests {
             );
             speech_fixture::records(&speech, Path::new("framelogs"), cap);
 
-            let found = inspect(&config, Some(&speech), None, dir.as_ref());
+            let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
             let says = speech_says(&found, &speech);
             assert!(says.contains(&format!("under a {printed} cap")), "{says:?}");
         }
@@ -1047,7 +1174,7 @@ mod tests {
         );
         speech_fixture::records(&speech, Path::new("framelogs"), 9_000_000_000_000_000_000);
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         let says = speech_says(&found, &speech);
         // The figure itself, not merely a unit: a cap read at the wrong
         // magnitude is one an operator would believe.
@@ -1065,7 +1192,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let says = speech_says(&found, &speech);
         assert!(says.contains("it records nothing"), "{says:?}");
@@ -1084,7 +1211,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         let says = speech_says(&found, &speech);
         assert!(
             says.contains("the gate declines above no_speech 0.2"),
@@ -1093,7 +1220,7 @@ mod tests {
         assert!(!says.contains("logprob"), "{says:?}");
 
         speech_fixture::declining_below(&speech, -0.9);
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         let says = speech_says(&found, &speech);
         assert!(
             says.contains("the gate declines above no_speech 0.2 or below logprob -0.9"),
@@ -1112,7 +1239,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let says = speech_says(&found, &speech);
         assert!(
@@ -1137,7 +1264,7 @@ mod tests {
         let store = dir.join("framelogs");
         speech_fixture::records(&speech, store.as_path(), 64 * 1024 * 1024);
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let refused = about(&found, "record.dir");
         assert_eq!(refused.kind, "absolute", "{refused:?}");
@@ -1170,7 +1297,7 @@ mod tests {
             64 * 1024 * 1024,
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let refused = about(&found, "record.dir");
         assert_eq!(refused.kind, "absolute", "{refused:?}");
@@ -1198,7 +1325,7 @@ mod tests {
         let text = std::fs::read_to_string(&speech).expect("the fixture");
         std::fs::write(&speech, text.replace("enabled = true", "enabled = false")).expect("a file");
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         assert!(
             !found
@@ -1223,7 +1350,7 @@ mod tests {
         );
         speech_fixture::records(&speech, Path::new("framelogs"), 64 * 1024 * 1024);
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         assert!(
             !found
@@ -1239,7 +1366,7 @@ mod tests {
         let config = params(dir.as_ref(), "names.json");
         std::fs::create_dir(dir.join("names.json")).expect("a directory in the way");
 
-        let found = inspect(&config, None, None, dir.as_ref());
+        let found = inspect(&config, None, None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         assert!(
             about(&found, "library_names_path")
@@ -1262,7 +1389,7 @@ mod tests {
         let text = std::fs::read_to_string(&speech).expect("the fixture");
         std::fs::write(&speech, format!("listen_adr = \"127.0.0.1:0\"\n{text}")).expect("a file");
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let refused = about(&found, &speech.display().to_string());
         assert_eq!(refused.kind, "speech_config");
@@ -1287,7 +1414,7 @@ mod tests {
         let config = dir.join("host_params.textproto");
         std::fs::write(&config, "pod: \"fixture-reachy\"\nnot_a_field: 1\n").expect("a file");
 
-        let found = inspect(&config, None, None, dir.as_ref());
+        let found = inspect(&config, None, None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let refused = about(&found, &config.display().to_string());
         assert_eq!(refused.kind, "params");
@@ -1300,7 +1427,7 @@ mod tests {
         let config = params(dir.as_ref(), "names.json");
         library_names(dir.as_ref(), "names.json");
 
-        let found = inspect(&config, None, None, dir.as_ref());
+        let found = inspect(&config, None, None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         assert!(
             found
@@ -1348,7 +1475,7 @@ mod tests {
         let token = std::fs::read_to_string(dir.join("bus.token")).expect("the token");
 
         let at = SyncTime::from_nanos(1);
-        let printed: String = inspect(&config, Some(&speech), None, dir.as_ref())
+        let printed: String = inspect(&config, Some(&speech), None, false, dir.as_ref())
             .iter()
             .map(|conclusion| conclusion_line(conclusion, at))
             .collect();
@@ -1365,7 +1492,7 @@ mod tests {
         let config = params(dir.as_ref(), "names.json");
         library_names(dir.as_ref(), "names.json");
 
-        let found = inspect(&config, None, None, Path::new(""));
+        let found = inspect(&config, None, None, false, Path::new(""));
         assert!(
             !settled(&found),
             "the table is in the scratch directory, not this process's: {found:?}",
@@ -1392,7 +1519,7 @@ mod tests {
         );
         speech_fixture::presence_poses(&speech, "stow", pose_fixture::NEUTRAL_POSE);
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let poses = about(&found, "presence poses");
         assert_eq!(poses.kind, "poses", "{poses:?}");
@@ -1424,7 +1551,7 @@ mod tests {
         );
         speech_fixture::presence_poses(&speech, "peek", pose_fixture::NEUTRAL_POSE);
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let poses = about(&found, "presence poses");
         assert!(!poses.held, "{poses:?}");
@@ -1437,6 +1564,69 @@ mod tests {
         assert!(
             !poses.says.contains("`presence_turn_pose`"),
             "the pose that resolves is not among the findings: {poses:?}",
+        );
+    }
+
+    #[test]
+    fn a_keep_wake_pose_is_not_looked_up_in_the_library() {
+        // `keep` names no pose: the wake holds the head where it stands, so only
+        // the turn pose is resolved, and the conclusion says why.
+        let dir = scratch_dir("reachy-host-check-poses-keep");
+        let config = params(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        speech_fixture::presence_poses(&speech, "keep", pose_fixture::NEUTRAL_POSE);
+
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
+        assert!(settled(&found), "{found:?}");
+        let poses = about(&found, "presence poses");
+        assert!(poses.held, "{poses:?}");
+        assert!(
+            poses.says.contains("`presence_wake_pose` is `keep`"),
+            "{poses:?}",
+        );
+        assert!(
+            poses
+                .says
+                .contains("`presence_turn_pose` names `neutral`, pose 0"),
+            "{poses:?}",
+        );
+        assert!(
+            !poses.says.contains("`presence_wake_pose` names"),
+            "{poses:?}",
+        );
+    }
+
+    #[test]
+    fn a_keep_wake_pose_with_a_missing_turn_pose_names_only_the_turn_pose() {
+        let dir = scratch_dir("reachy-host-check-poses-keep-missing");
+        let config = params(dir.as_ref(), "names.json");
+        library_names(dir.as_ref(), "names.json");
+        let speech = speech_fixture::carrying_named(
+            dir.as_ref(),
+            speech_fixture::Events::Dropped,
+            speech_fixture::Naming::PayloadRelative,
+        );
+        speech_fixture::presence_poses(&speech, "keep", "peek");
+
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
+        let poses = about(&found, "presence poses");
+        assert!(!poses.held, "{poses:?}");
+        assert!(
+            poses.says.contains("`presence_turn_pose` names `peek`"),
+            "{poses:?}",
+        );
+        assert!(
+            poses.says.contains("`presence_wake_pose` is `keep`"),
+            "{poses:?}",
+        );
+        assert!(
+            !poses.says.contains("`presence_wake_pose` names"),
+            "{poses:?}",
         );
     }
 
@@ -1455,7 +1645,7 @@ mod tests {
         );
         speech_fixture::presence_poses(&speech, "peek", "attentive");
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let poses = about(&found, "presence poses");
         assert!(!poses.held, "{poses:?}");
@@ -1481,7 +1671,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         let poses = about(&found, "presence poses");
         assert!(poses.held, "{poses:?}");
@@ -1508,7 +1698,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         let poses = about(&found, "presence poses");
         assert!(!poses.held, "{poses:?}");
@@ -1538,7 +1728,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(!settled(&found), "{found:?}");
         assert!(about(&found, "library_names_path").held, "{found:?}");
         let poses = about(&found, "presence poses");
@@ -1559,7 +1749,7 @@ mod tests {
             speech_fixture::Naming::PayloadRelative,
         );
 
-        let found = inspect(&config, Some(&speech), None, dir.as_ref());
+        let found = inspect(&config, Some(&speech), None, false, dir.as_ref());
         assert!(settled(&found), "{found:?}");
         assert!(
             !found
@@ -1611,7 +1801,13 @@ mod tests {
         let config = idle_names(dir.as_ref(), "names.json");
         playlist_file(dir.as_ref(), r#"{"playlist": ["a/one", "a/two"]}"#);
 
-        let found = inspect(&config, None, Some(Path::new("idle.json")), dir.as_ref());
+        let found = inspect(
+            &config,
+            None,
+            Some(Path::new("idle.json")),
+            false,
+            dir.as_ref(),
+        );
         let conclusion = idle(&found);
         assert!(conclusion.held, "{conclusion:?}");
         assert_eq!(conclusion.subject, "idle");
@@ -1625,7 +1821,13 @@ mod tests {
         let config = idle_names(dir.as_ref(), "names.json");
         playlist_file(dir.as_ref(), r#"{"playlist": ["a/one", "a/missing"]}"#);
 
-        let found = inspect(&config, None, Some(Path::new("idle.json")), dir.as_ref());
+        let found = inspect(
+            &config,
+            None,
+            Some(Path::new("idle.json")),
+            false,
+            dir.as_ref(),
+        );
         let conclusion = idle(&found);
         assert!(!conclusion.held, "{conclusion:?}");
         assert!(conclusion.says.contains("a/missing"), "{conclusion:?}");
@@ -1639,7 +1841,13 @@ mod tests {
         let dir = scratch_dir("reachy-host-check-idle-absent");
         let config = idle_names(dir.as_ref(), "names.json");
 
-        let found = inspect(&config, None, Some(Path::new("idle.json")), dir.as_ref());
+        let found = inspect(
+            &config,
+            None,
+            Some(Path::new("idle.json")),
+            false,
+            dir.as_ref(),
+        );
         let conclusion = idle(&found);
         assert!(!conclusion.held, "{conclusion:?}");
         assert!(
@@ -1654,7 +1862,7 @@ mod tests {
         let dir = scratch_dir("reachy-host-check-idle-unnamed");
         let config = idle_names(dir.as_ref(), "names.json");
 
-        let found = inspect(&config, None, None, dir.as_ref());
+        let found = inspect(&config, None, None, false, dir.as_ref());
         assert!(
             !found.iter().any(|conclusion| conclusion.kind == "idle"),
             "{found:?}",
@@ -1668,9 +1876,98 @@ mod tests {
         playlist_file(dir.as_ref(), r#"{"playlist": ["a/one", "a/two"]}"#);
         let config = dir.join("host_params.textproto");
 
-        let found = inspect(&config, None, Some(Path::new("idle.json")), dir.as_ref());
+        let found = inspect(
+            &config,
+            None,
+            Some(Path::new("idle.json")),
+            false,
+            dir.as_ref(),
+        );
         let conclusion = idle(&found);
         assert!(!conclusion.held, "{conclusion:?}");
         assert!(conclusion.says.contains("did not load"), "{conclusion:?}");
+    }
+
+    /// A host configuration whose name table holds the gaze ladder, numbered as
+    /// the committed library numbers it, and the stow.
+    fn ladder_names(dir: &Path, name: &str) -> PathBuf {
+        std::fs::write(
+            dir.join(name),
+            r#"{
+  "motions": [],
+  "poses": [
+    {"pose_id": 1, "name": "look_l30", "duration_ms": 600},
+    {"pose_id": 2, "name": "look_l60", "duration_ms": 900},
+    {"pose_id": 3, "name": "look_r30", "duration_ms": 600},
+    {"pose_id": 4, "name": "look_r60", "duration_ms": 900},
+    {"pose_id": 5, "name": "neutral", "duration_ms": 800},
+    {"pose_id": 8, "name": "stow", "duration_ms": 2000}
+  ]
+}
+"#,
+        )
+        .expect("a file");
+        params(dir, name)
+    }
+
+    #[test]
+    fn the_gaze_ladder_is_looked_for_when_the_gaze_is_on() {
+        let dir = scratch_dir("reachy-host-check-gaze");
+        let config = ladder_names(dir.as_ref(), "names.json");
+
+        let found = inspect(&config, None, None, true, dir.as_ref());
+        let conclusion = about(&found, "gaze poses");
+        assert!(conclusion.held, "{conclusion:?}");
+        assert!(
+            conclusion.says.contains("`neutral`, pose 5"),
+            "{conclusion:?}"
+        );
+        assert!(
+            conclusion.says.contains("`look_r60`, pose 4"),
+            "{conclusion:?}"
+        );
+        assert!(settled(&found), "{found:?}");
+    }
+
+    #[test]
+    fn a_ladder_pose_the_library_lacks_is_a_finding() {
+        let dir = scratch_dir("reachy-host-check-gaze-missing");
+        let config = params(dir.as_ref(), "library.names.json");
+        library_names(dir.as_ref(), "library.names.json");
+
+        let found = inspect(&config, None, None, true, dir.as_ref());
+        let conclusion = about(&found, "gaze poses");
+        assert!(!conclusion.held, "{conclusion:?}");
+        assert!(
+            conclusion
+                .says
+                .contains("does not hold `look_l30`, `look_r30`, `look_l60`, `look_r60` —"),
+            "{conclusion:?}"
+        );
+        assert!(!verdict(&found).held, "{found:?}");
+    }
+
+    #[test]
+    fn no_gaze_is_no_gaze_conclusion() {
+        let dir = scratch_dir("reachy-host-check-gaze-off");
+        let config = ladder_names(dir.as_ref(), "names.json");
+
+        let found = inspect(&config, None, None, false, dir.as_ref());
+        assert!(
+            !found.iter().any(|conclusion| conclusion.kind == "gaze"),
+            "{found:?}",
+        );
+    }
+
+    #[test]
+    fn a_gaze_with_no_host_configuration_is_not_held() {
+        let dir = scratch_dir("reachy-host-check-gaze-no-host");
+        let config = dir.join("host_params.textproto");
+
+        let found = inspect(&config, None, None, true, dir.as_ref());
+        let conclusion = about(&found, "gaze poses");
+        assert!(!conclusion.held, "{conclusion:?}");
+        assert!(conclusion.says.contains("did not load"), "{conclusion:?}");
+        assert!(!settled(&found), "{found:?}");
     }
 }

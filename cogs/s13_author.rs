@@ -1,11 +1,13 @@
 //! S13's input log.
 //!
-//! Five messages: the world the run begins in and four scripts. Two of them
+//! Six messages: the world the run begins in and five scripts. Two of them
 //! share the instant the survey's allowance runs out -- the opening script and
 //! the one that arrives while the engagement it opens is still in flight, which
 //! is how a script lands in `engaging` on a grid where an engagement is one
-//! driver cycle. The other two arrive inside the release the first session ends
-//! at, the second of them carrying the first's number.
+//! driver cycle. The third is a keep sent mid-raise and stamped a couple of
+//! cycles before it is sent, as an edge's receipt precedes the mover's first
+//! look. The other two arrive inside the release the first session ends at, the
+//! second of them carrying the first's number.
 //!
 //! The plant is never touched: every hold, the refusal and both engagements are
 //! the system's own answers.
@@ -17,8 +19,9 @@ use scenario::author::{self, InputLog};
 use scenario::cycle_at;
 
 use s13_scenario::{
-    CLOSING_SCRIPT_ID, HELD_SCRIPT_ID, OPENING_SCRIPT_ID, START_CYCLE, closing_cycle,
-    closing_steps, duplicate_cycle, duplicate_steps, held_steps, opening_steps, script_sent_cycle,
+    CLOSING_SCRIPT_ID, HELD_SCRIPT_ID, KEEP_SCRIPT_ID, OPENING_SCRIPT_ID, START_CYCLE,
+    closing_cycle, closing_steps, duplicate_cycle, duplicate_steps, held_steps, keep_sent_cycle,
+    keep_stamped_cycle, keep_steps, opening_steps, script_sent_cycle,
 };
 
 fn main() -> ExitCode {
@@ -39,6 +42,14 @@ fn write(dir: &Path) -> Result<(), clockwork_logs::LogError> {
     // and opens the engagement, and this one is screened against the phase that
     // acceptance left the machine in.
     log.script(cycle_at(script_sent_cycle()), HELD_SCRIPT_ID, &held_steps())?;
+    // A wake answered by a keep while the held script's raise is under way,
+    // stamped ahead of its sending.
+    log.script_stamped(
+        cycle_at(keep_sent_cycle()),
+        cycle_at(keep_stamped_cycle()),
+        KEEP_SCRIPT_ID,
+        &keep_steps(),
+    )?;
     log.script(
         cycle_at(closing_cycle()),
         CLOSING_SCRIPT_ID,

@@ -43,7 +43,7 @@ use brenn_reachy__cogs__config_clk_rs::{MoverParams, PoseLibraryConfig, ServoGai
 use brenn_reachy__cogs__motion_clk_rs::{MoverDial, MoverSignals, PoseDial, PoseSignals};
 use brenn_reachy__cogs__mover_clk_rs::MoverStateWire;
 use brenn_reachy__cogs__pose_state_clk_rs::PoseStateWire;
-use brenn_reachy__cogs__schedule_clk_rs::{SessionScheduleWire, StepKindWire};
+use brenn_reachy__cogs__schedule_clk_rs::{ScheduledStepWire, SessionScheduleWire, StepKindWire};
 use brenn_reachy__driver__pose_clk_rs::PoseSample;
 use brenn_reachy__motion__joints_clk_rs::JointFlags;
 use brenn_reachy__motion__tick_state_clk_rs::MotionSnap;
@@ -356,11 +356,11 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
 
     // Where the last period left the commanded stream. Carried across samples
     // rather than re-read per sample: the state is taken up once a sample for
-    // the tick, so the two numbers the overlay layer needs off it are read
-    // through that same take-up -- here before the first sample, and again at
-    // every point below that writes the state. `None` until a state that has
-    // been armed says where the stream stands: an unarmed slot commands nothing,
-    // and a machine is armed before any window is taken up.
+    // the tick, so what the overlay layer needs off it is read through that
+    // same take-up -- here before the first sample, and again at every point
+    // below that writes the state. `None` until a state that has been armed
+    // says where the stream stands: an unarmed slot commands nothing, and a
+    // machine is armed before any window is taken up.
     let mut anchor: Option<Anchor> = None;
 
     // Taken up once here and again per sample below. The slot is only
@@ -448,6 +448,11 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
             desired = Desired::NOTHING_DISPATCHED;
         }
 
+        // The step covering this instant, found once: what is dispatched and
+        // whether the base is kept both come from it.
+        let step = schedule.and_then(|schedule| covering(schedule, nominal));
+        let keep = step.is_some_and(|step| step.kind() == StepKindWire::BASE_KEEP);
+
         // A retarget is spent by the step that answers it, not by the schedule
         // arriving, so it cannot be lost to the gap it happens to land in: a
         // bumped epoch stands, sample over sample and across the slot, until a
@@ -455,8 +460,7 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
         // site, so the dispatch and the consumption cannot come apart.
         let asked = schedule.and_then(|schedule| {
             let retarget = schedule.epoch() != epoch_seen;
-            desired
-                .at(schedule, nominal)
+            step.and_then(Desired::dispatched_by)
                 .filter(|asked| retarget || *asked != desired)
                 .inspect(|&asked| {
                     desired = asked;
@@ -498,6 +502,7 @@ pub fn execute_mover(dial: &mut MoverDial<'_>) {
                 tick_hz: settings.tick_hz(),
                 fresh,
                 standing,
+                keep,
             },
             // Every armed state has one: it was read off the arming that
             // established this one, off the tick that last advanced it, or off
@@ -837,6 +842,15 @@ fn pace_of(pace: clockwork_rs::Duration) -> Duration {
     Duration::from_nanos(u64::try_from(pace.as_nanos()).unwrap_or(0))
 }
 
+/// The schedule step whose half-open span holds `nominal`, if one does: two
+/// steps may share an edge without either owning it twice.
+fn covering(schedule: &SessionScheduleWire, nominal: i64) -> Option<&ScheduledStepWire> {
+    schedule
+        .steps()
+        .iter()
+        .find(|step| (step.start().as_nanos()..step.end().as_nanos()).contains(&nominal))
+}
+
 /// The base move last dispatched: where it sends the machine, and how fast.
 ///
 /// A triple rather than a pose alone. "Nothing has been dispatched" is a state
@@ -883,19 +897,15 @@ impl Desired {
         ));
     }
 
-    /// What the schedule asks for at `nominal`, or `None` where it asks for
-    /// nothing new.
+    /// What is dispatched for `step`, the step covering an instant
+    /// ([`covering`]), or `None` where it asks for nothing new.
     ///
-    /// The step containing the instant, half-open, so two steps may share an
-    /// edge without either owning it twice. A step that keeps the base and an
-    /// instant no step covers both answer with the pose already dispatched --
-    /// the machine holds where the last move left it rather than being sent
-    /// somewhere by a gap in a schedule.
-    fn at(self, schedule: &SessionScheduleWire, nominal: i64) -> Option<Self> {
-        let step = schedule
-            .steps()
-            .iter()
-            .find(|step| (step.start().as_nanos()..step.end().as_nanos()).contains(&nominal))?;
+    /// A step that keeps the base asks for nothing new, so nothing is
+    /// dispatched; it is answered by the overlay layer through [`Ask::keep`],
+    /// which stops a running move where it stands. An instant no step covers
+    /// asks for nothing either, since the caller has no step, and a gap leaves
+    /// the machine wherever the last move takes it.
+    fn dispatched_by(step: &ScheduledStepWire) -> Option<Self> {
         (step.kind() == StepKindWire::BASE_POSTURE).then_some(Self {
             kind: StepKindWire::BASE_POSTURE,
             pose_id: step.pose_id(),

@@ -27,7 +27,7 @@
 use brenn_reachy__cogs__config_clk_rs::{ClipLibraryConfig, ClipLibraryConfigWire};
 use brenn_reachy__cogs__mover_clk_rs::MoverStateWire;
 use brenn_reachy__cogs__schedule_clk_rs::SessionScheduleWire;
-use brenn_reachy__motion__tick_state_clk_rs::MotionSnap;
+use brenn_reachy__motion__tick_state_clk_rs::{MotionMode, MotionSnap};
 use core::time::Duration;
 use motion_slots::configured;
 use overlay::{Base, Overlays, Windows, read_base, write_base};
@@ -82,7 +82,7 @@ pub(crate) struct Commanded {
 ///
 /// Read off the tick's state by the caller, which holds it validated for the
 /// tick anyway: the take-up of the hottest schema in the tree is one per sample,
-/// and a second one here to read two numbers would be paid at control rate.
+/// and a second one here to read three fields would be paid at control rate.
 #[derive(Clone, Copy)]
 pub(crate) struct Anchor {
     /// The setpoint the last period commanded. What a handover starts the base
@@ -90,6 +90,9 @@ pub(crate) struct Anchor {
     pub setpoint: JointTargets,
     /// How close the measured pose stood to the nearest envelope fence.
     pub margin: f64,
+    /// Whether the tick is running a move of its own: a `MoveTo` it accepted and
+    /// has neither finished nor abandoned. What a keep stops.
+    pub moving: bool,
 }
 
 impl Anchor {
@@ -98,6 +101,7 @@ impl Anchor {
         Self {
             setpoint: last_targets(snap),
             margin: snap.present_min_margin,
+            moving: snap.mode == MotionMode::Moving,
         }
     }
 }
@@ -117,6 +121,10 @@ pub(crate) struct Ask {
     /// handover has to keep going toward: a composed setpoint abandons the
     /// tick's move, so the move has to be re-planned here or it is lost.
     pub standing: Option<Goal>,
+    /// Whether the schedule step covering `now_ns` keeps the base: holds it where
+    /// it is commanded now. A running move is stopped where it stands, and
+    /// nothing else is commanded while the keep lasts.
+    pub keep: bool,
 }
 
 /// Screen the schedule's overlay windows, and say whether the layer is latched.
@@ -228,7 +236,8 @@ pub(crate) fn screen<'a>(
 ///
 /// - **No window, and the tick has the base.** The ordinary posture path: the
 ///   step the schedule asks for, on a clock long enough to carry the span it
-///   actually covers.
+///   actually covers — under a keep, a hold if the tick is running a move and
+///   nothing otherwise.
 /// - **A window covers it.** This cog has the base. It takes it over from the
 ///   setpoint the last period commanded, samples it, composes the players'
 ///   weighted deltas onto it and asks for the result as one tracked setpoint,
@@ -238,7 +247,8 @@ pub(crate) fn screen<'a>(
 ///   the composed setpoint that was last commanded toward where the schedule is
 ///   sending it. The contribution the closing window was carrying is absorbed
 ///   into that plan's starting point and decays under the same step bound as
-///   every other move, so the commanded stream is continuous across the close.
+///   every other move, so the commanded stream is continuous across the close
+///   — under a keep, a hold instead of the re-plan.
 /// - **A window covers it, and a row was taken over.** A row whose player is
 ///   replaced by a fresh join in the same period -- another motion's window in
 ///   the same row, or a player that could not be picked up -- is a row vacated
@@ -258,7 +268,11 @@ pub(crate) fn decide(
     anchor: &Anchor,
     counters: &mut MoverCounters,
 ) -> Commanded {
-    let Anchor { setpoint, margin } = *anchor;
+    let Anchor {
+        setpoint,
+        margin,
+        moving,
+    } = *anchor;
     // Reused memory holding whatever an older run left: a record that is not a
     // base is counted and cleared, which leaves the tick owning the base, and
     // the next window opening takes it over afresh.
@@ -280,14 +294,34 @@ pub(crate) fn decide(
             // both antennas between the stow and the working posture, mirrored,
             // so what the floor mostly does here is part the pair at their
             // crossing.
+            let command = if ask.keep {
+                // The tick's own mode says whether the keep has anything to
+                // stop: a move it is running is told to hold, and `hold()`
+                // leaves it `Holding`, so the next period's anchor reads that
+                // and nothing more is commanded. Nothing about the schedule's
+                // timing enters into it.
+                moving.then_some(MotionCommand::Hold)
+            } else {
+                ask.fresh
+                    .map(|goal| planned(cfg, &setpoint, goal, ask.tick_hz, counters))
+            };
             return Commanded {
-                command: ask
-                    .fresh
-                    .map(|goal| planned(cfg, &setpoint, goal, ask.tick_hz, counters)),
+                command,
                 overlaid: false,
             };
         };
         release(state, ask.now_ns);
+        if ask.keep {
+            // Under a keep the head stays where the closing window left it: the
+            // tick holds its last goal, which after a composed `Track` is the
+            // setpoint. Not gated on `moving`: a handover whose first `Track`
+            // the tick refused leaves it on the move the handover meant to
+            // abandon, and this is what stops it.
+            return Commanded {
+                command: Some(MotionCommand::Hold),
+                overlaid: false,
+            };
+        }
         // The hand-back, which is the re-anchor with nothing left riding: the
         // tick plans from the setpoint the last period commanded, so the
         // contribution the closing window was carrying is absorbed into the
@@ -888,10 +922,12 @@ mod tests {
                     tick_hz: TICK_HZ,
                     fresh: None,
                     standing: None,
+                    keep: false,
                 },
                 &Anchor {
                     setpoint,
                     margin: 1.0,
+                    moving: false,
                 },
                 &mut counters,
             );
@@ -923,10 +959,12 @@ mod tests {
                     tick_hz: TICK_HZ,
                     fresh: None,
                     standing: None,
+                    keep: false,
                 },
                 &Anchor {
                     setpoint: raw_setpoint,
                     margin: 1.0,
+                    moving: false,
                 },
                 &mut raw_counters,
             );
@@ -975,10 +1013,12 @@ mod tests {
                     tick_hz: TICK_HZ,
                     fresh: None,
                     standing: None,
+                    keep: false,
                 },
                 &Anchor {
                     setpoint,
                     margin: 1.0,
+                    moving: false,
                 },
                 &mut counters,
             );
@@ -1015,10 +1055,12 @@ mod tests {
                     tick_hz: TICK_HZ,
                     fresh: None,
                     standing: None,
+                    keep: false,
                 },
                 &Anchor {
                     setpoint,
                     margin: 1.0,
+                    moving: false,
                 },
                 &mut counters,
             );
@@ -1046,6 +1088,7 @@ mod tests {
             tick_hz: TICK_HZ,
             fresh: None,
             standing: None,
+            keep: false,
         };
         let first = decide(
             &MotionConfig::default(),
@@ -1056,6 +1099,7 @@ mod tests {
             &Anchor {
                 setpoint: base,
                 margin: 1.0,
+                moving: false,
             },
             &mut counters,
         );
@@ -1072,6 +1116,7 @@ mod tests {
             &Anchor {
                 setpoint: pre_first,
                 margin: 1.0,
+                moving: false,
             },
             &mut counters,
         );
@@ -1087,6 +1132,7 @@ mod tests {
             &Anchor {
                 setpoint: base,
                 margin: 1.0,
+                moving: false,
             },
             &mut counters,
         );
@@ -1103,6 +1149,7 @@ mod tests {
             &Anchor {
                 setpoint: control_first,
                 margin: 1.0,
+                moving: false,
             },
             &mut counters,
         );
@@ -1121,6 +1168,7 @@ mod tests {
             &Anchor {
                 setpoint: pre_vacate,
                 margin: 1.0,
+                moving: false,
             },
             &mut counters,
         );
@@ -1136,6 +1184,7 @@ mod tests {
             &Anchor {
                 setpoint: control_second,
                 margin: 1.0,
+                moving: false,
             },
             &mut counters,
         );
@@ -1168,6 +1217,7 @@ mod tests {
             tick_hz: TICK_HZ,
             fresh: None,
             standing: None,
+            keep: false,
         };
         let first = decide(
             &MotionConfig::default(),
@@ -1178,6 +1228,7 @@ mod tests {
             &Anchor {
                 setpoint: base,
                 margin: 1.0,
+                moving: false,
             },
             &mut counters,
         );
@@ -1193,6 +1244,7 @@ mod tests {
             &Anchor {
                 setpoint: first,
                 margin: 1.0,
+                moving: false,
             },
             &mut counters,
         );
@@ -1208,6 +1260,7 @@ mod tests {
             &Anchor {
                 setpoint: base,
                 margin: 1.0,
+                moving: false,
             },
             &mut counters,
         );
@@ -1224,6 +1277,7 @@ mod tests {
             &Anchor {
                 setpoint: control_first,
                 margin: 1.0,
+                moving: false,
             },
             &mut counters,
         );
@@ -1242,6 +1296,7 @@ mod tests {
             &Anchor {
                 setpoint: pre_vacate,
                 margin: 1.0,
+                moving: false,
             },
             &mut counters,
         );
@@ -1257,6 +1312,7 @@ mod tests {
             &Anchor {
                 setpoint: control_second,
                 margin: 1.0,
+                moving: false,
             },
             &mut counters,
         );
@@ -1376,10 +1432,12 @@ mod tests {
                 tick_hz: TICK_HZ,
                 fresh: None,
                 standing: None,
+                keep: false,
             },
             &Anchor {
                 setpoint,
                 margin: 1.0,
+                moving: false,
             },
             counters,
         );
@@ -1558,5 +1616,122 @@ mod tests {
             unchanged.head, roomy.head,
             "a head clock with room to spare is the clock that was asked for"
         );
+    }
+
+    /// An ask at `now_ns` with nothing fresh, over the usual period.
+    fn keep_ask(now_ns: i64, keep: bool, standing: Option<Goal>) -> Ask {
+        Ask {
+            now_ns,
+            period: Duration::from_millis(20),
+            tick_hz: TICK_HZ,
+            fresh: None,
+            standing,
+            keep,
+        }
+    }
+
+    /// One tick-owned `decide` with no window, from the default targets.
+    fn tick_owned(keep: bool, moving: bool) -> Option<MotionCommand> {
+        let mut state = MoverStateWire::new();
+        let mut counters = MoverCounters::default();
+        decide(
+            &MotionConfig::default(),
+            &mut state,
+            &Windows::default(),
+            false,
+            &keep_ask(0, keep, None),
+            &Anchor {
+                setpoint: JointTargets::default(),
+                margin: 1.0,
+                moving,
+            },
+            &mut counters,
+        )
+        .command
+    }
+
+    /// A keep over a tick running a move of its own stops it; the same instant
+    /// with no keep asks for nothing, because nothing fresh is asked for.
+    #[test]
+    fn a_keep_while_the_tick_owns_the_base_holds() {
+        assert_eq!(tick_owned(true, true), Some(MotionCommand::Hold));
+        assert_eq!(tick_owned(false, true), None);
+    }
+
+    /// A keep over a tick already holding has nothing to stop, so the second and
+    /// every later period under the same keep command nothing.
+    #[test]
+    fn a_keep_over_a_holding_tick_commands_nothing() {
+        assert_eq!(tick_owned(true, false), None);
+    }
+
+    /// The hand-back under a keep holds the composed setpoint the closing window
+    /// left, whatever the tick's mode; without the keep it re-plans toward where
+    /// the schedule was sending the base.
+    #[test]
+    fn a_keep_hand_back_holds_the_composed_setpoint() {
+        let (both, _, _, _, base) = mover_fixture_windows();
+        let mut raised = base;
+        raised.head_pose_body.translation.vector.z += 0.01;
+        let standing = Goal {
+            target: raised,
+            durations: MoveDurations::uniform(Duration::from_millis(800)),
+        };
+        // A window covering the first period takes the base over, and the
+        // second period, with no window, hands it back.
+        let handed_back = |keep: bool, moving: bool| {
+            let mut state = MoverStateWire::new();
+            let mut counters = MoverCounters::default();
+            let first = decide(
+                &MotionConfig::default(),
+                &mut state,
+                &both,
+                false,
+                &keep_ask(0, false, Some(standing)),
+                &Anchor {
+                    setpoint: base,
+                    margin: 1.0,
+                    moving: false,
+                },
+                &mut counters,
+            );
+            let Some(MotionCommand::Track(setpoint)) = first.command else {
+                panic!(
+                    "the open window tracks a composed setpoint: {:?}",
+                    first.command
+                );
+            };
+            let second = decide(
+                &MotionConfig::default(),
+                &mut state,
+                &Windows::default(),
+                false,
+                &keep_ask(20_000_000, keep, Some(standing)),
+                &Anchor {
+                    setpoint,
+                    margin: 1.0,
+                    moving,
+                },
+                &mut counters,
+            );
+            (
+                second.command,
+                read_base(state.base()).expect("base reads").is_none(),
+            )
+        };
+        for moving in [true, false] {
+            let (command, released) = handed_back(true, moving);
+            assert_eq!(command, Some(MotionCommand::Hold), "moving: {moving}");
+            assert!(
+                released,
+                "the hand-back releases the base (moving: {moving})"
+            );
+        }
+        let (command, released) = handed_back(false, false);
+        let Some(MotionCommand::MoveTo { target, .. }) = command else {
+            panic!("without a keep the hand-back re-plans: {command:?}");
+        };
+        assert_eq!(target.head_pose_body, raised.head_pose_body);
+        assert!(released);
     }
 }

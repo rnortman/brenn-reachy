@@ -11,6 +11,28 @@ Nothing has been released.
 
 ### Added
 
+- **The head turns toward whoever said the wake word.** With
+  `--gaze-elevation-deg`, which the launcher passes as 27, the voice host reads
+  the audio device's beam azimuth and the head's pose and raises the head to the
+  nearest of five new library poses, `look_l60`, `look_l30`, `neutral`,
+  `look_r30` and `look_r60`, holding that look through the reply. A wake with no
+  usable reading or pose takes the configured wake pose, and every wake says a
+  `gaze` line with what it chose or why it did not. Four more settle-evidence
+  scripts walk every transition into and out of the new poses. They have not
+  been run on a unit, so the clearance floor's measured residuals still cover
+  only the earlier five poses.
+- **The voice host knows where the head is.** The control process sends every
+  head pose estimate to the voice host on loopback port 7411, and the host keeps
+  the newest usable one for choosing where to look. `reachy-kin` gains `mic`,
+  which turns the audio device's beam azimuth (the direction its microphones
+  heard from) into a world bearing for any head
+  attitude, and `docs/frames.md` records the frames and the array's convention.
+- **A mirrored greeting.** `hello_wave_mirror` waves the other antenna with
+  the head tilted the other way, written by a new authoring tool,
+  `//cogs:mirror_clip`, that mirrors any clip document left for right.
+- **The idle playlist names its speed.** `cogs/idle.json` takes a top-level
+  `speed`, default 1.0; a speed outside 0.25–2.0 keeps the voice host from
+  starting rather than being narrowed.
 - **A power-cycled unit hears without being provisioned.** The motion payload
   (the bundle a unit fetches and runs) now carries the audio device's link
   configuration, `conf/audio.conf`, built from the speech configuration, and
@@ -48,6 +70,9 @@ Nothing has been released.
 
 ### Changed
 
+- **The idle loop dances a short, slow set.** Ten gentle clips at half speed
+  replace the full 68-clip list, which kept the microphone's voice gate open
+  and cost wakes.
 - **The imported vendor library is posed over the vendor's zero.** Every
   `pollen/*` clip now carries a numeric base: head at the neutral head pose
   and antennas at zero, for whichever of those two channels it drives; body
@@ -80,11 +105,11 @@ Nothing has been released.
   and the ambient Linux shell, tar and Python boundary remains.
 
 - **The command clearance floor is derived at 0.56 mm** from the largest
-  end-of-move leg residual measured over the committed pose library. Two
-  dedicated settle-evidence scripts walk every directed transition; the report
-  enforces an inclusive 18-count bound on those residuals per leg. The previous
-  1.5 mm figure was a de-torque settle measurement that answered a different
-  question; the derivation and evidence are in the source.
+  end-of-move leg residual measured over the committed pose library. Dedicated
+  settle-evidence scripts walk every directed transition; the report enforces
+  an inclusive 18-count bound on those residuals per leg. The previous 1.5 mm
+  figure was a de-torque settle measurement that answered a different question;
+  the derivation and evidence are in the source.
 
 - **Planned antenna moves take the shortest representable arc.** The previous
   policy sent planned sweeps past the antenna's sideways point the long way
@@ -406,6 +431,11 @@ Nothing has been released.
 
 ### Fixed
 
+- **A wake that freezes the head now freezes it.** A speech script that keeps
+  the head and then stows it — what `presence_wake_pose = "keep"` sends — is
+  no longer dropped by the idle loop as a stale stow.
+- **A keep stops a move already under way** instead of letting it run to its
+  target, whenever the script reaches the motion loop.
 - **A fetched payload's voice host starts.** The robot's voice host refused
   its own key table ("psk file mode 0644 is group/world-accessible") because a
   fetched payload is unpacked world-readable on the unit, so a robot started

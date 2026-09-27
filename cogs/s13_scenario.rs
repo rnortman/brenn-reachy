@@ -1,13 +1,20 @@
 //! S13, a wake at the wrong moments: the scenario that says a script arriving
 //! mid-maneuver is the next command rather than an error.
 //!
-//! A wake word can land at any instant, and three of them here land while a
+//! A wake word can land at any instant, and four of them here land while a
 //! maneuver is under way: one while the engagement it opened is
-//! still in flight, one while the machine is being let go of at the end of the
-//! schedule, and one that is a duplicate of a script already waiting. What the
-//! run says is that each of the first two is *held* -- answered on the phase the
-//! maneuver ends in -- and that the duplicate is refused for its number and
-//! nothing else.
+//! still in flight, one while the raise that engagement runs is under way, one
+//! while the machine is being let go of at the end of the schedule, and one that
+//! is a duplicate of a script already waiting. What the run says is that the
+//! first and third are *held* -- answered on the phase the maneuver ends in --
+//! and that the duplicate is refused for its number and nothing else.
+//!
+//! The second is a wake answered by a keep: it replaces the schedule mid-raise,
+//! stops the raise where it stands and holds there until the same fold the held
+//! script carried ends the session. It is stamped ahead of its delivery, as an
+//! edge's receipt is, so the keep already covers the period before the first
+//! sample that sees it. Because the keep stops the held script's raise, that
+//! script's upright is not asserted.
 //!
 //! The two holds are drained the two ways there are. The one held while the
 //! engagement is in flight becomes a replacement the wake the machine goes
@@ -42,8 +49,18 @@ pub const OPENING_SCRIPT_ID: u32 = 30;
 /// hold is put through demands.
 pub const HELD_SCRIPT_ID: u32 = 31;
 
+/// The number of the script that arrives while the held script's raise is under
+/// way: a wake whose response is a keep. Strictly greater than the one before it.
+pub const KEEP_SCRIPT_ID: u32 = 32;
+
+/// How far before its sending the keep script is stamped, in cycles: the edge's
+/// receipt preceding the mover's first look at it. More than a period, so the
+/// keep already covers the period before the first sample that sees it -- the
+/// shape a stateless "was the previous period a keep" test misses.
+pub const KEEP_LAG_CYCLES: i64 = 2;
+
 /// The number of the script that arrives while the machine is being let go of.
-pub const CLOSING_SCRIPT_ID: u32 = 32;
+pub const CLOSING_SCRIPT_ID: u32 = 33;
 
 /// How long the opening script asks for the machine to be up, in cycles.
 ///
@@ -95,6 +112,19 @@ pub fn second_up_cycles() -> i64 {
 #[must_use]
 pub fn stow_start_cycle() -> i64 {
     up_start_cycle() + up_cycles()
+}
+
+/// The cycle the keep script is sent on: halfway through the raise's head clock,
+/// so the tick is `Moving` with most of the move ahead of it.
+#[must_use]
+pub fn keep_sent_cycle() -> i64 {
+    up_start_cycle() + scenario::up_cycles() / 2
+}
+
+/// The cycle the keep script is stamped with.
+#[must_use]
+pub fn keep_stamped_cycle() -> i64 {
+    keep_sent_cycle() - KEEP_LAG_CYCLES
 }
 
 /// The cycle the first schedule runs out on, which is what ends the first
@@ -209,4 +239,26 @@ pub fn closing_steps() -> [Step; 2] {
 #[must_use]
 pub fn duplicate_steps() -> [Step; 2] {
     closing_steps()
+}
+
+/// The two steps of the keep script: hold the base where it is commanded from
+/// the stamp until the held script's fold would begin, and then that same fold.
+/// The ending is the held script's, so every later instant in the run is
+/// unchanged.
+#[must_use]
+pub fn keep_steps() -> [Step; 2] {
+    [
+        Step {
+            start_ns: cycle_at(keep_stamped_cycle()),
+            end_ns: cycle_at(stow_start_cycle()),
+            pose: None,
+            move_ms: None,
+        },
+        Step {
+            start_ns: cycle_at(stow_start_cycle()),
+            end_ns: cycle_at(disengage_cycle()),
+            pose: Some(scenario::STOW_POSE),
+            move_ms: None,
+        },
+    ]
 }

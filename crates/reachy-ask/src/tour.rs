@@ -11,15 +11,16 @@
 //! which motions exist: the sidecar the box loads is the plan.
 //!
 //! The plan is a list of scripts and the sender's own clock for them. Each
-//! script raises or keeps the base, plays one motion at 1.0x, and ends with a
-//! stow it will normally never reach, because the next script replaces it
-//! first; the stow is what folds the machine if the next script never comes.
+//! script raises the base to `neutral`, plays one motion at 1.0x, and ends
+//! with a stow it will normally never reach, because the next script replaces
+//! it first; the stow is what folds the machine if the next script never comes.
 //! The sender sends script `k + 1` once script `k`'s play window has closed by
 //! its own clock. That clock is the sender's and not the session's: the window
 //! opens at the wake that took the script, so a replacement lands up to one
 //! session period either side of the window's real close, and the tail of a
 //! blend-out it lands inside of is absorbed by the mover's hand-back rather
-//! than stepped.
+//! than stepped, because the replacement names `neutral` and the hand-back
+//! plans toward it from wherever the blend-out stood.
 //!
 //! The run ends itself. A tour long enough for a whole library is too long to
 //! sit under a fixed budget that would then be spent idling, and a run that has
@@ -44,8 +45,10 @@ use crate::gesture::UP_AFTER_MS;
 ///
 /// The pose library's own pace for `neutral`, restated here because this sender
 /// states no pace of its own. The first motion cannot start until the raise has
-/// finished, so this is a term of the first script's play offset; a case below
-/// pins it against the library the payload carries.
+/// finished, so this is a term of the first script's play offset; every later
+/// leg's move back to `neutral` runs on the same clock inside
+/// [`PLAY_AFTER_MS`]. A case below pins it against the library the payload
+/// carries.
 ///
 pub const UP_DURATION_MS: u64 = 800;
 
@@ -54,9 +57,9 @@ pub const UP_DURATION_MS: u64 = 800;
 ///
 /// It is also the gap between one motion's window closing and the next one's
 /// first frame, because the next script's play sits this far past its own
-/// receipt: long enough for the base to have taken itself back after the
-/// previous overlay faded, short enough that a library's worth of them is not
-/// most of the run.
+/// receipt: long enough for the move back to `neutral`, at the library's pace,
+/// to finish before the next motion's first frame, short enough that a
+/// library's worth of them is not most of the run.
 pub const PLAY_AFTER_MS: u64 = 1000;
 
 /// How long after a motion's window closes the script's own stow would open,
@@ -301,8 +304,12 @@ impl Tour {
 /// base has to be somewhere before a delta rides on it; the edge cannot date a
 /// request forward, so the arming lead lives in the offset exactly as the wake
 /// gesture's does, and the first motion waits out the raise on top of that.
-/// Every later leg says `keep`: the machine is already up, and restating `up`
-/// would retarget the base mid-hand-back.
+/// Every later leg names `neutral` at offset 0. The machine is already up, and
+/// the posture is what brings the base back after the previous motion: a
+/// replacement opens a fresh epoch, so the posture is dispatched at once, and
+/// the hand-back plans from the composed setpoint toward it. A `keep` would
+/// instead hold the base wherever the last composed setpoint left it, with
+/// whatever part of the previous motion's blend-out had not yet decayed.
 fn leg(index: usize, name: &str, entry: &MotionEntry) -> Result<Leg, String> {
     let seq = index as u64 + 1;
     let (base, play_after) = if index == 0 {
@@ -311,7 +318,7 @@ fn leg(index: usize, name: &str, entry: &MotionEntry) -> Result<Leg, String> {
             UP_AFTER_MS + UP_DURATION_MS + PLAY_AFTER_MS,
         )
     } else {
-        (Step::keep(0), PLAY_AFTER_MS)
+        (Step::new(0, crate::gesture::NEUTRAL_POSE), PLAY_AFTER_MS)
     };
     let window_close_ms = play_after + entry.window.span_ms(1.0);
     let stow_after = window_close_ms + STOW_MARGIN_MS;
@@ -587,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_leg_raises_and_every_later_one_keeps_the_base() {
+    fn the_first_leg_raises_and_every_later_one_re_centres_the_base() {
         let tour = Tour::of(&two()).expect("a two-motion library");
         let first = &tour.legs()[0];
         assert_eq!(
@@ -607,11 +614,24 @@ mod tests {
         let later = &tour.legs()[1];
         assert_eq!(
             later.script.steps()[0].action.base(),
-            Some(&Base::Keep),
-            "restating the raise pose would retarget the base mid-hand-back",
+            Some(&Base::Pose {
+                name: crate::gesture::NEUTRAL_POSE.to_owned(),
+                move_ms: None,
+            }),
+            "a later leg re-centres the base on the raise pose; a keep would hold whatever the last blend-out left",
         );
         assert_eq!(later.script.steps()[0].after_ms, 0);
         assert_eq!(later.script.steps()[1].after_ms, PLAY_AFTER_MS);
+    }
+
+    #[test]
+    fn the_move_back_to_neutral_finishes_before_the_next_motion() {
+        const {
+            assert!(
+                PLAY_AFTER_MS > UP_DURATION_MS,
+                "a later leg's move back to neutral runs at the library's pace for it and must be over before the next motion's window opens",
+            );
+        };
     }
 
     #[test]

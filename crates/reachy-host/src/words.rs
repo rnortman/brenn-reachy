@@ -7,7 +7,9 @@
 //! started and what it composed — and the prefix the binary refuses under on its
 //! way out. The idle loop's words live here too, the ones it narrates its seams,
 //! its yielding to speech and its backoff under, so that a run analyzer joins on
-//! one spelling.
+//! one spelling; the pose feed's two, for a feed that is not running and a
+//! datagram of the wrong size on it; and the gaze line, what the gaze policy
+//! chose on a wake or why it chose nothing.
 //!
 //! They are here rather than beside each emitter because one of the emitters is
 //! `src/main.rs`, which is a crate of its own and nothing else can import. The
@@ -39,6 +41,20 @@ pub const UNOFFERED: &str = "unoffered";
 
 /// An accepted script that never reached the session's port.
 pub const UNSENT: &str = "unsent";
+
+/// The pose feed is not running: its port would not bind, its thread would not
+/// start, or a run of socket errors stopped it. `detail` says which.
+pub const POSE_UNFED: &str = "pose_unfed";
+
+/// The first datagram on the pose feed port that was not one estimate's size,
+/// said once per run. `got` and `want` are the byte counts.
+pub const POSE_WRONG_SIZE: &str = "pose_wrong_size";
+
+/// One line per wake the gaze policy was asked about, whether it chose or
+/// declined: `pod`, `chosen` (the pose, or null), `reason` (`bearing` or
+/// `end_fire` on a choice, the decline's word otherwise), `azimuth_deg` and
+/// `bearing_deg` (null where there was none), `doa_count` and `wake_end_sample`.
+pub const GAZE: &str = "gaze";
 
 /// The idle loop opened a resting machine with a clip.
 pub const IDLE_OPENED: &str = "idle_opened";

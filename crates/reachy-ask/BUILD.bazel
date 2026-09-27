@@ -63,6 +63,10 @@ rust_test(
         "fixtures/greeting.json",
         "fixtures/settle-evidence-1.json",
         "fixtures/settle-evidence-2.json",
+        "fixtures/settle-evidence-3.json",
+        "fixtures/settle-evidence-4.json",
+        "fixtures/settle-evidence-5.json",
+        "fixtures/settle-evidence-6.json",
     ],
     deps = [
         "//cogs:scenario",

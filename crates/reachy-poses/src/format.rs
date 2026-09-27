@@ -628,8 +628,8 @@ pub(crate) fn descriptor(message: &str) -> MessageDescriptor {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_DESCRIPTION_LEN, MAX_DURATION_MS, Pose, PoseDoc, PoseDocError, QUAT_NORM_TOL,
-        parse_document,
+        DOCUMENT_EXT, MAX_DESCRIPTION_LEN, MAX_DURATION_MS, Pose, PoseDoc, PoseDocError,
+        QUAT_NORM_TOL, parse_document,
     };
     use crate::record::reduce_antennas;
     use reachy_kin::ik::min_pose_margin;
@@ -792,8 +792,8 @@ mod tests {
     /// Every committed document fits the field it is written into.
     #[test]
     fn the_committed_descriptions_fit_the_document() {
-        for name in ["stow", "neutral", "peek", "peek_tilt", "hello"] {
-            let pose = committed(name);
+        for name in committed_names() {
+            let pose = committed(&name);
             assert!(pose.description().len() <= MAX_DESCRIPTION_LEN);
         }
     }
@@ -985,6 +985,30 @@ mod tests {
         std::fs::read_to_string(&path).unwrap_or_else(|why| panic!("{path:?}: {why}"))
     }
 
+    /// The file stem of every committed document, sorted, read from the
+    /// directory the test target stages.
+    fn committed_names() -> Vec<String> {
+        let dir = std::env::var("POSE_DOCUMENTS").expect("the documents are staged for this test");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|why| panic!("{dir}: {why}"))
+            .map(|entry| entry.unwrap_or_else(|why| panic!("{dir}: {why}")).path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == DOCUMENT_EXT))
+            .map(|path| {
+                path.file_stem()
+                    .expect("a document has a stem")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert!(
+            names.len() >= 2,
+            "{dir} holds {} pose document(s): the test target's data attribute is not supplying them",
+            names.len()
+        );
+        names
+    }
+
     /// The committed documents, read from the runfiles.
     fn committed(name: &str) -> Pose {
         Pose::from_text(&committed_text(name))
@@ -996,9 +1020,13 @@ mod tests {
     /// emitted from, so this fails before the emitter does.
     #[test]
     fn the_committed_documents_load_under_their_own_names() {
-        for name in ["stow", "neutral", "peek", "peek_tilt", "hello"] {
-            let pose = committed(name);
-            assert_eq!(pose.name(), name, "a document's name is its file stem");
+        for name in committed_names() {
+            let pose = committed(&name);
+            assert_eq!(
+                pose.name(),
+                name.as_str(),
+                "a document's name is its file stem"
+            );
             assert!(pose.duration_ms() > 0);
             assert!(
                 !pose.description().is_empty(),

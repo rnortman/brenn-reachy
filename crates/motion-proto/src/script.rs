@@ -114,6 +114,16 @@ pub const MIN_SPEED: f64 = 0.25;
 /// change that crosses the seam without its mirror fails there.
 pub const MAX_SPEED: f64 = 2.0;
 
+/// Whether a play step may carry `speed`: within [`MIN_SPEED`]..=[`MAX_SPEED`],
+/// which no non-finite number is.
+///
+/// The wire's one statement of the rule, for a door that screens a speed
+/// before any script is built as much as for a script's own validation.
+#[must_use]
+pub fn speed_is_carried(speed: f64) -> bool {
+    (MIN_SPEED..=MAX_SPEED).contains(&speed)
+}
+
 /// The most overlays a script may ever have running at one instant.
 ///
 /// Each one costs a sampled frame and a layer of composition every tick, and
@@ -1083,7 +1093,7 @@ fn validate(steps: &[Step], timeout_ms: u64) -> Result<(), ScriptError> {
                         name: play.name.clone(),
                     });
                 }
-                if !play.speed.is_finite() || play.speed < MIN_SPEED || play.speed > MAX_SPEED {
+                if !speed_is_carried(play.speed) {
                     return Err(ScriptError::SpeedOutOfBounds {
                         index,
                         speed: play.speed,
@@ -1998,6 +2008,39 @@ mod tests {
             MotionScript::decode(over).expect_err("nine times"),
             DecodeError::Invalid(ScriptError::SpeedOutOfBounds { index: 1, .. })
         ));
+    }
+
+    /// The predicate is the rule a play step is validated by, at the bounds,
+    /// just past them and for every non-finite number.
+    #[test]
+    fn speed_is_carried_is_the_play_step_s_rule() {
+        for speed in [
+            MIN_SPEED,
+            MAX_SPEED,
+            1.0,
+            MIN_SPEED - 1e-9,
+            MAX_SPEED + 1e-9,
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(
+                speed_is_carried(speed),
+                MotionScript::new(
+                    "reachy00",
+                    1,
+                    vec![
+                        Step::new(0, NEUTRAL),
+                        Step::play(10, Play::at_speed("pod/nod", speed)),
+                    ],
+                    30_000,
+                )
+                .is_ok(),
+                "{speed}"
+            );
+        }
     }
 
     /// A motion name that cannot join against any library is the publisher's

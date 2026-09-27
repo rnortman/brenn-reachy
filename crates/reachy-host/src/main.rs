@@ -1,21 +1,26 @@
-//! The voice host's entry point: configuration, the two loopback ports, and the
-//! loop that owns the edge.
+//! The voice host's entry point: configuration, the three loopback ports, and
+//! the loop that owns the edge.
 //!
-//! Six steps, in this order and for a reason. Read the configuration, because
+//! Seven steps, in this order and for a reason. Read the configuration, because
 //! the name this machine answers to and every screen below is a value out of
 //! it. Read the clip name table, because an overlay names a motion and only
 //! that file says which index a name has. Read the idle playlist, where one was
 //! named, because it names motions and only that table says whether they are
-//! there. Bind the reports port, because a
-//! second host already reading it is the one failure that has to stop this one
-//! before anything is asked of the machine. Install the stop flag. Start the
-//! voice pipeline, where one was configured, with its motion seams pointed at
-//! the gate this loop owns. Then run the loop.
+//! there. Bind the reports port, because a second host already reading it is
+//! the one failure that has to stop this one before anything is asked of the
+//! machine. Bind the pose feed's port beside it; the thread that reads it starts
+//! once the host has said it started. Install the stop flag. Start the voice pipeline,
+//! where one was configured, with its motion seams pointed at the gate this loop
+//! owns and, where `--gaze-elevation-deg` was given, the gaze policy reading the
+//! pose feed. Then run the loop.
 //!
 //! Every one of those failures is an exit and none of them is retried: a
 //! configuration that does not parse, a name table that is not there, a
-//! playlist that names a motion the table does not hold, a port somebody else
-//! holds, a speech configuration the pipeline will not run on.
+//! playlist that names a motion the table does not hold, a reports port somebody
+//! else holds, a speech configuration the pipeline will not run on.
+//! The pose feed is not among them: a feed that cannot start, or that stops
+//! mid-run, costs the choice of where to look and nothing else, so it is a
+//! `pose_unfed` line, a run without a feed, and nothing in the exit status.
 //! A speech configuration that is not on the machine at all is not among them —
 //! that is how a unit starts, and it runs the edge half and says so.
 //! What supervises this process decides what happens next,
@@ -43,19 +48,21 @@ use std::time::Duration;
 
 use clockwork_rs::SyncTime;
 use reachy_edge::{
-    Accepted, Author, DATAGRAM_CAP, HostEdge, LOOPBACK, MotionTable, POLL, PoseTable,
-    REPORTS_OUT_PORT, SCRIPTS_IN_PORT, Surface, edge_line_with, now, origin_word,
+    Accepted, Author, DATAGRAM_CAP, ESTIMATES_OUT_PORT, HostEdge, LOOPBACK, MotionTable, POLL,
+    PoseTable, REPORTS_OUT_PORT, SCRIPTS_IN_PORT, Surface, edge_line_with, now, origin_word,
 };
 use reachy_host::check;
 use reachy_host::edge::{Console, Publishing, Speaker};
+use reachy_host::gaze::{Elevation, Gaze};
 use reachy_host::idle::{Idle, Verdict};
 use reachy_host::intents::{Intents, Waiting, waking_queue};
 use reachy_host::params::{self, HostSettings};
-use reachy_host::sinks::Stdout;
+use reachy_host::pose_feed::PoseFeed;
+use reachy_host::sinks::{Lines, Stdout};
 use reachy_host::voice::{NotRunning, Voice, absent_line, composed_line, silent_line};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
-use speech_surface::{ALERT_QUEUE_DEPTH, AlertRaiser, alert_seam};
+use speech_surface::{ALERT_QUEUE_DEPTH, AlertRaiser, WakeGaze, alert_seam};
 
 /// Where the configuration is read from unless `--config` says otherwise.
 ///
@@ -66,7 +73,7 @@ use speech_surface::{ALERT_QUEUE_DEPTH, AlertRaiser, alert_seam};
 const DEFAULT_CONFIG: &str = "host/host_params.textproto";
 
 /// What the invocation asked for.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Options {
     /// Which configuration to run on.
     config: PathBuf,
@@ -85,6 +92,9 @@ struct Options {
     /// With it, the host dances the playlist whenever nobody is speaking.
     /// Without it, no loop runs.
     idle: Option<PathBuf>,
+    /// The talker's assumed elevation, where the head is to look toward whoever
+    /// said the wake word. Without it every wake takes the configured wake pose.
+    gaze: Option<Elevation>,
     /// Load both configurations, look for every file they name, and exit —
     /// without binding a port, starting a pipeline or touching a robot.
     ///
@@ -100,6 +110,7 @@ impl Default for Options {
             config: PathBuf::from(DEFAULT_CONFIG),
             speech_config: None,
             idle: None,
+            gaze: None,
             check: false,
         }
     }
@@ -108,11 +119,11 @@ impl Default for Options {
 /// How to invoke this, for a refusal to print.
 fn usage() -> String {
     format!(
-        "usage: reachy-host [--config PATH] [--speech-config PATH] [--idle PATH] [--check]\n\
+        "usage: reachy-host [--config PATH] [--speech-config PATH] [--idle PATH] [--gaze-elevation-deg DEG] [--check]\n\
          \n\
          Runs the robot's voice host: binds {REPORTS_OUT_PORT} on loopback, follows the\n\
-         session's story, and sends compiled scripts to {SCRIPTS_IN_PORT}. One line of JSON\n\
-         per row, on stdout.\n\
+         session's story, binds {ESTIMATES_OUT_PORT} for the head's pose estimates, and sends\n\
+         compiled scripts to {SCRIPTS_IN_PORT}. One line of JSON per row, on stdout.\n\
          \n\
          With --speech-config naming a file that is there, the voice pipeline runs in\n\
          this process too, and the scripter's decisions and the bus's motion channel both\n\
@@ -125,14 +136,22 @@ fn usage() -> String {
          after a session that ended on a fault. A playlist that does not load is a nonzero\n\
          exit.\n\
          \n\
+         With --gaze-elevation-deg, a wake the voice pipeline hears turns the head toward\n\
+         whoever said it: the array's reading, the head's pose off the pose feed, and the\n\
+         talker's assumed elevation in degrees choose one of five library poses, and every\n\
+         wake says a `gaze` line with what it chose or why it did not. Without it, or when\n\
+         no reading or pose is usable, the wake takes the configured wake pose.\n\
+         \n\
          With --check the process instead loads both configurations and the playlist, where\n\
          one is named, looks for every file they name relative to the working directory,\n\
          prints one line of JSON per conclusion and exits: zero when everything loaded and\n\
-         every file is there. It binds nothing and prints no file's contents.\n\
+         every file is there, and, with --gaze-elevation-deg, whether the library holds the\n\
+         five poses the gaze chooses among. It binds nothing and prints no file's contents.\n\
          \n\
          Nothing is retried and nothing is persisted. A configuration that does not parse,\n\
-         a clip name table that is not there and a port already held are each a nonzero\n\
-         exit.\n\
+         a clip name table that is not there and a reports port already held are each a\n\
+         nonzero exit; a pose feed port that will not bind is a line, and the host runs\n\
+         without the head's pose.\n\
          \n\
          Default: --config {DEFAULT_CONFIG}."
     )
@@ -157,7 +176,7 @@ fn main() -> ExitCode {
 
 /// What the invocation asks for.
 ///
-/// Four optional flags, three of them naming a path. A word this does not know is a
+/// Five optional flags, three of them naming a path, one a number. A word this does not know is a
 /// refusal rather than something ignored: a host run on the shipped
 /// configuration when an operator meant a unit's own would answer to the wrong
 /// pod name.
@@ -170,6 +189,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut given = false;
     let mut speech_given = false;
     let mut idle_given = false;
+    let mut gaze_given = false;
     let mut args = args;
     while let Some(word) = args.next() {
         match word.as_str() {
@@ -183,6 +203,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
             "--idle" => {
                 let value = path_once(&word, args.next(), &mut idle_given)?;
                 options.idle = Some(PathBuf::from(value));
+            }
+            "--gaze-elevation-deg" => {
+                options.gaze = Some(elevation_once(&word, args.next(), &mut gaze_given)?);
             }
             "--check" => {
                 if options.check {
@@ -207,6 +230,26 @@ fn path_once(flag: &str, value: Option<String>, given: &mut bool) -> Result<Stri
     }
     *given = true;
     Ok(value)
+}
+
+/// A flag's elevation in degrees, refused if the flag carried none, was given
+/// before, is not a number, or is not strictly between -90 and 90.
+///
+/// The value is taken before the repeat is refused, as [`path_once`] does.
+fn elevation_once(
+    flag: &str,
+    value: Option<String>,
+    given: &mut bool,
+) -> Result<Elevation, String> {
+    let value = value.ok_or_else(|| format!("{flag} needs a number of degrees"))?;
+    if *given {
+        return Err(format!("{flag} was given twice"));
+    }
+    *given = true;
+    let degrees: f64 = value
+        .parse()
+        .map_err(|_| format!("{flag} needs a number of degrees, got `{value}`"))?;
+    Elevation::from_degrees(degrees).map_err(|error| format!("{flag} {value}: {error}"))
 }
 
 /// Say what both configurations would load, and exit on whether they would.
@@ -241,6 +284,7 @@ fn write_check(out: &mut impl io::Write, options: &Options, base: &Path) -> bool
         &options.config,
         options.speech_config.as_deref(),
         options.idle.as_deref(),
+        options.gaze.is_some(),
         base,
     );
     let at = now();
@@ -283,6 +327,14 @@ fn run(options: &Options) -> Result<(), String> {
     reports
         .set_read_timeout(Some(POLL))
         .map_err(|error| format!("setting the read timeout on the reports port: {error}"))?;
+    let estimates = UdpSocket::bind((LOOPBACK, ESTIMATES_OUT_PORT)).map_err(|error| {
+        let cause = if error.kind() == io::ErrorKind::AddrInUse {
+            "; something else on this machine already holds it"
+        } else {
+            ""
+        };
+        format!("binding the pose feed port {ESTIMATES_OUT_PORT} on loopback: {error}{cause}")
+    });
     // An ephemeral source port: the seam identifies a datagram by the port it
     // arrived on, never by where it came from.
     let scripts = UdpSocket::bind((LOOPBACK, 0))
@@ -311,12 +363,22 @@ fn run(options: &Options) -> Result<(), String> {
     let mut host = HostEdge::new(settings.edge.clone(), table, poses);
     let mut surface = Publishing::new(Console);
     surface.say(started_line(&settings, &options.config, now()));
+    // Where the head is feeds the choice of where to look and nothing else
+    // here, so a feed that cannot run is a line and a run without one.
+    let feed = start_pose_feed(estimates, Arc::new(Stdout));
+    let gaze = options.gaze.map(|elevation| {
+        Arc::new(Gaze::new(
+            elevation,
+            feed.as_ref().map(PoseFeed::reader),
+            Arc::new(Stdout),
+        )) as Arc<dyn WakeGaze>
+    });
 
     // Only a run that drains the seam gives the alerts anywhere to go, so the
     // raising end comes back only from one that does. Installed after the fact
     // because the surface exists before it: the host's first line is written
     // before there is anything to publish through.
-    let started = start_voice(options, &intents, &mut surface)?;
+    let started = start_voice(options, &intents, gaze, &mut surface)?;
     let voice = install_alerts(&mut surface, started);
     // The queue's other sending handle. Dropped here so that the only holders
     // are the pipeline's two sinks: the loop reads a disconnected queue the same
@@ -340,7 +402,25 @@ fn run(options: &Options) -> Result<(), String> {
     // loop that broke is still a process on its way out, and the pod link's
     // open segments finalize either way.
     let stopped = voice.and_then(Voice::stop);
+    if let Some(feed) = feed {
+        feed.stop();
+    }
     outcome(followed, stopped)
+}
+
+/// The pose feed on the port `bound` holds, or `None` with a line saying why not.
+fn start_pose_feed(bound: Result<UdpSocket, String>, lines: Arc<dyn Lines>) -> Option<PoseFeed> {
+    let started = bound.and_then(|socket| {
+        PoseFeed::start(socket, Arc::clone(&lines))
+            .map_err(|error| format!("starting the pose feed: {error}"))
+    });
+    match started {
+        Ok(feed) => Some(feed),
+        Err(detail) => {
+            lines.say(reachy_host::pose_feed::unfed_line(&detail, now()));
+            None
+        }
+    }
 }
 
 /// Put the raising and speaking ends on the surface, and hand back the pipeline
@@ -373,16 +453,19 @@ fn install_alerts<S: Surface>(
 /// rather than dropped, because a loop that broke because the machine itself is
 /// unhealthy — descriptors exhausted, memory gone — is exactly the case where
 /// the voice half's own death is part of the diagnosis, and nothing else in
-/// this process would ever mention it.
+/// this process would ever mention it. The pose feed is not an answer here: a
+/// feed that stopped said so when it did, and it ended nothing.
 fn outcome(followed: Result<(), String>, stopped: Option<String>) -> Result<(), String> {
-    match (followed, stopped) {
-        (Err(loop_error), Some(voice_error)) => Err(format!(
-            "{loop_error} — and stopping the voice pipeline also failed: {voice_error}"
-        )),
-        (Err(loop_error), None) => Err(loop_error),
-        (Ok(()), Some(voice_error)) => Err(voice_error),
-        (Ok(()), None) => Ok(()),
+    let mut said = followed.err();
+    if let Some(voice_error) = stopped {
+        said = Some(match said {
+            Some(lead) => {
+                format!("{lead} — and stopping the voice pipeline also failed: {voice_error}")
+            }
+            None => voice_error,
+        });
     }
+    said.map_or(Ok(()), Err)
 }
 
 /// What a composed voice half left this process holding.
@@ -415,6 +498,7 @@ struct Started {
 fn start_voice(
     options: &Options,
     intents: &Intents,
+    gaze: Option<Arc<dyn WakeGaze>>,
     surface: &mut impl Surface,
 ) -> Result<Option<Started>, String> {
     let Some(path) = &options.speech_config else {
@@ -435,7 +519,7 @@ fn start_voice(
     // answer for. Absence is the loader's own answer and not a `stat` asked
     // ahead of it, which cannot tell a file that is not there from one this
     // process may not look at.
-    match Voice::start(path, intents.clone(), Arc::new(Stdout), inbox) {
+    match Voice::start(path, intents.clone(), Arc::new(Stdout), inbox, gaze) {
         Ok(voice) => {
             let carries = voice.carries_alerts();
             let speaker = voice.speaker();
@@ -734,6 +818,7 @@ mod tests {
         Alert, Author, EdgeConfig, HostEdge, LOOPBACK, MotionTable, Origin, POLL, PoseTable,
         Surface, now,
     };
+    use reachy_host::gaze::Elevation;
     use reachy_host::intents::queue;
     use reachy_host::{Idle, Playlist};
     use reachy_scratch::scratch_dir;
@@ -745,7 +830,8 @@ mod tests {
 
     use super::{
         DEFAULT_CONFIG, Options, Publishing, READ_FLOOR, Started, Until, Voice, alert_seam, follow,
-        install_alerts, outcome, parse, read_timeout, start_voice, unsent_line, until, voice_ended,
+        install_alerts, outcome, parse, read_timeout, start_pose_feed, start_voice, unsent_line,
+        until, voice_ended,
     };
 
     /// The pod the fixture bodies are addressed to.
@@ -1059,7 +1145,7 @@ mod tests {
             ..Options::default()
         };
         let voice = Some(
-            start_voice(&options, &intents, &mut said)
+            start_voice(&options, &intents, None, &mut said)
                 .expect("a running host")
                 .expect("a composed pipeline")
                 .voice,
@@ -1471,6 +1557,7 @@ mod tests {
                 config: PathBuf::from(DEFAULT_CONFIG),
                 speech_config: None,
                 idle: None,
+                gaze: None,
                 check: false,
             }),
         );
@@ -1484,6 +1571,7 @@ mod tests {
                 config: PathBuf::from("/run/reachy/host_params.textproto"),
                 speech_config: None,
                 idle: None,
+                gaze: None,
                 check: false,
             }),
         );
@@ -1501,6 +1589,31 @@ mod tests {
         assert!(parsed(&["--config", "a", "--config", "b"]).is_err());
         assert!(parsed(&["--speech-config"]).is_err());
         assert!(parsed(&["--speech-config", "a", "--speech-config", "b"]).is_err());
+    }
+
+    #[test]
+    fn a_gaze_elevation_can_be_named() {
+        assert_eq!(
+            parsed(&["--gaze-elevation-deg", "27"]),
+            Ok(Options {
+                gaze: Some(Elevation::from_degrees(27.0).expect("a lawful elevation")),
+                ..Options::default()
+            }),
+        );
+    }
+
+    #[test]
+    fn a_gaze_elevation_needs_a_number_in_range_and_is_given_once() {
+        let refused = |words: &[&str]| parsed(words).expect_err("a refusal");
+        let bare = refused(&["--gaze-elevation-deg"]);
+        assert!(bare.contains("needs a number"), "{bare}");
+        let word = refused(&["--gaze-elevation-deg", "up"]);
+        assert!(word.contains("`up`"), "{word}");
+        let vertical = refused(&["--gaze-elevation-deg", "90"]);
+        assert!(vertical.contains("-90 and 90"), "{vertical}");
+        refused(&["--gaze-elevation-deg", "NaN"]);
+        let twice = refused(&["--gaze-elevation-deg", "27", "--gaze-elevation-deg", "27"]);
+        assert!(twice.contains("given twice"), "{twice}");
     }
 
     #[test]
@@ -1589,6 +1702,7 @@ mod tests {
             config,
             speech_config: Some(speech),
             idle: None,
+            gaze: None,
             check: true,
         };
 
@@ -1616,6 +1730,7 @@ mod tests {
             config,
             speech_config: None,
             idle: Some(PathBuf::from("idle.json")),
+            gaze: None,
             check: true,
         };
 
@@ -1644,6 +1759,7 @@ mod tests {
             config,
             speech_config: Some(speech),
             idle: None,
+            gaze: None,
             check: true,
         };
 
@@ -1660,6 +1776,48 @@ mod tests {
                 .contains("brenn.bridge.token_file"),
             "{verdict}",
         );
+    }
+
+    #[test]
+    fn the_preflight_looks_for_the_ladder_when_a_gaze_elevation_is_given() {
+        // The fixture's name table carries `neutral` and `stow` only, so every
+        // `look_*` rung is missing.
+        let dir = scratch_dir("reachy-host-checked-gaze");
+        let config = checkable(dir.as_ref());
+        let options = Options {
+            config,
+            speech_config: None,
+            idle: None,
+            gaze: Some(Elevation::from_degrees(27.0).expect("a lawful elevation")),
+            check: true,
+        };
+
+        let (settled, lines) = checked_lines(&options, dir.as_ref());
+        assert!(!settled, "{lines:?}");
+        let objects: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .unwrap_or_else(|_| panic!("one line of JSON: {line}"))
+            })
+            .collect();
+        let gaze: Vec<&serde_json::Value> = objects
+            .iter()
+            .filter(|object| object["subject"] == "gaze poses")
+            .collect();
+        assert_eq!(gaze.len(), 1, "{lines:?}");
+        assert_eq!(gaze[0]["kind"], "gaze", "{lines:?}");
+        assert_eq!(gaze[0]["held"], false, "{lines:?}");
+        assert!(
+            gaze[0]["says"]
+                .as_str()
+                .expect("a sentence")
+                .contains("`look_l30`"),
+            "{lines:?}",
+        );
+        let verdict = objects.last().expect("a verdict");
+        assert_eq!(verdict["kind"], "checked", "{lines:?}");
+        assert_eq!(verdict["held"], false, "{lines:?}");
     }
 
     #[test]
@@ -1702,7 +1860,7 @@ mod tests {
         };
         // `is_none()` rather than a match on the value: a running `Voice` owns
         // a runtime and is deliberately not `Debug`.
-        let started = start_voice(&options, &intents, &mut said).expect("a running host");
+        let started = start_voice(&options, &intents, None, &mut said).expect("a running host");
         assert!(
             started.is_none(),
             "no pipeline was composed, so there is nothing to hold and nowhere to publish",
@@ -1729,7 +1887,7 @@ mod tests {
             speech_config: Some(path.clone()),
             ..Options::default()
         };
-        let started = start_voice(&options, &intents, &mut said)
+        let started = start_voice(&options, &intents, None, &mut said)
             .expect("a running host")
             .expect("a composed pipeline");
         // The fixture configuration names no bus, so the composed run drops its
@@ -1767,7 +1925,7 @@ mod tests {
             speech_config: Some(path),
             ..Options::default()
         };
-        let started = start_voice(&options, &intents, &mut surface)
+        let started = start_voice(&options, &intents, None, &mut surface)
             .expect("a running host")
             .expect("a composed pipeline");
         assert!(
@@ -1814,7 +1972,7 @@ mod tests {
             speech_config: Some(path),
             ..Options::default()
         };
-        let started = start_voice(&options, &intents, &mut surface)
+        let started = start_voice(&options, &intents, None, &mut surface)
             .expect("a running host")
             .expect("a composed pipeline");
         assert!(started.alerts.is_none(), "nowhere to publish, so no raiser");
@@ -1847,7 +2005,7 @@ mod tests {
             speech_config: Some(path),
             ..Options::default()
         };
-        let voice = start_voice(&options, &intents, &mut surface)
+        let voice = start_voice(&options, &intents, None, &mut surface)
             .expect("a running host")
             .expect("a composed pipeline")
             .voice;
@@ -1896,7 +2054,7 @@ mod tests {
             speech_config: Some(path),
             ..Options::default()
         };
-        let voice = start_voice(&options, &intents, &mut surface)
+        let voice = start_voice(&options, &intents, None, &mut surface)
             .expect("a running host")
             .expect("a composed pipeline")
             .voice;
@@ -1964,7 +2122,7 @@ mod tests {
         assert_eq!(
             outcome(
                 Ok(()),
-                Some("the voice pipeline stopped on an error: x".to_owned())
+                Some("the voice pipeline stopped on an error: x".to_owned()),
             ),
             Err("the voice pipeline stopped on an error: x".to_owned()),
         );
@@ -1975,12 +2133,54 @@ mod tests {
         );
     }
 
+    /// Every line a pose feed said, in order.
+    #[derive(Default)]
+    struct Said(std::sync::Mutex<Vec<String>>);
+
+    impl reachy_host::sinks::Lines for Said {
+        fn say(&self, line: String) {
+            self.0.lock().expect("an unpoisoned recorder").push(line);
+        }
+    }
+
+    impl Said {
+        fn lines(&self) -> Vec<serde_json::Value> {
+            self.0
+                .lock()
+                .expect("an unpoisoned recorder")
+                .iter()
+                .map(|line| serde_json::from_str(line).expect("one JSON object"))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_pose_feed_that_cannot_start_is_a_line_and_no_feed() {
+        let said = Arc::new(Said::default());
+        let detail = "binding the pose feed port 7411 on loopback: held";
+        assert!(start_pose_feed(Err(detail.to_owned()), Arc::clone(&said) as _).is_none());
+        let lines = said.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["kind"], "pose_unfed");
+        assert_eq!(lines[0]["detail"], detail);
+    }
+
+    #[test]
+    fn a_pose_feed_on_a_bound_port_starts_and_says_nothing() {
+        let said = Arc::new(Said::default());
+        let socket = UdpSocket::bind((LOOPBACK, 0)).expect("an ephemeral port");
+        let feed = start_pose_feed(Ok(socket), Arc::clone(&said) as _).expect("a running feed");
+        assert!(said.lines().is_empty(), "nothing is said");
+        feed.stop();
+        assert!(said.lines().is_empty(), "nothing is said");
+    }
+
     #[test]
     fn a_host_asked_for_no_speech_configuration_says_that_instead() {
         let (intents, _waiting) = queue();
         let mut said = Recorded::default();
         let started =
-            start_voice(&Options::default(), &intents, &mut said).expect("a running host");
+            start_voice(&Options::default(), &intents, None, &mut said).expect("a running host");
         assert!(
             started.is_none(),
             "no pipeline was composed, and nothing to publish through",

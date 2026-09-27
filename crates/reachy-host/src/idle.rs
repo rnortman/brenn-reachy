@@ -12,13 +12,17 @@
 //! the edge answered. Nothing here reads a clock, opens a socket or sleeps.
 //!
 //! Who owns the head is said once, in the wire's vocabulary. A script that is
-//! not a bare stow takes the head for speech once the edge has accepted it; a
+//! not a bare stow — one that plays nothing, keeps nothing and names no pose
+//! but `stow` — takes the head for speech once the edge has accepted it; a
 //! script whose last step is a future `stow` says when speech is done with it,
 //! and the `resting` that ends the session running it hands it back; a body
 //! the session holds across a `resting` keeps the head through that one. The
 //! loop owns it otherwise. A body the edge refused never ran and changes
 //! nothing. A bare stow from a sender that no longer owns the head is stale,
 //! and the loop has it dropped rather than offered: it would fold a head that is dancing.
+//!
+//! Every clip plays at the playlist's one `speed`, and the seam and the stow are
+//! timed on the clock that speed runs.
 //!
 //! The loop reads three row kinds — `phase_changed`, `session_ended` and
 //! `script_refused` — and waits on none of them. The story can lose rows, and a
@@ -50,7 +54,10 @@
 use std::path::{Path, PathBuf};
 
 use clockwork_rs::SyncTime;
-use motion_proto::{Action, Base, MotionScript, Play, STOW_POSE, SeqSource, Step};
+use motion_proto::{
+    Action, Base, MAX_SPEED, MIN_SPEED, MotionScript, Play, PlayWindow, STOW_POSE, SeqSource, Step,
+    speed_is_carried,
+};
 use reachy_edge::Origin;
 use reachy_edge::names::{MotionEntry, MotionTable};
 use reachy_edge::narrate::{edge_line_with, origin_word, row_says};
@@ -111,12 +118,17 @@ pub const NO_STORY_GRACE_MS: u64 = 10_000;
 /// content anyone watched as a dance.
 pub const EXCLUDED_PREFIXES: [&str; 2] = ["probe/", "bench/"];
 
+/// The speed a playlist that names none plays at: the recorded pace.
+pub const DEFAULT_SPEED: f64 = 1.0;
+
 /// The motions the loop picks from, checked against the deployed name table.
 ///
-/// File order is kept. At least two entries, no duplicates, none excluded.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// File order is kept. At least two entries, no duplicates, none excluded, and
+/// one speed the wire admits.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Playlist {
     entries: Vec<(String, MotionEntry)>,
+    speed: f64,
 }
 
 /// The playlist file's one shape. A misspelt field is refused rather than read
@@ -125,6 +137,9 @@ pub struct Playlist {
 #[serde(deny_unknown_fields)]
 struct PlaylistFile {
     playlist: Vec<String>,
+    /// The multiplier on every clip's clock; absent is [`DEFAULT_SPEED`].
+    #[serde(default)]
+    speed: Option<f64>,
 }
 
 impl Playlist {
@@ -135,12 +150,17 @@ impl Playlist {
     /// [`IdleError::Malformed`] for text that is not `{"playlist": [..]}`; for
     /// the first name that is excluded, repeated or not in `table`,
     /// [`IdleError::Excluded`], [`IdleError::Duplicate`] or
-    /// [`IdleError::UnknownMotion`]; [`IdleError::TooFew`] for fewer than two.
+    /// [`IdleError::UnknownMotion`]; [`IdleError::TooFew`] for fewer than two;
+    /// [`IdleError::Speed`] for a speed a play step cannot carry.
     pub fn parse(text: &str, table: &MotionTable) -> Result<Self, IdleError> {
         let file: PlaylistFile =
             serde_json::from_str(text).map_err(|error| IdleError::Malformed {
                 detail: error.to_string(),
             })?;
+        let speed = file.speed.unwrap_or(DEFAULT_SPEED);
+        if !speed_is_carried(speed) {
+            return Err(IdleError::Speed { speed });
+        }
         let mut entries: Vec<(String, MotionEntry)> = Vec::with_capacity(file.playlist.len());
         for name in file.playlist {
             if EXCLUDED_PREFIXES
@@ -162,7 +182,13 @@ impl Playlist {
                 count: entries.len(),
             });
         }
-        Ok(Self { entries })
+        Ok(Self { entries, speed })
+    }
+
+    /// The multiplier every clip plays at.
+    #[must_use]
+    pub fn speed(&self) -> f64 {
+        self.speed
     }
 
     /// How many motions the playlist holds.
@@ -186,7 +212,7 @@ impl Playlist {
 }
 
 /// Why a playlist was not loaded.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum IdleError {
     /// The file could not be read.
     #[error("the playlist at {} could not be read: {detail}", path.display())]
@@ -225,6 +251,12 @@ pub enum IdleError {
     TooFew {
         /// How many it holds.
         count: usize,
+    },
+    /// A speed a play step cannot carry: refused, never narrowed to the nearest bound.
+    #[error("the playlist asks for speed {speed}, and a play step carries {min}..={max}", min = MIN_SPEED, max = MAX_SPEED)]
+    Speed {
+        /// The speed it asks for.
+        speed: f64,
     },
 }
 
@@ -550,7 +582,10 @@ impl Idle {
             script_id,
             motion_id: entry.motion_id,
             due: minus_ms(
-                plus_ms(arrival, play.saturating_add(entry.window.duration_ms)),
+                plus_ms(
+                    arrival,
+                    play.saturating_add(clip_wall_ms(entry.window, self.playlist.speed)),
+                ),
                 SEAM_LEAD_MS,
             ),
         });
@@ -776,14 +811,14 @@ impl Idle {
         now: SyncTime,
     ) -> Result<MotionScript, motion_proto::ScriptError> {
         let (name, entry) = &self.playlist.entries[index];
+        let speed = self.playlist.speed;
         let play = play_ms(shape);
         let stow_at = play
-            .saturating_add(entry.window.duration_ms)
-            .saturating_add(entry.window.blend_out_ms)
+            .saturating_add(entry.window.span_ms(speed))
             .saturating_add(STOW_MARGIN_MS);
         let steps = vec![
             Step::new(0, NEUTRAL_POSE),
-            Step::play(play, Play::new(name.clone())),
+            Step::play(play, Play::at_speed(name.clone(), speed)),
             Step::new(stow_at, STOW_POSE),
         ];
         // The edge's mark is shared with speech, so the loop numbers above the
@@ -820,6 +855,17 @@ const fn play_ms(shape: Shape) -> u64 {
     }
 }
 
+/// How long a loop clip's own motion runs on the wall clock at `speed`: its
+/// recorded length divided by the speed, rounded up as the edge rounds the
+/// window it compiles. The blend-out is not included.
+fn clip_wall_ms(window: PlayWindow, speed: f64) -> u64 {
+    PlayWindow {
+        blend_out_ms: 0,
+        ..window
+    }
+    .span_ms(speed)
+}
+
 /// When an `active` that began at `since` has lasted long enough to reset the
 /// ladder.
 fn ladder_reset_at(since: SyncTime) -> SyncTime {
@@ -833,7 +879,7 @@ fn decoded(body: &[u8]) -> Option<MotionScript> {
         .and_then(|text| MotionScript::decode(text).ok())
 }
 
-/// Whether `script` plays nothing and names no pose but the stow.
+/// Whether `script` plays nothing, holds nothing, and names no pose but the stow.
 fn bare_stow(script: &MotionScript) -> bool {
     let mut posed = false;
     for step in script.steps() {
@@ -845,7 +891,7 @@ fn bare_stow(script: &MotionScript) -> bool {
                 }
                 posed = true;
             }
-            Action::Base(Base::Keep) => {}
+            Action::Base(Base::Keep) => return false,
         }
     }
     posed
@@ -879,10 +925,15 @@ mod tests {
     use super::*;
 
     use brenn_reachy__motion__reports_clk_rs::{RefusalReasonWire, ReportKindWire};
-    use motion_proto::PlayWindow;
     use reachy_edge::{EdgeConfig, HostEdge};
 
     const POD: &str = "fixture-reachy";
+
+    /// The speed the fixture playlist names.
+    const SPEED: f64 = 0.5;
+
+    /// The fixture playlist's text.
+    const PLAYLIST: &str = r#"{"playlist":["a/one","a/two","a/three"],"speed":0.5}"#;
 
     /// A round epoch the fixture's instants are counted from.
     const T0_MS: u64 = 1_800_000_000_000;
@@ -922,8 +973,7 @@ mod tests {
     }
 
     fn playlist() -> Playlist {
-        Playlist::parse(r#"{"playlist":["a/one","a/two","a/three"]}"#, &table())
-            .expect("the fixture playlist")
+        Playlist::parse(PLAYLIST, &table()).expect("the fixture playlist")
     }
 
     /// A surface that keeps its lines.
@@ -1029,12 +1079,12 @@ mod tests {
         assert_eq!(script.pod(), POD);
         let name = motion(script);
         let w = window(name);
-        let stow = play + w.duration_ms + w.blend_out_ms + STOW_MARGIN_MS;
+        let stow = play + w.span_ms(SPEED) + STOW_MARGIN_MS;
         assert_eq!(
             script.steps(),
             &[
                 Step::new(0, NEUTRAL_POSE),
-                Step::play(play, Play::new(name)),
+                Step::play(play, Play::at_speed(name, SPEED)),
                 Step::new(stow, STOW_POSE),
             ],
         );
@@ -1311,8 +1361,7 @@ mod tests {
         assert!(error.to_string().contains(&missing.display().to_string()));
 
         let good = dir.join("idle.json");
-        let text = r#"{"playlist":["a/one","a/two","a/three"]}"#;
-        std::fs::write(&good, text).expect("a scratch file");
+        std::fs::write(&good, PLAYLIST).expect("a scratch file");
         assert_eq!(Idle::load(&good, &table()), Ok(playlist()));
     }
 
@@ -1374,12 +1423,13 @@ mod tests {
         let mut rig = resting_loop();
         let (_, opening) = rig.send(0);
         rig.engage(0);
-        let due = OPEN_PLAY_MS + window(motion(&opening)).duration_ms - SEAM_LEAD_MS;
+        let due = OPEN_PLAY_MS + clip_wall_ms(window(motion(&opening)), SPEED) - SEAM_LEAD_MS;
         assert_eq!(rig.poll(1_000).due, Some(t(due)));
 
         rig.quiet(due - 1);
         let (_, replacement) = rig.send(due);
-        let next = due + SEAM_PLAY_MS + window(motion(&replacement)).duration_ms - SEAM_LEAD_MS;
+        let next =
+            due + SEAM_PLAY_MS + clip_wall_ms(window(motion(&replacement)), SPEED) - SEAM_LEAD_MS;
         assert_eq!(rig.poll(due).due, Some(t(next)));
         rig.quiet(next - 1);
         assert!(rig.poll(next).send.is_some());
@@ -1697,7 +1747,7 @@ mod tests {
         let next = rig.standing_due();
         assert_eq!(
             next,
-            resume + SEAM_PLAY_MS + window(motion(&script)).duration_ms - SEAM_LEAD_MS
+            resume + SEAM_PLAY_MS + clip_wall_ms(window(motion(&script)), SPEED) - SEAM_LEAD_MS
         );
         rig.quiet(next - 1);
         rig.send(next);
@@ -1720,6 +1770,73 @@ mod tests {
         let dropped = rig.surface.of(IDLE_DROPPED_STOW);
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0]["origin"], "local");
+    }
+
+    /// A wake that keeps the head and then stows it is not a stale stow: it
+    /// holds the head, so it takes it for speech.
+    #[test]
+    fn a_keep_led_speech_script_takes_the_head() {
+        let mut rig = active_loop();
+        let keep = body(vec![Step::keep(0), Step::new(30_000, STOW_POSE)], 35_000);
+        assert_eq!(rig.speech(&keep, 1_500), Verdict::Offer);
+        assert_eq!(rig.surface.count(IDLE_DROPPED_STOW), 0);
+        rig.accept(&keep, 1_500);
+        assert_eq!(rig.idle.owner, Owner::Speech);
+        assert_eq!(rig.surface.count(IDLE_SUSPENDED), 1);
+    }
+
+    #[test]
+    fn a_playlist_naming_no_speed_plays_at_the_recorded_pace() {
+        let playlist = Playlist::parse(r#"{"playlist":["a/one","a/two","a/three"]}"#, &table())
+            .expect("a playlist naming no speed");
+        assert_eq!(playlist.speed(), DEFAULT_SPEED);
+    }
+
+    #[test]
+    fn a_named_speed_is_read() {
+        assert_eq!(playlist().speed(), 0.5);
+    }
+
+    #[test]
+    fn a_speed_the_wire_cannot_carry_is_refused() {
+        let text = |speed: f64| format!(r#"{{"playlist":["a/one","a/two"],"speed":{speed:?}}}"#);
+        for speed in [0.2, 2.5, 0.0, -1.0] {
+            assert_eq!(
+                Playlist::parse(&text(speed), &table()),
+                Err(IdleError::Speed { speed }),
+                "{speed}"
+            );
+        }
+        for speed in [MIN_SPEED, MAX_SPEED] {
+            let playlist = Playlist::parse(&text(speed), &table()).expect("a bound is admitted");
+            assert_eq!(playlist.speed(), speed);
+        }
+        // JSON has no NaN, so a non-finite speed is refused as text and never
+        // reaches the range check as a number.
+        assert!(matches!(
+            Playlist::parse(r#"{"playlist":["a/one","a/two"],"speed":NaN}"#, &table()),
+            Err(IdleError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_loop_clip_runs_on_the_wall_clock_at_its_speed() {
+        for (duration_ms, blend_out_ms, speed, wall) in [
+            (2000, 200, 0.5, 4000),
+            (1501, 200, 0.5, 3002),
+            (2000, 200, 1.0, 2000),
+            (1501, 200, 2.0, 751),
+        ] {
+            let window = PlayWindow {
+                duration_ms,
+                blend_out_ms,
+            };
+            assert_eq!(
+                clip_wall_ms(window, speed),
+                wall,
+                "{duration_ms} ms at {speed}"
+            );
+        }
     }
 
     #[test]

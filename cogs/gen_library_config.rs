@@ -1283,6 +1283,80 @@ mod tests {
         assert!(left.iter().any(|value| *value > 0.2872683519680999));
     }
 
+    /// Whether `hello_wave_mirror`'s head channel is mirrored, or copied because
+    /// the mirrored posture would leave the envelope.
+    const HELLO_WAVE_MIRROR_HEAD_MIRRORED: bool = true;
+
+    /// `hello_wave_mirror` is `hello_wave` reflected through the head's x–z
+    /// plane, frame for frame, over the same base. The map is restated here
+    /// rather than taken from the tool that wrote the document.
+    #[test]
+    fn hello_wave_mirror_is_the_frame_mirror_of_hello_wave() {
+        // Over `neutral` the deltas mirror directly only because neutral is its
+        // own mirror.
+        let neutral = *poses()
+            .iter()
+            .find(|pose| pose.name() == "neutral")
+            .expect("neutral is committed")
+            .targets();
+        let rotation = neutral.head_pose_body.rotation.quaternion();
+        assert_eq!(neutral.head_pose_body.translation.vector.y, 0.0);
+        assert_eq!(rotation.i, 0.0);
+        assert_eq!(rotation.k, 0.0);
+        assert_eq!(neutral.body_yaw, 0.0);
+        assert_eq!(neutral.antennas[0], -neutral.antennas[1]);
+
+        let source = document("hello_wave");
+        let mirror = document("hello_wave_mirror");
+        assert_eq!(mirror.name, "hello_wave_mirror");
+        assert_eq!(mirror.base, Some(BaseDoc::Named("neutral".to_owned())));
+        assert_eq!(mirror.base, source.base);
+        assert_eq!(mirror.channels, source.channels);
+        assert_eq!(mirror.frame_hz, source.frame_hz);
+        assert_eq!(mirror.blend_in_ms, source.blend_in_ms);
+        assert_eq!(mirror.blend_out_ms, source.blend_out_ms);
+        assert_eq!(mirror.frames.len(), source.frames.len());
+        assert!(
+            mirror
+                .description
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Mirror of `hello_wave`")),
+            "{:?}",
+            mirror.description
+        );
+
+        for (index, (mirrored, original)) in mirror.frames.iter().zip(&source.frames).enumerate() {
+            let [right, left] = original.antennas.expect("hello_wave drives the antennas");
+            assert_eq!(
+                mirrored.antennas,
+                Some([-left, -right]),
+                "antennas at {index}"
+            );
+            if HELLO_WAVE_MIRROR_HEAD_MIRRORED {
+                let [x, y, z] = original.dt.expect("hello_wave drives the head");
+                let [qw, qx, qy, qz] = original.dq.expect("hello_wave drives the head");
+                assert_eq!(mirrored.dt, Some([x, -y, z]), "translation at {index}");
+                assert_eq!(mirrored.dq, Some([qw, -qx, qy, -qz]), "rotation at {index}");
+            } else {
+                assert_eq!(mirrored.dt, original.dt, "translation at {index}");
+                assert_eq!(mirrored.dq, original.dq, "rotation at {index}");
+            }
+        }
+
+        let clip = Clip::from_doc_resolved(mirror, &ClipLimits::default(), |name| {
+            poses()
+                .iter()
+                .find(|pose| pose.name() == name)
+                .map(|pose| *pose.targets())
+        })
+        .expect("hello_wave_mirror resolves and passes the envelope screen");
+        assert!(
+            emitted_clip_block(&baseline().textproto, "hello_wave_mirror")
+                .contains(&format!("  posed_mask: {}\n", joint_mask_bits(clip.mask()))),
+            "hello_wave_mirror is emitted posed on its whole mask"
+        );
+    }
+
     #[test]
     fn the_recorded_dance_is_a_resolved_clip() {
         let doc = document("dance");
@@ -2266,22 +2340,31 @@ mod tests {
         assert!(format!("{error:#}").contains("no *.textproto"), "{error:#}");
     }
 
+    /// The committed pose set, pinned: a document added or removed without
+    /// this edit fails the cases that read it.
+    const COMMITTED_POSES: [&str; 9] = [
+        "hello",
+        "look_l30",
+        "look_l60",
+        "look_r30",
+        "look_r60",
+        "neutral",
+        "peek",
+        "peek_tilt",
+        "stow",
+    ];
+
     /// The pose documents the cases emit are the committed ones, walked the way
     /// the tool walks them: the drift check is against what `make
     /// library-config` would read.
     #[test]
     fn the_walk_finds_the_committed_pose_documents() {
         let sources: Vec<String> = pose_texts().into_iter().map(|(source, _)| source).collect();
-        for name in [
-            "neutral.textproto",
-            "peek.textproto",
-            "peek_tilt.textproto",
-            "hello.textproto",
-            "stow.textproto",
-        ] {
+        for name in COMMITTED_POSES {
+            let file = format!("{name}.{}", reachy_poses::format::DOCUMENT_EXT);
             assert!(
-                sources.iter().any(|source| source.ends_with(name)),
-                "{name}: {sources:?}"
+                sources.iter().any(|source| source.ends_with(&file)),
+                "{file}: {sources:?}"
             );
         }
         assert!(sources.windows(2).all(|pair| pair[0] < pair[1]), "sorted");
@@ -2299,10 +2382,10 @@ mod tests {
             .iter()
             .map(|pose| pose.name.as_str())
             .collect();
-        for name in ["neutral", "peek", "peek_tilt", "hello", "stow"] {
+        for name in COMMITTED_POSES {
             assert!(names.contains(&name), "{name}: {names:?}");
         }
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), COMMITTED_POSES.len());
         assert_eq!(
             usize::from(
                 emitted

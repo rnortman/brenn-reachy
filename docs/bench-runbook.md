@@ -39,9 +39,8 @@ All RAM: nothing touches the eMMC; a reboot clears it.
 
 ## Clearing the bus
 
-`brenn-app.service` and `reachy-motiond.service` each open the servo port; the
-scripts refuse rather than stop either. A fetched unit runs `brenn-app.service`
-from boot; stop it before a bench night.
+`brenn-app.service` and `reachy-motiond.service` each open the servo port. A
+fetched unit runs `brenn-app.service` from boot; stop it before a bench night.
 
     ssh root@"$REACHY_HOST" systemctl stop reachy-motiond.service
     ssh root@"$REACHY_HOST" systemctl start reachy-motiond.service   # after
@@ -76,7 +75,7 @@ driver de-torques.
     make library-run   # build, push, play every motion, fetch, judge
 
 Every motion in `cogs/library.names.json` but the `probe/` instruments
-(`make motion-probe MOTION=<name>`), in order, at recorded pace: minutes of
+(`make motion-probe MOTION=<name>`), at recorded pace: minutes of
 unattended motion.
 **Keep the space around the machine clear until it returns.** Reaching the
 `timeout` fails the run; `library_tour_report` judges.
@@ -87,12 +86,10 @@ unattended motion.
 
 `motion-pack` packs the operator's build, keys included: the server admits only
 a unit presenting its provisioned certificate. The unit unpacks it root-owned
-and, by the pack's modes, world-readable; `speech.toml` declares
-`secrets_posture = "payload"`.
+and world-readable.
 `motion-resync` makes the unit fetch the archive and restart
 `brenn-app.service`, which dances the idle playlist, `cogs/idle.json`, as
-`app` until stopped; a name absent from `cogs/library.names.json` keeps
-`voice_host` from starting. Every boot fetches the same URL, so a speech build
+`app` until stopped. Every boot fetches the same URL, so a speech build
 listens from power: **publish only a build you would let a power cycle start.**
 `make motion-fetch` brings the records home; `//cogs:idle_run_report` judges
 them. Reboot between a root run and a fetched run: they cannot share log roots.
@@ -137,7 +134,7 @@ Tail `recorder_0.log` and `voice_host_0.log`. Ctrl-C ends it.
 
 `speech-record.toml` (`REACHY_RECORD_SPEECH_CONFIG`) is `speech.toml` without
 `[brenn]`, with `[wake] policy = "gated"`, `[brain] mode = "echo"`, `[record]
-enabled = true`; shared keys must match.
+enabled = true`.
 
 The fetch prints the `pose_session_report` command; `--extract <segment>`
 drafts a clip, `--as-pose` a pose: `docs/pose-authoring.md`.
@@ -170,3 +167,7 @@ sentinel line, the launcher's.
 - **A log recorded before a schema append cannot be read by a later build.**
   Analyze a run with the build that recorded it; `provenance.txt` names both
   sides.
+- **Idle clips look jerky at speed 0.5.** Suspects: the legs' profile
+  completing each period's step, or servos following clip tremor at half
+  frequency. Test `attentive2` at 0.5, legs' acceleration halved
+  (`REACHY_EXPERIMENT_DIR`).

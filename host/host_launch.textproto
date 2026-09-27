@@ -34,6 +34,12 @@
 # repo path, so it is always there. This entry is merged into the production
 # config only, so the harness and recording configs run no loop.
 #
+# `--gaze-elevation-deg 27` turns the head toward whoever said the wake word. 27
+# is the talker's assumed elevation above the head's horizontal, in degrees: a
+# standing visitor's mouth above a table-top head at a metre or less. The array
+# reports no elevation, so the figure is a site's assumption, not a reading.
+# Merged into the production config only, like `--idle`.
+#
 # Named `voice_host` rather than `host`: the launcher spells each app's console
 # `<name>_<run>.log` and this repo says "host" for the workstation half of the
 # bench -- `make motion-host-run`, `cogs/robot_host.clk`, `hostcpu.textproto` --
@@ -52,4 +58,6 @@ app {
   args: "host/speech.toml"
   args: "--idle"
   args: "cogs/idle.json"
+  args: "--gaze-elevation-deg"
+  args: "27"
 }

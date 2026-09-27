@@ -201,6 +201,8 @@ a host that narrates the session and does not listen.
 `//cogs:first_motion_report` is what reads its log.
 `docs/speech-degradation.md` is the shorter one beside it: how to read a
 conversation the robot heard badly, and how to compare two sessions of it.
+`docs/frames.md` records the frames the motion code works in and the convention
+of the audio device's direction readings.
 
 ## Attribution
 

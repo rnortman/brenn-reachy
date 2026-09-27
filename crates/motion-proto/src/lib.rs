@@ -64,6 +64,6 @@ pub mod seq;
 pub use script::{
     Action, ActiveOverlay, Base, DecodeError, KEEP_BASE, MAX_ASSET_NAME_LEN,
     MAX_CONCURRENT_OVERLAYS, MAX_SPEED, MAX_TIMEOUT_MS, MIN_SPEED, MOTION_SCRIPT_TYPE,
-    MotionScript, OverlayError, Play, PlayWindow, STOW_POSE, ScriptError, Step,
+    MotionScript, OverlayError, Play, PlayWindow, STOW_POSE, ScriptError, Step, speed_is_carried,
 };
 pub use seq::{SeqSource, unix_millis};

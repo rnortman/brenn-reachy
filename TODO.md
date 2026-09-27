@@ -44,6 +44,11 @@ the body moved during the window. The working 55° relative-yaw cap bounds how
 far such a gaze hold can follow a body turn; `collision-envelope` is the work
 that could widen it.
 
+A third concrete case: `reachy_kin::mic` solves the audio device's azimuth
+against whatever head estimate the caller holds when it asks, not the estimate
+at the reading's own instant. Matching the two needs the device's host-time
+projection related to `SyncTime`.
+
 ## play-mirrored
 
 Add a mirrored play invocation whose spatial map is head translation y -> -y,
@@ -1391,3 +1396,9 @@ copies in `crates/reachy-bench/src/main.rs`.
 Decide what `reachy-ask --script` reads as the session taking its script when the session was not at rest as the offer arrived. Today only `script_accepted` naming the offer's id counts; a `script_replaced` naming it — the session was running another script and swapped to this one — is not read, so such a run waits its whole sender window out and ends red with "did not accept script N" over a log in which the script ran. `script_held` needs no reading of its own: the wake that ends the maneuver answers it with one of the other two.
 
 Deferral context: the bench runs one sender against one control process, which posts on the commissioning row into a session at rest, so the replacement path is reached only by a sender that joins a live engagement — and whether such a sender should ask at all is itself undecided. The reports vocabulary keeps `script_replaced` apart from `script_accepted` so that a reader counting engagements does not count a replacement as one; whether the harness's green — "my script ran and the machine released" — should be earned by a replacement is the same question from the sender's side, and it is a decision about what the verdict means, not a matcher change. Marked at the acceptance match in `script_conduct_inner`, `crates/reachy-ask/src/main.rs`.
+
+## `quality-gaze-check-bool-threaded-and-unreached-by-deploy`
+
+Make the speech run's deploy preflight check what the launcher will start. `tools/deploy-motion.sh` `speech_preflight` runs `reachy_host --speech-config <file> --check`, but the production launcher entry (`host/host_launch.textproto`, `voice_host`) also passes `--idle cogs/idle.json` and `--gaze-elevation-deg 27`. So `--check`'s playlist conclusion and its gaze-ladder conclusion (whether the deployed name table holds the five ladder poses) are never run before a unit starts. A playlist the host refuses, or a site name table missing a ladder pose, is found only on the unit.
+
+Deferral context: the gap for `--idle` goes back to when the idle loop was added, and the gaze flag widened it. What is left to decide is where the launch arguments are stated once. The options are: the preflight reads them out of the launcher config it is about to start (the speech and record kinds use different launcher configs and different arguments); a second copy in the script, pinned to the textproto by a test; or `--check` taking the launcher config itself. That is a decision about the deploy tooling, and its test suite changes with it. The committed library is guarded meanwhile by `gaze_ladder_test` and the idle tests. Marked at the `--check` invocation in `speech_preflight`, `tools/deploy-motion.sh`.

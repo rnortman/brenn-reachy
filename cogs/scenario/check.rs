@@ -755,6 +755,26 @@ pub fn scripts_sent(run: &Run, wanted: &[(u32, i64)], failures: &mut Vec<String>
 /// sent part way through a cycle is taken at the instant it was sent, and that
 /// instant is what the run is asserted to have replayed.
 pub fn scripts_sent_at(run: &Run, wanted: &[(u32, i64)], failures: &mut Vec<String>) {
+    let stamped: Vec<(u32, i64, i64)> = wanted
+        .iter()
+        .map(|&(script_id, at)| (script_id, at, at))
+        .collect();
+    replayed(run, &stamped, failures);
+}
+
+/// [`scripts_sent`] for a scenario that stamps a script earlier than it sends
+/// it: these ids, sent on these cycles and stamped on these, in this order.
+pub fn scripts_sent_stamped(run: &Run, wanted: &[(u32, i64, i64)], failures: &mut Vec<String>) {
+    let instants: Vec<(u32, i64, i64)> = wanted
+        .iter()
+        .map(|&(script_id, sent, stamped)| (script_id, cycle_at(sent), cycle_at(stamped)))
+        .collect();
+    replayed(run, &instants, failures);
+}
+
+/// The scripts the run replayed are these `(id, sent_ns, stamped_ns)`, in this
+/// order.
+fn replayed(run: &Run, wanted: &[(u32, i64, i64)], failures: &mut Vec<String>) {
     if run.scripts.len() != wanted.len() {
         failures.push(format!(
             "the run replayed {} scripts, and the scenario sent {}",
@@ -763,7 +783,7 @@ pub fn scripts_sent_at(run: &Run, wanted: &[(u32, i64)], failures: &mut Vec<Stri
         ));
         return;
     }
-    for (index, (found, &(script_id, at))) in run.scripts.iter().zip(wanted).enumerate() {
+    for (index, (found, &(script_id, at, stamped))) in run.scripts.iter().zip(wanted).enumerate() {
         if found.at_ns != at {
             failures.push(format!(
                 "script {index} reached the run at {}, and the scenario sent it at {at}",
@@ -776,10 +796,10 @@ pub fn scripts_sent_at(run: &Run, wanted: &[(u32, i64)], failures: &mut Vec<Stri
                 found.message.script_id()
             ));
         }
-        if found.message.arrival().as_nanos() != at {
+        if found.message.arrival().as_nanos() != stamped {
             failures.push(format!(
-                "script {index} is stamped {} and was sent at {at}: every offset in it is measured \
-                 from that stamp, so the two disagreeing moves the whole schedule",
+                "script {index} is stamped {} and the scenario stamped it {stamped}: every offset \
+                 in it is measured from that stamp, so the two disagreeing moves the whole schedule",
                 found.message.arrival().as_nanos()
             ));
         }
@@ -2047,7 +2067,7 @@ pub fn commissioning(run: &Run, failures: &mut Vec<String>) -> Option<i64> {
 ///
 /// Skipped for a run that ends mid-survey: there is no count to compare a part
 /// of a sweep against. The refusals are checked either way.
-fn survey_cost(run: &Run, finished: Option<i64>, failures: &mut Vec<String>) {
+pub fn survey_cost(run: &Run, finished: Option<i64>, failures: &mut Vec<String>) {
     for report in &run.reports {
         if report.message.kind() == ReportKindWire::AUX_GAVE_UP {
             failures.push(format!(

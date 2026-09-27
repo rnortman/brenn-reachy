@@ -18,165 +18,167 @@
 # clip_id  name
 #   0  dance
 #   1  hello_wave
-#   2  bench/nod
-#   3  bench/perk
-#   4  pollen/dances/chicken_peck
-#   5  pollen/dances/chin_lead
-#   6  pollen/dances/dizzy_spin
-#   7  pollen/dances/grid_snap
-#   8  pollen/dances/groovy_sway_and_roll
-#   9  pollen/dances/head_tilt_roll
-#   10  pollen/dances/interwoven_spirals
-#   11  pollen/dances/neck_recoil
-#   12  pollen/dances/pendulum_swing
-#   13  pollen/dances/polyrhythm_combo
-#   14  pollen/dances/sharp_side_tilt
-#   15  pollen/dances/side_glance_flick
-#   16  pollen/dances/side_peekaboo
-#   17  pollen/dances/side_to_side_sway
-#   18  pollen/dances/simple_nod
-#   19  pollen/dances/stumble_and_recover
-#   20  pollen/dances/uh_huh_tilt
-#   21  pollen/dances/yeah_nod
-#   22  pollen/emotions/amazed1
-#   23  pollen/emotions/anxiety1
-#   24  pollen/emotions/attentive1
-#   25  pollen/emotions/attentive2
-#   26  pollen/emotions/boredom1
-#   27  pollen/emotions/boredom2
-#   28  pollen/emotions/dance1
-#   29  pollen/emotions/dance3
-#   30  pollen/emotions/disgusted1
-#   31  pollen/emotions/displeased1
-#   32  pollen/emotions/displeased2
-#   33  pollen/emotions/downcast1
-#   34  pollen/emotions/electric1
-#   35  pollen/emotions/enthusiastic2
-#   36  pollen/emotions/exhausted1
-#   37  pollen/emotions/frustrated1
-#   38  pollen/emotions/grateful1
-#   39  pollen/emotions/helpful1
-#   40  pollen/emotions/helpful2
-#   41  pollen/emotions/impatient1
-#   42  pollen/emotions/impatient2
-#   43  pollen/emotions/incomprehensible2
-#   44  pollen/emotions/indifferent1
-#   45  pollen/emotions/inquiring2
-#   46  pollen/emotions/inquiring3
-#   47  pollen/emotions/irritated1
-#   48  pollen/emotions/laughing2
-#   49  pollen/emotions/lonely1
-#   50  pollen/emotions/lost1
-#   51  pollen/emotions/loving1
-#   52  pollen/emotions/mini-deep-sleep
-#   53  pollen/emotions/no1
-#   54  pollen/emotions/no_excited1
-#   55  pollen/emotions/no_sad1
-#   56  pollen/emotions/oops1
-#   57  pollen/emotions/proud1
-#   58  pollen/emotions/proud2
-#   59  pollen/emotions/relief1
-#   60  pollen/emotions/resigned1
-#   61  pollen/emotions/sad1
-#   62  pollen/emotions/serenity1
-#   63  pollen/emotions/shy1
-#   64  pollen/emotions/thoughtful1
-#   65  pollen/emotions/thoughtful2
-#   66  pollen/emotions/toc-toc-toc
-#   67  pollen/emotions/uncertain1
-#   68  pollen/emotions/uncomfortable1
-#   69  pollen/emotions/waiting
-#   70  pollen/emotions/wake-mini-up
-#   71  pollen/emotions/welcoming1
-#   72  probe/antenna-step-a
-#   73  probe/antenna-step-b
-#   74  probe/antenna-sweep
-#   75  bench/sway
-#   76  bench/tip
-#   77  wave_left
-#   78  wave_right
+#   2  hello_wave_mirror
+#   3  bench/nod
+#   4  bench/perk
+#   5  pollen/dances/chicken_peck
+#   6  pollen/dances/chin_lead
+#   7  pollen/dances/dizzy_spin
+#   8  pollen/dances/grid_snap
+#   9  pollen/dances/groovy_sway_and_roll
+#   10  pollen/dances/head_tilt_roll
+#   11  pollen/dances/interwoven_spirals
+#   12  pollen/dances/neck_recoil
+#   13  pollen/dances/pendulum_swing
+#   14  pollen/dances/polyrhythm_combo
+#   15  pollen/dances/sharp_side_tilt
+#   16  pollen/dances/side_glance_flick
+#   17  pollen/dances/side_peekaboo
+#   18  pollen/dances/side_to_side_sway
+#   19  pollen/dances/simple_nod
+#   20  pollen/dances/stumble_and_recover
+#   21  pollen/dances/uh_huh_tilt
+#   22  pollen/dances/yeah_nod
+#   23  pollen/emotions/amazed1
+#   24  pollen/emotions/anxiety1
+#   25  pollen/emotions/attentive1
+#   26  pollen/emotions/attentive2
+#   27  pollen/emotions/boredom1
+#   28  pollen/emotions/boredom2
+#   29  pollen/emotions/dance1
+#   30  pollen/emotions/dance3
+#   31  pollen/emotions/disgusted1
+#   32  pollen/emotions/displeased1
+#   33  pollen/emotions/displeased2
+#   34  pollen/emotions/downcast1
+#   35  pollen/emotions/electric1
+#   36  pollen/emotions/enthusiastic2
+#   37  pollen/emotions/exhausted1
+#   38  pollen/emotions/frustrated1
+#   39  pollen/emotions/grateful1
+#   40  pollen/emotions/helpful1
+#   41  pollen/emotions/helpful2
+#   42  pollen/emotions/impatient1
+#   43  pollen/emotions/impatient2
+#   44  pollen/emotions/incomprehensible2
+#   45  pollen/emotions/indifferent1
+#   46  pollen/emotions/inquiring2
+#   47  pollen/emotions/inquiring3
+#   48  pollen/emotions/irritated1
+#   49  pollen/emotions/laughing2
+#   50  pollen/emotions/lonely1
+#   51  pollen/emotions/lost1
+#   52  pollen/emotions/loving1
+#   53  pollen/emotions/mini-deep-sleep
+#   54  pollen/emotions/no1
+#   55  pollen/emotions/no_excited1
+#   56  pollen/emotions/no_sad1
+#   57  pollen/emotions/oops1
+#   58  pollen/emotions/proud1
+#   59  pollen/emotions/proud2
+#   60  pollen/emotions/relief1
+#   61  pollen/emotions/resigned1
+#   62  pollen/emotions/sad1
+#   63  pollen/emotions/serenity1
+#   64  pollen/emotions/shy1
+#   65  pollen/emotions/thoughtful1
+#   66  pollen/emotions/thoughtful2
+#   67  pollen/emotions/toc-toc-toc
+#   68  pollen/emotions/uncertain1
+#   69  pollen/emotions/uncomfortable1
+#   70  pollen/emotions/waiting
+#   71  pollen/emotions/wake-mini-up
+#   72  pollen/emotions/welcoming1
+#   73  probe/antenna-step-a
+#   74  probe/antenna-step-b
+#   75  probe/antenna-sweep
+#   76  bench/sway
+#   77  bench/tip
+#   78  wave_left
+#   79  wave_right
 #
 # motion_id  name
 #   0  dance
 #   1  hello_wave
-#   2  bench/nod
-#   3  bench/perk
-#   4  pollen/dances/chicken_peck
-#   5  pollen/dances/chin_lead
-#   6  pollen/dances/dizzy_spin
-#   7  pollen/dances/grid_snap
-#   8  pollen/dances/groovy_sway_and_roll
-#   9  pollen/dances/head_tilt_roll
-#   10  pollen/dances/interwoven_spirals
-#   11  pollen/dances/neck_recoil
-#   12  pollen/dances/pendulum_swing
-#   13  pollen/dances/polyrhythm_combo
-#   14  pollen/dances/sharp_side_tilt
-#   15  pollen/dances/side_glance_flick
-#   16  pollen/dances/side_peekaboo
-#   17  pollen/dances/side_to_side_sway
-#   18  pollen/dances/simple_nod
-#   19  pollen/dances/stumble_and_recover
-#   20  pollen/dances/uh_huh_tilt
-#   21  pollen/dances/yeah_nod
-#   22  pollen/emotions/amazed1
-#   23  pollen/emotions/anxiety1
-#   24  pollen/emotions/attentive1
-#   25  pollen/emotions/attentive2
-#   26  pollen/emotions/boredom1
-#   27  pollen/emotions/boredom2
-#   28  pollen/emotions/dance1
-#   29  pollen/emotions/dance3
-#   30  pollen/emotions/disgusted1
-#   31  pollen/emotions/displeased1
-#   32  pollen/emotions/displeased2
-#   33  pollen/emotions/downcast1
-#   34  pollen/emotions/electric1
-#   35  pollen/emotions/enthusiastic2
-#   36  pollen/emotions/exhausted1
-#   37  pollen/emotions/frustrated1
-#   38  pollen/emotions/grateful1
-#   39  pollen/emotions/helpful1
-#   40  pollen/emotions/helpful2
-#   41  pollen/emotions/impatient1
-#   42  pollen/emotions/impatient2
-#   43  pollen/emotions/incomprehensible2
-#   44  pollen/emotions/indifferent1
-#   45  pollen/emotions/inquiring2
-#   46  pollen/emotions/inquiring3
-#   47  pollen/emotions/irritated1
-#   48  pollen/emotions/laughing2
-#   49  pollen/emotions/lonely1
-#   50  pollen/emotions/lost1
-#   51  pollen/emotions/loving1
-#   52  pollen/emotions/mini-deep-sleep
-#   53  pollen/emotions/no1
-#   54  pollen/emotions/no_excited1
-#   55  pollen/emotions/no_sad1
-#   56  pollen/emotions/oops1
-#   57  pollen/emotions/proud1
-#   58  pollen/emotions/proud2
-#   59  pollen/emotions/relief1
-#   60  pollen/emotions/resigned1
-#   61  pollen/emotions/sad1
-#   62  pollen/emotions/serenity1
-#   63  pollen/emotions/shy1
-#   64  pollen/emotions/thoughtful1
-#   65  pollen/emotions/thoughtful2
-#   66  pollen/emotions/toc-toc-toc
-#   67  pollen/emotions/uncertain1
-#   68  pollen/emotions/uncomfortable1
-#   69  pollen/emotions/waiting
-#   70  pollen/emotions/wake-mini-up
-#   71  pollen/emotions/welcoming1
-#   72  probe/antenna-step-a
-#   73  probe/antenna-step-b
-#   74  probe/antenna-sweep
-#   75  bench/sway
-#   76  bench/tip
-#   77  bench/tour
-#   78  wave_left
-#   79  wave_right
+#   2  hello_wave_mirror
+#   3  bench/nod
+#   4  bench/perk
+#   5  pollen/dances/chicken_peck
+#   6  pollen/dances/chin_lead
+#   7  pollen/dances/dizzy_spin
+#   8  pollen/dances/grid_snap
+#   9  pollen/dances/groovy_sway_and_roll
+#   10  pollen/dances/head_tilt_roll
+#   11  pollen/dances/interwoven_spirals
+#   12  pollen/dances/neck_recoil
+#   13  pollen/dances/pendulum_swing
+#   14  pollen/dances/polyrhythm_combo
+#   15  pollen/dances/sharp_side_tilt
+#   16  pollen/dances/side_glance_flick
+#   17  pollen/dances/side_peekaboo
+#   18  pollen/dances/side_to_side_sway
+#   19  pollen/dances/simple_nod
+#   20  pollen/dances/stumble_and_recover
+#   21  pollen/dances/uh_huh_tilt
+#   22  pollen/dances/yeah_nod
+#   23  pollen/emotions/amazed1
+#   24  pollen/emotions/anxiety1
+#   25  pollen/emotions/attentive1
+#   26  pollen/emotions/attentive2
+#   27  pollen/emotions/boredom1
+#   28  pollen/emotions/boredom2
+#   29  pollen/emotions/dance1
+#   30  pollen/emotions/dance3
+#   31  pollen/emotions/disgusted1
+#   32  pollen/emotions/displeased1
+#   33  pollen/emotions/displeased2
+#   34  pollen/emotions/downcast1
+#   35  pollen/emotions/electric1
+#   36  pollen/emotions/enthusiastic2
+#   37  pollen/emotions/exhausted1
+#   38  pollen/emotions/frustrated1
+#   39  pollen/emotions/grateful1
+#   40  pollen/emotions/helpful1
+#   41  pollen/emotions/helpful2
+#   42  pollen/emotions/impatient1
+#   43  pollen/emotions/impatient2
+#   44  pollen/emotions/incomprehensible2
+#   45  pollen/emotions/indifferent1
+#   46  pollen/emotions/inquiring2
+#   47  pollen/emotions/inquiring3
+#   48  pollen/emotions/irritated1
+#   49  pollen/emotions/laughing2
+#   50  pollen/emotions/lonely1
+#   51  pollen/emotions/lost1
+#   52  pollen/emotions/loving1
+#   53  pollen/emotions/mini-deep-sleep
+#   54  pollen/emotions/no1
+#   55  pollen/emotions/no_excited1
+#   56  pollen/emotions/no_sad1
+#   57  pollen/emotions/oops1
+#   58  pollen/emotions/proud1
+#   59  pollen/emotions/proud2
+#   60  pollen/emotions/relief1
+#   61  pollen/emotions/resigned1
+#   62  pollen/emotions/sad1
+#   63  pollen/emotions/serenity1
+#   64  pollen/emotions/shy1
+#   65  pollen/emotions/thoughtful1
+#   66  pollen/emotions/thoughtful2
+#   67  pollen/emotions/toc-toc-toc
+#   68  pollen/emotions/uncertain1
+#   69  pollen/emotions/uncomfortable1
+#   70  pollen/emotions/waiting
+#   71  pollen/emotions/wake-mini-up
+#   72  pollen/emotions/welcoming1
+#   73  probe/antenna-step-a
+#   74  probe/antenna-step-b
+#   75  probe/antenna-sweep
+#   76  bench/sway
+#   77  bench/tip
+#   78  bench/tour
+#   79  wave_left
+#   80  wave_right
 
 # dance
 clips {
@@ -1000,6 +1002,161 @@ clips {
   frames { head_dx: 0.0006690716310147473 head_dy: 0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: 0.22862791097815877 quat_y: 0.009840924041276438 quat_z: 0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.6558838173726208 antenna_left_d: 0.15393501863476605 }
   frames { head_dx: 0.0006690716310147473 head_dy: 0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: 0.22862791097815877 quat_y: 0.009840924041276438 quat_z: 0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.6558838173726208 antenna_left_d: 0.2206016853014336 }
   frames { head_dx: 0.0006690716310147473 head_dy: 0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: 0.22862791097815877 quat_y: 0.009840924041276438 quat_z: 0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.6558838173726208 antenna_left_d: 0.2872683519680996 }
+}
+
+# hello_wave_mirror
+clips {
+  mask: 510
+  frame_rate_hz: 50.0
+  blend_in_ms: 200
+  blend_out_ms: 200
+  posed_mask: 510
+  anchor_head_dx: 0.0
+  anchor_head_dy: 0.0
+  anchor_head_dz: 0.177
+  anchor_head_qw: 1.0
+  anchor_head_qx: 0.0
+  anchor_head_qy: 0.0
+  anchor_head_qz: 0.0
+  anchor_body_yaw: 0.0
+  anchor_antenna_right: -0.1745
+  anchor_antenna_left: 0.1745
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.2872683519680999 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.35393501863476656 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.4206016853014332 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.48726835196809987 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.5539350186347665 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.6206016853014331 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.6872683519680998 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.7539350186347666 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.8206016853014333 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.8872683519680999 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.9539350186347664 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -1.0206016853014337 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.9872683519681003 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.9206016853014334 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.8539350186347665 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.7872683519680999 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.7206016853014332 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.6539350186347668 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.5872683519680999 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.5206016853014335 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.45393501863476665 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.3872683519680999 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.32060168530143335 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.2539350186347666 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.18726835196810004 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.12060168530143328 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.05393501863476674 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.012731648031900022 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.07939831469856679 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.1460649813652331 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.2127316480318998 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.27939831469856674 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.3460649813652335 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.4127316480319005 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.4460649813652339 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.3793983146985666 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.3127316480319002 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.24606498136523353 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.1793983146985671 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.11273164803190033 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.04606498136523357 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.020601685301433192 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.0872683519680999 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.15393501863476627 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.22060168530143304 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.2872683519680998 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.35393501863476656 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.4206016853014329 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.48726835196809964 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.5539350186347667 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.6206016853014331 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.6872683519681 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.7539350186347662 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.8206016853014328 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.8872683519680999 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.9539350186347662 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -1.0206016853014337 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.9872683519681003 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.9206016853014338 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.8539350186347663 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.7872683519681003 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.7206016853014336 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.6539350186347668 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.5872683519681001 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.5206016853014332 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.45393501863476654 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.3872683519680998 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.320601685301433 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.25393501863476714 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.18726835196810038 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.12060168530143273 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.05393501863476685 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.012731648031899911 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.07939831469856667 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.14606498136523338 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.2127316480319001 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.2793983146985661 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.3460649813652336 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.4127316480318994 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.4460649813652339 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.37939831469856694 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.3127316480319004 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.24606498136523364 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.17939831469856765 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.1127316480319 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.04606498136523324 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.020601685301432637 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.0872683519680994 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.15393501863476616 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.22060168530143293 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.2872683519680997 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.35393501863476645 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.4206016853014332 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.4872683519681 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.5539350186347658 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.6206016853014336 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.6872683519680993 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.753935018634766 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.8206016853014337 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.8872683519680997 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.9539350186347664 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -1.0206016853014321 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.9872683519680998 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.9206016853014329 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.853935018634767 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.7872683519680996 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.7206016853014336 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.6539350186347668 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.5872683519681001 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.5206016853014335 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.45393501863476754 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.3872683519681008 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.3206016853014331 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.25393501863476725 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.1872683519681005 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.12060168530143373 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.05393501863476785 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.0127316480318998 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.07939831469856745 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.14606498136523333 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.2127316480318992 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.27939831469856685 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.34606498136523284 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.4127316480319005 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.4460649813652339 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.37939831469856816 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.3127316480319004 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.24606498136523464 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.17939831469856687 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.11273164803189933 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: 0.04606498136523335 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.02060168530143247 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.08726835196810012 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.15393501863476605 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.2206016853014336 antenna_left_d: 0.6558838173726208 }
+  frames { head_dx: 0.0006690716310147473 head_dy: -0.011657214299538974 head_dz: 0.011019355907297057 quat_w: 0.9727091900478038 quat_x: -0.22862791097815877 quat_y: 0.009840924041276438 quat_z: -0.03833100745248598 body_yaw_d: 0.0 antenna_right_d: -0.2872683519680996 antenna_left_d: 0.6558838173726208 }
 }
 
 # bench/nod
@@ -23721,7 +23878,7 @@ motions {
   }
 }
 
-# bench/nod
+# hello_wave_mirror
 motions {
   lead_gap_ms: 0
   segments {
@@ -23731,7 +23888,7 @@ motions {
   }
 }
 
-# bench/perk
+# bench/nod
 motions {
   lead_gap_ms: 0
   segments {
@@ -23741,7 +23898,7 @@ motions {
   }
 }
 
-# pollen/dances/chicken_peck
+# bench/perk
 motions {
   lead_gap_ms: 0
   segments {
@@ -23751,7 +23908,7 @@ motions {
   }
 }
 
-# pollen/dances/chin_lead
+# pollen/dances/chicken_peck
 motions {
   lead_gap_ms: 0
   segments {
@@ -23761,7 +23918,7 @@ motions {
   }
 }
 
-# pollen/dances/dizzy_spin
+# pollen/dances/chin_lead
 motions {
   lead_gap_ms: 0
   segments {
@@ -23771,7 +23928,7 @@ motions {
   }
 }
 
-# pollen/dances/grid_snap
+# pollen/dances/dizzy_spin
 motions {
   lead_gap_ms: 0
   segments {
@@ -23781,7 +23938,7 @@ motions {
   }
 }
 
-# pollen/dances/groovy_sway_and_roll
+# pollen/dances/grid_snap
 motions {
   lead_gap_ms: 0
   segments {
@@ -23791,7 +23948,7 @@ motions {
   }
 }
 
-# pollen/dances/head_tilt_roll
+# pollen/dances/groovy_sway_and_roll
 motions {
   lead_gap_ms: 0
   segments {
@@ -23801,7 +23958,7 @@ motions {
   }
 }
 
-# pollen/dances/interwoven_spirals
+# pollen/dances/head_tilt_roll
 motions {
   lead_gap_ms: 0
   segments {
@@ -23811,7 +23968,7 @@ motions {
   }
 }
 
-# pollen/dances/neck_recoil
+# pollen/dances/interwoven_spirals
 motions {
   lead_gap_ms: 0
   segments {
@@ -23821,7 +23978,7 @@ motions {
   }
 }
 
-# pollen/dances/pendulum_swing
+# pollen/dances/neck_recoil
 motions {
   lead_gap_ms: 0
   segments {
@@ -23831,7 +23988,7 @@ motions {
   }
 }
 
-# pollen/dances/polyrhythm_combo
+# pollen/dances/pendulum_swing
 motions {
   lead_gap_ms: 0
   segments {
@@ -23841,7 +23998,7 @@ motions {
   }
 }
 
-# pollen/dances/sharp_side_tilt
+# pollen/dances/polyrhythm_combo
 motions {
   lead_gap_ms: 0
   segments {
@@ -23851,7 +24008,7 @@ motions {
   }
 }
 
-# pollen/dances/side_glance_flick
+# pollen/dances/sharp_side_tilt
 motions {
   lead_gap_ms: 0
   segments {
@@ -23861,7 +24018,7 @@ motions {
   }
 }
 
-# pollen/dances/side_peekaboo
+# pollen/dances/side_glance_flick
 motions {
   lead_gap_ms: 0
   segments {
@@ -23871,7 +24028,7 @@ motions {
   }
 }
 
-# pollen/dances/side_to_side_sway
+# pollen/dances/side_peekaboo
 motions {
   lead_gap_ms: 0
   segments {
@@ -23881,7 +24038,7 @@ motions {
   }
 }
 
-# pollen/dances/simple_nod
+# pollen/dances/side_to_side_sway
 motions {
   lead_gap_ms: 0
   segments {
@@ -23891,7 +24048,7 @@ motions {
   }
 }
 
-# pollen/dances/stumble_and_recover
+# pollen/dances/simple_nod
 motions {
   lead_gap_ms: 0
   segments {
@@ -23901,7 +24058,7 @@ motions {
   }
 }
 
-# pollen/dances/uh_huh_tilt
+# pollen/dances/stumble_and_recover
 motions {
   lead_gap_ms: 0
   segments {
@@ -23911,7 +24068,7 @@ motions {
   }
 }
 
-# pollen/dances/yeah_nod
+# pollen/dances/uh_huh_tilt
 motions {
   lead_gap_ms: 0
   segments {
@@ -23921,7 +24078,7 @@ motions {
   }
 }
 
-# pollen/emotions/amazed1
+# pollen/dances/yeah_nod
 motions {
   lead_gap_ms: 0
   segments {
@@ -23931,7 +24088,7 @@ motions {
   }
 }
 
-# pollen/emotions/anxiety1
+# pollen/emotions/amazed1
 motions {
   lead_gap_ms: 0
   segments {
@@ -23941,7 +24098,7 @@ motions {
   }
 }
 
-# pollen/emotions/attentive1
+# pollen/emotions/anxiety1
 motions {
   lead_gap_ms: 0
   segments {
@@ -23951,7 +24108,7 @@ motions {
   }
 }
 
-# pollen/emotions/attentive2
+# pollen/emotions/attentive1
 motions {
   lead_gap_ms: 0
   segments {
@@ -23961,7 +24118,7 @@ motions {
   }
 }
 
-# pollen/emotions/boredom1
+# pollen/emotions/attentive2
 motions {
   lead_gap_ms: 0
   segments {
@@ -23971,7 +24128,7 @@ motions {
   }
 }
 
-# pollen/emotions/boredom2
+# pollen/emotions/boredom1
 motions {
   lead_gap_ms: 0
   segments {
@@ -23981,7 +24138,7 @@ motions {
   }
 }
 
-# pollen/emotions/dance1
+# pollen/emotions/boredom2
 motions {
   lead_gap_ms: 0
   segments {
@@ -23991,7 +24148,7 @@ motions {
   }
 }
 
-# pollen/emotions/dance3
+# pollen/emotions/dance1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24001,7 +24158,7 @@ motions {
   }
 }
 
-# pollen/emotions/disgusted1
+# pollen/emotions/dance3
 motions {
   lead_gap_ms: 0
   segments {
@@ -24011,7 +24168,7 @@ motions {
   }
 }
 
-# pollen/emotions/displeased1
+# pollen/emotions/disgusted1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24021,7 +24178,7 @@ motions {
   }
 }
 
-# pollen/emotions/displeased2
+# pollen/emotions/displeased1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24031,7 +24188,7 @@ motions {
   }
 }
 
-# pollen/emotions/downcast1
+# pollen/emotions/displeased2
 motions {
   lead_gap_ms: 0
   segments {
@@ -24041,7 +24198,7 @@ motions {
   }
 }
 
-# pollen/emotions/electric1
+# pollen/emotions/downcast1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24051,7 +24208,7 @@ motions {
   }
 }
 
-# pollen/emotions/enthusiastic2
+# pollen/emotions/electric1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24061,7 +24218,7 @@ motions {
   }
 }
 
-# pollen/emotions/exhausted1
+# pollen/emotions/enthusiastic2
 motions {
   lead_gap_ms: 0
   segments {
@@ -24071,7 +24228,7 @@ motions {
   }
 }
 
-# pollen/emotions/frustrated1
+# pollen/emotions/exhausted1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24081,7 +24238,7 @@ motions {
   }
 }
 
-# pollen/emotions/grateful1
+# pollen/emotions/frustrated1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24091,7 +24248,7 @@ motions {
   }
 }
 
-# pollen/emotions/helpful1
+# pollen/emotions/grateful1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24101,7 +24258,7 @@ motions {
   }
 }
 
-# pollen/emotions/helpful2
+# pollen/emotions/helpful1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24111,7 +24268,7 @@ motions {
   }
 }
 
-# pollen/emotions/impatient1
+# pollen/emotions/helpful2
 motions {
   lead_gap_ms: 0
   segments {
@@ -24121,7 +24278,7 @@ motions {
   }
 }
 
-# pollen/emotions/impatient2
+# pollen/emotions/impatient1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24131,7 +24288,7 @@ motions {
   }
 }
 
-# pollen/emotions/incomprehensible2
+# pollen/emotions/impatient2
 motions {
   lead_gap_ms: 0
   segments {
@@ -24141,7 +24298,7 @@ motions {
   }
 }
 
-# pollen/emotions/indifferent1
+# pollen/emotions/incomprehensible2
 motions {
   lead_gap_ms: 0
   segments {
@@ -24151,7 +24308,7 @@ motions {
   }
 }
 
-# pollen/emotions/inquiring2
+# pollen/emotions/indifferent1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24161,7 +24318,7 @@ motions {
   }
 }
 
-# pollen/emotions/inquiring3
+# pollen/emotions/inquiring2
 motions {
   lead_gap_ms: 0
   segments {
@@ -24171,7 +24328,7 @@ motions {
   }
 }
 
-# pollen/emotions/irritated1
+# pollen/emotions/inquiring3
 motions {
   lead_gap_ms: 0
   segments {
@@ -24181,7 +24338,7 @@ motions {
   }
 }
 
-# pollen/emotions/laughing2
+# pollen/emotions/irritated1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24191,7 +24348,7 @@ motions {
   }
 }
 
-# pollen/emotions/lonely1
+# pollen/emotions/laughing2
 motions {
   lead_gap_ms: 0
   segments {
@@ -24201,7 +24358,7 @@ motions {
   }
 }
 
-# pollen/emotions/lost1
+# pollen/emotions/lonely1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24211,7 +24368,7 @@ motions {
   }
 }
 
-# pollen/emotions/loving1
+# pollen/emotions/lost1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24221,7 +24378,7 @@ motions {
   }
 }
 
-# pollen/emotions/mini-deep-sleep
+# pollen/emotions/loving1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24231,7 +24388,7 @@ motions {
   }
 }
 
-# pollen/emotions/no1
+# pollen/emotions/mini-deep-sleep
 motions {
   lead_gap_ms: 0
   segments {
@@ -24241,7 +24398,7 @@ motions {
   }
 }
 
-# pollen/emotions/no_excited1
+# pollen/emotions/no1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24251,7 +24408,7 @@ motions {
   }
 }
 
-# pollen/emotions/no_sad1
+# pollen/emotions/no_excited1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24261,7 +24418,7 @@ motions {
   }
 }
 
-# pollen/emotions/oops1
+# pollen/emotions/no_sad1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24271,7 +24428,7 @@ motions {
   }
 }
 
-# pollen/emotions/proud1
+# pollen/emotions/oops1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24281,7 +24438,7 @@ motions {
   }
 }
 
-# pollen/emotions/proud2
+# pollen/emotions/proud1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24291,7 +24448,7 @@ motions {
   }
 }
 
-# pollen/emotions/relief1
+# pollen/emotions/proud2
 motions {
   lead_gap_ms: 0
   segments {
@@ -24301,7 +24458,7 @@ motions {
   }
 }
 
-# pollen/emotions/resigned1
+# pollen/emotions/relief1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24311,7 +24468,7 @@ motions {
   }
 }
 
-# pollen/emotions/sad1
+# pollen/emotions/resigned1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24321,7 +24478,7 @@ motions {
   }
 }
 
-# pollen/emotions/serenity1
+# pollen/emotions/sad1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24331,7 +24488,7 @@ motions {
   }
 }
 
-# pollen/emotions/shy1
+# pollen/emotions/serenity1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24341,7 +24498,7 @@ motions {
   }
 }
 
-# pollen/emotions/thoughtful1
+# pollen/emotions/shy1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24351,7 +24508,7 @@ motions {
   }
 }
 
-# pollen/emotions/thoughtful2
+# pollen/emotions/thoughtful1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24361,7 +24518,7 @@ motions {
   }
 }
 
-# pollen/emotions/toc-toc-toc
+# pollen/emotions/thoughtful2
 motions {
   lead_gap_ms: 0
   segments {
@@ -24371,7 +24528,7 @@ motions {
   }
 }
 
-# pollen/emotions/uncertain1
+# pollen/emotions/toc-toc-toc
 motions {
   lead_gap_ms: 0
   segments {
@@ -24381,7 +24538,7 @@ motions {
   }
 }
 
-# pollen/emotions/uncomfortable1
+# pollen/emotions/uncertain1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24391,7 +24548,7 @@ motions {
   }
 }
 
-# pollen/emotions/waiting
+# pollen/emotions/uncomfortable1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24401,7 +24558,7 @@ motions {
   }
 }
 
-# pollen/emotions/wake-mini-up
+# pollen/emotions/waiting
 motions {
   lead_gap_ms: 0
   segments {
@@ -24411,7 +24568,7 @@ motions {
   }
 }
 
-# pollen/emotions/welcoming1
+# pollen/emotions/wake-mini-up
 motions {
   lead_gap_ms: 0
   segments {
@@ -24421,7 +24578,7 @@ motions {
   }
 }
 
-# probe/antenna-step-a
+# pollen/emotions/welcoming1
 motions {
   lead_gap_ms: 0
   segments {
@@ -24431,7 +24588,7 @@ motions {
   }
 }
 
-# probe/antenna-step-b
+# probe/antenna-step-a
 motions {
   lead_gap_ms: 0
   segments {
@@ -24441,7 +24598,7 @@ motions {
   }
 }
 
-# probe/antenna-sweep
+# probe/antenna-step-b
 motions {
   lead_gap_ms: 0
   segments {
@@ -24451,11 +24608,21 @@ motions {
   }
 }
 
-# bench/sway
+# probe/antenna-sweep
 motions {
   lead_gap_ms: 0
   segments {
     clip_id: 75
+    speed: 1.0
+    gap_after_ms: 0
+  }
+}
+
+# bench/sway
+motions {
+  lead_gap_ms: 0
+  segments {
+    clip_id: 76
     speed: 1.0
     gap_after_ms: 0
   }
@@ -24465,7 +24632,7 @@ motions {
 motions {
   lead_gap_ms: 0
   segments {
-    clip_id: 76
+    clip_id: 77
     speed: 1.0
     gap_after_ms: 0
   }
@@ -24475,12 +24642,12 @@ motions {
 motions {
   lead_gap_ms: 0
   segments {
-    clip_id: 76
+    clip_id: 77
     speed: 1.0
     gap_after_ms: 400
   }
   segments {
-    clip_id: 75
+    clip_id: 76
     speed: 1.0
     gap_after_ms: 0
   }
@@ -24490,7 +24657,7 @@ motions {
 motions {
   lead_gap_ms: 0
   segments {
-    clip_id: 77
+    clip_id: 78
     speed: 1.0
     gap_after_ms: 0
   }
@@ -24500,7 +24667,7 @@ motions {
 motions {
   lead_gap_ms: 0
   segments {
-    clip_id: 78
+    clip_id: 79
     speed: 1.0
     gap_after_ms: 0
   }

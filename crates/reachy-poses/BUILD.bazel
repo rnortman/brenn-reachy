@@ -40,11 +40,12 @@ rust_library(
 )
 
 # The document suite: parsing and arithmetic over in-memory documents, plus the
-# committed documents themselves. What a *directory* of documents means is the
-# generator's business, not this crate's; that these three particular documents
-# still load, and that the machine's stow still clears the clearance floor, is
-# this crate's, because it owns both the loader and the check. The path is
-# relative to the runfiles root, which is a test's working directory.
+# committed documents themselves. What a *directory* of documents means — their
+# order and their numbering — is the generator's business, not this crate's;
+# that every committed document still loads, and that the machine's stow still
+# clears the clearance floor, is this crate's, because it owns both the loader
+# and the check. The path is relative to the runfiles root, which is a test's
+# working directory.
 rust_test(
     name = "reachy_poses_test",
     size = "small",

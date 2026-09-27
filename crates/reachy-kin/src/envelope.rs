@@ -43,11 +43,14 @@
 //!
 //! Zero margin is an IK-root merge/dead centre. The 0.56 mm floor buys at least
 //! 7.9° at the outer merge and 13.2° at the inner merge. The largest end-of-
-//! move residual over every directed transition of the committed library at
-//! its committed pace was 17.4 counts: the six per-leg maxima were 16.7,
-//! 15.0, 16.1, 17.4, 15.5, and 7.4 counts, with a worst hold-end value of
-//! 13.7 counts and an armed-rest value of 9 counts. The 18-count (1.58°) bound
-//! makes the outer clearance five times the bound.
+//! move residual over every directed transition among `hello`, `neutral`,
+//! `peek`, `peek_tilt` and `stow`, each at its committed pace, was 17.4
+//! counts: the six per-leg maxima were 16.7, 15.0, 16.1, 17.4, 15.5, and 7.4
+//! counts, with a worst hold-end value of 13.7 counts and an armed-rest value
+//! of 9 counts. The 18-count (1.58°) bound makes the outer clearance five times
+//! the bound. That measurement does not cover the gaze poses (`look_*`); the
+//! `reachy-ask` settle-evidence walks include every transition into and out of
+//! them, for the run that would.
 //!
 //! The head was in contact with the body during those runs. No model in this
 //! tree detects that contact, so these are observed residuals of those machine
