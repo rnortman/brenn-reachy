@@ -558,7 +558,7 @@ mod tests {
             _pod: &speech_pipeline::PodId,
             _doa: &[speech_surface::DoaSample],
             _wake_end_sample: u64,
-        ) -> Option<speech_surface::GazePose> {
+        ) -> Option<speech_surface::GazeLook> {
             None
         }
     }

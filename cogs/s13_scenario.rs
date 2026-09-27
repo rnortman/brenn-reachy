@@ -110,7 +110,7 @@ pub const DUPLICATE_AFTER_CLOSING: i64 = 20;
 /// robot's left, past the head's share so the body turns too.
 pub const LOOK_BEARING_MRAD: i32 = 698;
 
-/// The elevation it looks at, milliradians: the launcher's 27°.
+/// The elevation it looks at, milliradians: 27°, inside the launcher's range.
 pub const LOOK_ELEVATION_MRAD: i32 = 471;
 
 /// How long the second session holds the machine up, in cycles: the same travel

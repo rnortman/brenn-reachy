@@ -53,8 +53,10 @@ rust_binary(
 # dependencies and only that: the raise's offset has to cover the engagement,
 # whose allowance scales with the machine's joint count, and then holds long
 # enough for the
-# latter's stillness watch to judge at its default settle and minimum. The
-# binary links neither.
+# latter's stillness watch to judge at its default settle and minimum, and the
+# settle scripts' holds are measured from the floored clock of each move. The
+# binary links neither. `//cogs:schedule_clk_rs` is test-only too: the look
+# sweeps' steps are checked to compile to look rows.
 rust_test(
     name = "reachy_ask_test",
     size = "small",
@@ -63,12 +65,11 @@ rust_test(
         "fixtures/greeting.json",
         "fixtures/settle-evidence-1.json",
         "fixtures/settle-evidence-2.json",
-        "fixtures/settle-evidence-3.json",
-        "fixtures/settle-evidence-4.json",
-        "fixtures/settle-evidence-5.json",
-        "fixtures/settle-evidence-6.json",
+        "fixtures/look-sweep-1.json",
+        "fixtures/look-sweep-2.json",
     ],
     deps = [
+        "//cogs:schedule_clk_rs",
         "//cogs:scenario",
         "//crates/reachy-motion:reachy_motion",
         "//crates/reachy-scratch:reachy_scratch",

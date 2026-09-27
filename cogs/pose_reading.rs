@@ -1304,12 +1304,13 @@ pub const RECORDED_CAPABILITY_ANTENNAS: ClassProfile = ClassProfile {
     following_lag_us: 0,
 };
 
-/// The same reading for the body yaw, which read *gain-bound* on both tours:
-/// its velocity is the median of the bin two gaps out rather than a plateau's,
-/// and its acceleration is the median increase, because one goal step is fewer
-/// than [`CAPABILITY_STEP_MIN_SAMPLES`] and no ramp median exists. The
-/// acceleration is the shipped value, which is the reading: what holds this
-/// class back is its loop, not its motor.
+/// The same reading for the body yaw at `20 / 50` and `200 / 0 / 0`, which
+/// read *gain-bound* on both tours: its velocity is the median of the bin two
+/// gaps out rather than a plateau's, and its acceleration is the median
+/// increase, because one goal step is fewer than [`CAPABILITY_STEP_MIN_SAMPLES`]
+/// and no ramp median exists. The shipped class runs at the head servos'
+/// Velocity Limit register, not this reading; the one tour at `317 / 445`
+/// read gain-bound with a single goal step and offered no pair.
 pub const RECORDED_CAPABILITY_BODY_YAW: ClassProfile = ClassProfile {
     acceleration: 20,
     velocity: 48,
@@ -1730,6 +1731,11 @@ fn regime_of(bins: &[ErrorBin]) -> (Regime, Vec<FellAway>) {
     // walk. The condition is the exact complement of the gain-bound test inside
     // "not one speed", so a zero over a zero -- which `one_speed` refuses and
     // `>` does not order -- falls away too.
+    // TODO(capability-ramp-bands): a goal step's dead time and first ramp
+    // land in the band just under its step size, so a probe of one-size steps
+    // fills adjacent bands with one ramp and this walk reads them as a
+    // plateau. The goal-step listing knows where a ramp ends; the fix takes
+    // those periods out of the band table.
     let mut fell_away = Vec::new();
     let mut kept = readable.len();
     while kept >= 2 {
@@ -1822,8 +1828,8 @@ pub struct RecordedFloor {
     pub configuration: &'static str,
 }
 
-/// The body yaw's p99.9 residual under the shipped `20 / 50` pair, one figure
-/// per tour, in tour order.
+/// The body yaw's p99.9 residual under the `20 / 50` pair, one figure per
+/// tour, in tour order.
 ///
 /// Three figures and not one, because what a candidate pair's p99.9 is read for
 /// is *growth*, and the run-to-run spread between identically configured tours
@@ -1831,12 +1837,13 @@ pub struct RecordedFloor {
 /// not grown, one above its top has, by at least the amount above. A single
 /// tour's figure would have every reader mistaking the spread for a change.
 ///
-/// Read over three tours of the whole library at the `20 / 50` pair the class
-/// still runs, the `200 / 0 / 0` gains it still runs, and an identical clip
-/// library, walked at the measured dead time of two samples; provenance in
-/// `docs/servo-tuning.md`. The class was measured gain-bound at that pair — its
-/// loop and not its motor is what holds it back — so the pair was left there
-/// and these figures are the shipping configuration's.
+/// Read over three tours of the whole library at the `20 / 50` pair and the
+/// `200 / 0 / 0` gains, and an identical clip library, walked at the measured
+/// dead time of two samples; provenance in `docs/servo-tuning.md`. The class is
+/// now commissioned at `317 / 445` on `800 / 0 / 400`, where one armed tour
+/// read a p99.9 of 0.1128 rad; that is one figure, not a floor, so these stay
+/// the older configuration's until three tours at the shipping pair replace
+/// them, TODO(session-servo-profile).
 ///
 /// The other family of recorded residual figures off those same tours is the
 /// worst per joint group, `RECORDED_WORST_HEAD_RESIDUAL_RAD` and
@@ -1846,10 +1853,12 @@ pub struct RecordedFloor {
 /// at, and are re-baked together for that class or not at all: a fresh worst
 /// printed against a noise floor measured under some other configuration is a
 /// comparison of two machines. Where a figure is not read over three tours of
-/// the library, its own comment says so — the antennas' record below.
+/// the library, its own comment says so — the antennas' record below — and
+/// the body yaw's figures are its configuration before commissioning, as
+/// above.
 pub const RECORDED_P999_BODY_YAW_RESIDUAL_RAD: RecordedFloor = RecordedFloor {
     figures: [0.2754, 0.3264, 0.2488],
-    configuration: "at the pair and gains this class ships",
+    configuration: "at 20 / 50 and 200 / 0 / 0, the configuration the class ran before it was commissioned at the register",
 };
 
 /// The legs' p99.9 residual over three tours at the pair the class is
@@ -2858,7 +2867,7 @@ mod tests {
     /// The setpoints of a saturated move: further per period than the profile
     /// carries, which is what the recorded library is full of.
     fn saturated(count: usize) -> Vec<f64> {
-        (0..count).map(|n| 0.1 * n as f64).collect()
+        (0..count).map(|n| 0.5 * n as f64).collect()
     }
 
     /// The one assertion that separates this figure from the lag beside it: a
@@ -3042,7 +3051,21 @@ mod tests {
     /// branch that slows it down further.
     #[test]
     fn the_residual_summary_says_which_side_of_the_model_the_joint_stood() {
-        let plant = GroupPlants::default();
+        // A yaw whose cruise is long against its ramp, so that a reading a
+        // period early stands a whole period's travel ahead and trails only by
+        // the ramp: the `20 / 50` pair, where the two are eight to one.
+        let plant = GroupPlants::from_profiles(
+            &GroupProfiles {
+                yaw: ClassProfile {
+                    acceleration: 20,
+                    velocity: 50,
+                    following_lag_us: 0,
+                },
+                ..SHIPPED_PROFILES
+            },
+            PERIOD_NS,
+        )
+        .expect("the 20 / 50 pair is a model");
         let lagging = frozen(60, 2.0);
         let leading = chase(&plant, &saturated(60), 1);
         let index = driven();
@@ -3132,7 +3155,7 @@ mod tests {
             (
                 JointGroup::BodyYaw,
                 "0.2488–0.3264",
-                "at the pair and gains this class ships",
+                "at 20 / 50 and 200 / 0 / 0, the configuration the class ran before it was commissioned at the register",
             ),
             (
                 JointGroup::Legs,
@@ -3201,7 +3224,7 @@ mod tests {
     #[test]
     fn a_configuration_is_read_from_its_fields_and_not_from_the_comments_around_them() {
         let gains = "legs_p: 800\nlegs_i: 100\nlegs_d: 300\n\
-                     body_yaw_p: 200\nbody_yaw_i: 0\nbody_yaw_d: 0\n\
+                     body_yaw_p: 800\nbody_yaw_i: 0\nbody_yaw_d: 400\n\
                      antennas_p: 200\nantennas_i: 0\nantennas_d: 0\n";
         let commented = staged(
             "commented",

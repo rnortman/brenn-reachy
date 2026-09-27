@@ -496,78 +496,36 @@ wants an answer of its own with it. Marked at `Answer` in `cogs/sim_aux.rs`.
 
 ## `session-servo-profile`
 
-Commission the body yaw from measurement, as the legs and the antennas now are.
+Re-bake the body yaw's recorded figures at the pair it now ships, and the prose
+figures evaluated at a class's pair.
 
-Deferral context: two classes of the three are done and this entry is the third.
-The legs run `287 / 326`, read off a tour of the whole clip library with the
-generator wide open and confirmed on a tour at the pair. The antennas run
-`522 / 640`, their own measured capability: what stood between that pair and an
-armed detector was the plant model, which carried the servo's trajectory
-generator and not the position loop following it, and that loop's following lag
-is now a measured constant per class, read by the scan `plant.rs`' header
-describes and accepted only on the agreement of two recordings. Under it the
-antennas' worst residual at the measured pair reads 0.2536 rad against the
-0.4 rad bound a candidate is judged at, and six armed runs at the pair confirmed
-it. Both pairs and both lags are in `cogs/servo_profile.textproto` and
-`plant::SHIPPED_PROFILES`, the p99.9 floors are `RECORDED_P999_LEGS_RESIDUAL_RAD`
-and `RECORDED_P999_ANTENNAS_RESIDUAL_RAD`, and each class's worst window is a
-kept fixture. Both ladders, rung by rung, are in `docs/servo-tuning.md`.
+Deferral context: the body yaw is commissioned at `317 / 445` on gains
+`800 / 0 / 400`. The velocity is the head servos' Velocity Limit register,
+which the shaft cruised at on every long move of the step and hold probes at
+that gain rung, and the acceleration is those probes' ramp median. The pair was
+licensed on one armed library tour, not the usual three and a motion run,
+ahead of a demo. That tour read the yaw's worst residual at 0.2184 rad and its
+p99.9 at 0.1128 rad, with no raise. Its lag scans at `317 / 445` and
+`317 / 333` did not agree, so the class carries no lag. The same tour read the
+antennas' p99.9 at 0.2480 rad against their 0.1955-0.1988 floor, at an
+unchanged antenna configuration. Nothing explains that yet; a faster body yaw
+loading the rods is one possibility, and it is untested.
 
-The body yaw is measured and left where it is, and it is the class with no pair
-to commission and no reading that would offer one. The capability instrument
-reads it *gain-bound* at the shipped acceleration -- what holds it back is its
-loop and not its motor -- and the pair it does offer, `(20, 48)`, is inside the
-instrument's own repeatability ratio of the shipped `(20, 50)`. Its residual
-readings at the shipped pair span 0.3275-0.4035 rad over six tours, and one tour
-in three stands past the 0.4 rad bound a candidate would be judged at; that is
-the class's own spread, recorded, and not a capability reading. Its following
-lag is 0 for the same reason the pair is: a lag is read off a recording the
-class holds its generator's speed on, no run has ever put this motor there, and
-the scan runs out of grid rather than finding a floor. What headroom the class's
-loop has is headroom rather than the lever this entry needs, and stays
-`TODO(body-yaw-gains)`.
+What is still the older configuration's (`20 / 50` at `200 / 0 / 0`): the head
+pin `RECORDED_WORST_HEAD_RESIDUAL_RAD` in `crates/reachy-motion/src/tick.rs`
+and the fixture that holds it, `RECORDED_P999_BODY_YAW_RESIDUAL_RAD` and
+`RECORDED_CAPABILITY_BODY_YAW` in `cogs/pose_reading.rs`. The replay suite's
+saturated re-raise cases run on an explicit `20 / 50` yaw, because at the
+shipped pair no move inside the yaw's travel stays at the generator's cap for
+three windows. The prose figures evaluated at a class's pair -- the
+obstruction-cost paragraphs of `docs/fault-management.md` and the
+tracking-detector sentence in `CLAUDE.md` -- were written at the older pair.
 
-Next step: read the yaw's motor, which is a campaign of its own rather than a
-step here. A `probe/yaw-step` document -- a row in `cogs/probe_clips.rs`' table
--- played attended and with the tracking detector disarmed at a wide-open yaw
-profile, read by the capability instrument; then the same read-the-lag and
-commission-under-the-model procedure the antennas have just been through. Two
-things keep it out of the cycle that commissioned the antennas: no analyzer today
-reads a disarmed run, and a wide-open yaw step swings the whole head mass, which
-is the rapid head acceleration a wear question is about.
-
-Whoever commissions a pair also re-derives the prose figures evaluated at that
-class's pair: the obstruction-cost paragraphs of `docs/fault-management.md` and
-the tracking-detector sentence in `CLAUDE.md` -- the first raise's latency
-(`crossing_cycles() + ticks`), the settled-move grace
-(`ticks - pass_cycles(progress_min_rad)`), and the saturated-move grace, which
-is the window less the periods a released joint's from-rest ramp takes to reach
-`pace_min` of a generator at the cap -- the model's own walk, which moves with a
-class's loop as well as with its pair: three at the legs' commissioned pair and
-measured lag, where the trapezoid alone gave two, and its own count at any
-other. Every one of them is a figure for
-content that runs the class at its profile velocity, and the documents say so.
-The scenario suite is written over those expressions and moves by itself; the
-documents do not, and no test reads a document.
-
-The recorded residual figures are one configuration's reading per class and are
-re-baked per class or not at all -- a fresh worst printed against a noise floor
-measured under some other configuration compares two machines. The set is
-`RECORDED_WORST_HEAD_RESIDUAL_RAD` and `RECORDED_WORST_ANTENNA_RESIDUAL_RAD` in
-`crates/reachy-motion/src/tick.rs`, the three `RECORDED_P999_*_RESIDUAL_RAD`
-arrays and the three `RECORDED_CAPABILITY_*` pairs in `cogs/pose_reading.rs`,
-and the replay suite's own pinned worsts. The reading those comments defer is
-still open: one recorded tour ran the body yaw to 0.4024 rad, so the threshold
-stands at 1.491 times the largest sample on record rather than the 1.5 the
-sizing rule asks for, and the tree ships that knowingly. The threshold is not
-widened to close the gap; what closes it is a pair whose worst leaves the
-margin, or a decision, recorded, that 1.491 is the margin this machine has.
-
-Done = the body yaw either commissioned at a measured pair or recorded as not
-commissionable under this detector, with the run that says so. Marked at the
-profile fields in `cogs/config.clk`, at `SHIPPED_PROFILES` in
-`crates/reachy-motion/src/plant.rs` and at the head residual pin in
-`crates/reachy-motion/src/tick.rs`.
+Done = three armed tours and a motion run at the shipping pair, their worst
+yaw window cut as a kept fixture, the three yaw figures above re-baked from
+them, the antennas' p99.9 growth read against them, and the prose figures
+re-derived. Marked at the profile fields in `cogs/config.clk` and at the head
+residual pin in `crates/reachy-motion/src/tick.rs`.
 
 ## `aux-pending-carries-bustxn`
 
@@ -1257,42 +1215,6 @@ Done = `stt_compare` has no stream loop of its own, and `futures` is named by
 this repository only if something else still needs it. Marked at `transcribe` in
 `crates/reachy-host/src/bin/stt_compare.rs`.
 
-## `body-yaw-gains`
-
-Headroom: a stiffer body-yaw loop, a derivative term first, if a measured yaw
-pair ever wants one.
-
-Deferral context: the yaw is the one class that reads gain-bound rather than
-motor-bound -- it reached 48 velocity units on a tour where the legs reached
-326 and the antennas 640 -- so what caps it is its own loop and not its motor.
-The P-only climb was walked and came back non-monotonic: over the wake gesture's
-17 s stow hold, 400 limit-cycles at 3.0 counts and 8-11 Hz apparent in three
-holds of three, 800 in one of three, and the vendor's 200 sits at 2.0 counts of
-dither inside the two-count bound. Damping is what a P-only ladder has none of,
-which is why a derivative term is the rung after it rather than a fourth
-proportional one.
-
-What changed the standing of this entry is the plant model. A stiffer loop used
-to be the only lever against the yaw's own following lag, because the model
-carried the servo's trajectory generator and nothing that follows it, so every
-period the loop trailed came out of the tracking screen. The model now carries a
-measured following lag per class, and the yaw's is 0 for a reason that is about
-the instrument and not the loop: no recording has ever put this motor at its
-generator's speed, so there is nothing to read a lag off. So the loop's
-stiffness is no longer what stands between the yaw and a faster pair -- its
-unmeasured motor is, and reading that is `TODO(session-servo-profile)`'s
-campaign. Nothing has complained about the yaw at the pair it runs.
-
-Done = either a derivative term is committed with the hold it was measured on,
-or the record says a stiffer yaw loop is not available and the entry closes on
-that. Walk it when a measured yaw pair asks for it -- a candidate the loop
-cannot hold quietly is the reading that makes this worth doing -- or on its own
-if the hold is ever judged a defect. The instruments are `hold-probe <yaw id>
---gains P,I,D` for the ladder and a motion run that produces the long stow hold
-for the verdict. Marked at both: the yaw's triple in
-`cogs/servo_gains.textproto` and `DEFAULT_GAINS.yaw` in
-`crates/reachy-motion/src/arm.rs`.
-
 ## `antenna-raise-clock`
 
 Give the antennas' raise its own clock, so the wake gesture can snap the
@@ -1399,6 +1321,162 @@ Deferral context: the bench runs one sender against one control process, which p
 
 ## `quality-gaze-check-bool-threaded-and-unreached-by-deploy`
 
-Make the speech run's deploy preflight check what the launcher will start. `tools/deploy-motion.sh` `speech_preflight` runs `reachy_host --speech-config <file> --check`, but the production launcher entry (`host/host_launch.textproto`, `voice_host`) also passes `--idle cogs/idle.json` and `--gaze-elevation-deg 27`. So `--check`'s playlist conclusion and its gaze-ladder conclusion (whether the deployed name table holds the five ladder poses) are never run before a unit starts. A playlist the host refuses, or a site name table missing a ladder pose, is found only on the unit.
+Make the speech run's deploy preflight check what the launcher will start. `tools/deploy-motion.sh` `speech_preflight` runs `reachy_host --speech-config <file> --check`, but the production launcher entry (`host/host_launch.textproto`, `voice_host`) also passes `--idle cogs/idle.json`, and `--check` is run without it. So `--check`'s playlist conclusion is never run before a unit starts, and a playlist the host refuses is found only on the unit. `--gaze-elevation-deg` needs no conclusion: the argument parser refuses a value outside 0°–30° at start.
 
-Deferral context: the gap for `--idle` goes back to when the idle loop was added, and the gaze flag widened it. What is left to decide is where the launch arguments are stated once. The options are: the preflight reads them out of the launcher config it is about to start (the speech and record kinds use different launcher configs and different arguments); a second copy in the script, pinned to the textproto by a test; or `--check` taking the launcher config itself. That is a decision about the deploy tooling, and its test suite changes with it. The committed library is guarded meanwhile by `gaze_ladder_test` and the idle tests. Marked at the `--check` invocation in `speech_preflight`, `tools/deploy-motion.sh`.
+Deferral context: the gap for `--idle` goes back to when the idle loop was added. What is left to decide is where the launch arguments are stated once. The options are: the preflight reads them out of the launcher config it is about to start (the speech and record kinds use different launcher configs and different arguments); a second copy in the script, pinned to the textproto by a test; or `--check` taking the launcher config itself. That is a decision about the deploy tooling, and its test suite changes with it. The committed library is guarded meanwhile by the idle tests. Marked at the `--check` invocation in `speech_preflight`, `tools/deploy-motion.sh`.
+
+## `legs-arrival-braking`
+
+Make the legs' loop brake a committed pose's arrival, or state what it does.
+On a 1000 ms min-jerk arrival the legs trail the setpoint by 80-160 counts
+mid-move and cannot brake as fast as it decelerates: the crank crosses the
+setpoint 50-140 ms before it stops, stands 19-25 counts past it, holds flat
+for 0.4-1.2 s, and the integral term winds it in at about a count per
+100 ms. Whether the answer is a derivative rung for the legs, a profile
+change, or a settle bound that states the overshoot is a ladder on the
+loaded class read under the settle-evidence walks, and a campaign of its
+own.
+
+Deferral context: read on 2026-09-27 at 18-25 counts where 2026-09-20 read
+16-17 on the same moves at identical configuration. `SETTLE_BOUND_COUNTS` is
+baked at 25 from those walks, and a walk past it is a finding. The cause of
+the growth is not known. Marked at the legs' triple in
+`cogs/servo_gains.textproto`.
+
+## `capability-ramp-bands`
+
+Take a goal step's ramp out of the capability band table. Every move of a step
+probe puts its dead-time and first-ramp samples in the band just under its step
+size, and `regime_of` reads adjacent bands of one speed as a plateau, so a step
+probe on a loaded joint reads its ramp as the ceiling -- or thins the bands it
+needs when the joint crosses a band in under a period -- and the body yaw's
+motor is unread by the instrument. The goal-step listing already knows where a
+ramp ends; the band table should not count those periods.
+
+Deferral context: on 2026-09-27's derivative ladder the 24-step yaw probe read
+115 units motor-bound at Y1 off three ramp bands while the 0.3-0.4 rad band read
+224, gain-bound at Y2 by one sample, and content-bound at Y3 with the shaft at
+the 445-unit Velocity Limit register. The yaw was commissioned from the register
+and the ramp median instead. Marked at the band walk in `regime_of`,
+`cogs/pose_reading.rs`.
+
+## `reuse-look-composition-hand-rolled-four-more-times`
+
+Give the look's composition one conversion. The Mover's `BASE_LOOK` dispatch in
+`cogs/motion_cogs.rs` and the scenario library's `look_pose_at` in
+`cogs/scenario.rs` both decode the wire milliradians, call
+`reachy_kin::look::target`, and copy `head_pose_body`, `body_yaw` and `antennas`
+out of `LookTargets` into `JointTargets` by hand. Add `impl
+From<reachy_kin::LookTargets> for JointTargets` in `reachy-motion`, which
+already depends on `reachy-kin`, and use it at those two sites. The test copies
+(`look_targets` and `look_rows` in `cogs/motion_cog_test.rs`, the `look_at`
+closure in the `tick.rs` tests, the `look` closure in the scenario library pin)
+keep composing on their own, or call `scenario::look_pose_at`. A test that takes
+its expected goal from the production composition checks only that the Mover
+called the function the test called.
+
+Deferral context: Every copy agrees today. This is a reuse tidy-up with no
+behaviour change, held until after the current demo. Marked at the `BASE_LOOK`
+branch of the Mover's step decode, `cogs/motion_cogs.rs`.
+
+## `quality-elevation-range-stated-twice-without-a-join`
+
+Tie the launcher's elevation range to the sweep that proves it.
+`reachy_host::gaze::ELEVATION_RANGE_DEG` is `0.0..=30.0`. `reachy_kin::look`'s
+`every_look_in_the_launcher_s_range_passes_the_envelope` sweeps `for e in
+0..=30`. Only a doc sentence joins them, so widening the host's range leaves the
+sweep green over elevations it never checked. The refusal would then move from
+host start-up to the Mover on each wake. Either define the range once in
+`reachy_kin::look`, iterate it in the sweep and use it in the host; or keep the
+host's constant and add a host test asserting its bounds against a constant the
+kin sweep is built from.
+
+Deferral context: The Mover's envelope check still refuses an unreachable look,
+so this is not a safety gap, and the range is not being changed now. The range
+was placed in the host on purpose, as the launcher's policy. Moving it is a
+decision about ownership, and the assertion route is the smaller change. Marked
+at `ELEVATION_RANGE_DEG`, `crates/reachy-host/src/gaze.rs`.
+
+## `quality-clock-stretch-bool-pair-admits-invalid-state`
+
+Decide whether `ClockStretch`'s `span_stretched: bool` and `body_paced: bool`
+should be one three-way field (not stretched, stretched by the body yaw alone,
+stretched by something else). `floor_move_clock` never sets `body_paced` without
+`span_stretched`, since it computes `body_paced` under `sized != requested`. The
+type still admits the combination, though, and only a test helper's assertion in
+`cogs/mover_overlay.rs` guards it. `count_adjustment` still has to read the
+goal's kind next to the stretch, so an enum removes the invalid state but not
+that conjunction.
+
+Deferral context: No producer builds the invalid combination; only a hand-built
+fixture could. The two-flag shape was chosen deliberately when the body-paced
+bucket was introduced and kept when the bucket was renamed. Replacing it touches
+a public `reachy-motion` type, `count_adjustment`, the scenario library pin and
+the counting cases, so it needs a design pass. Marked at
+`ClockStretch::body_paced`, `crates/reachy-motion/src/tick.rs`.
+
+## `reuse-wire-mrad-conversions-hand-rolled`
+
+Put the look's wire unit conversions beside its range constants. `motion-proto`
+states the look's range in milliradians (`MAX_LOOK_BEARING_MRAD`,
+`MAX_LOOK_ELEVATION_MRAD`) but not the conversion. The host encodes with a
+private `mrad(radians)` in `crates/reachy-host/src/gaze.rs`. The Mover's step
+decode (`cogs/motion_cogs.rs`), the run report's `degrees` closure
+(`cogs/motion_run_report.rs`), `scenario::look_pose_at` and test helpers each
+decode `/ 1000.0` themselves, and a test in `crates/reachy-ask/src/script.rs`
+has an `mrad(degrees)` taking a different unit under the same name. Add
+`look_mrad_from_rad(f64) -> i32` (nearest milliradian) and
+`look_rad_from_mrad(i32) -> f64` to `motion-proto` and use them at those sites.
+
+Deferral context: Every encode rounds to the nearest milliradian and every
+decode divides by 1000, so the two ends agree today. This is a readability and
+reuse tidy-up held until after the current demo. Marked at
+`MAX_LOOK_BEARING_MRAD`, `crates/motion-proto/src/script.rs`.
+
+## `efficiency-look-grid-pin-dominates-a-small-test-target`
+
+Cut the look library pin's runtime without thinning its grid. The pin in
+`cogs/scenario.rs` runs `floor_move_clock` for every committed pose × head yaw
+in [−54°, 54°] × elevation in [0°, 30°] at 3° steps × two shares. Where the body
+moves it runs a second `floor_move_clock` for the legs' floor.
+`//cogs:scenario_test` is `size = "small"` and runs in about 21 s against the 60
+s budget, and every `make check` pays for it. The legs' floor is never below the
+look clock (the effective head clock is asserted at least the clock, and the
+fallback is the clock), so when `s.effective.head <= head_clock + body_floor`
+the bound already holds and the re-floor can be skipped. Compute `body_floor`
+first and run the held move only when that cheap bound fails. If the cost is
+still too high, state it with `size = "medium"` rather than thinning the grid.
+
+Deferral context: No timeout has occurred: about 22 s at the 30° share and 21 s
+at the shipped 0.16 rad share. The grid's extent is the configuration check that
+keeps look traffic out of `base_stretched`, so thinning it is a design decision.
+The in-test skip is not, and is the first route. Marked at the legs' floor in
+the pin's `forward` closure, `cogs/scenario.rs`.
+
+## `correctness-look-share-0-16-leaves-bearings-past-169-deg-unreachable`
+
+Decide how a look past the body's reach is answered. A look's body yaw is the
+bearing less the head's share (`reachy_kin::look::target`), and the envelope
+caps the body yaw at 160°. The wire carries bearings up to 3141 mrad. So any
+share under about 0.349 rad (20°) leaves a band of wire bearings that
+`Raise::from_gaze` accepts and the tick refuses as `CommandRejected`, with no
+fault response. At the shipped 0.16 rad share the band is |bearing| from 2953
+to 3141 mrad (about 169° to 180°). The gaze can only produce such a bearing
+once a previous look has turned the body about 80° or more. A wake from a
+talker there then moves nothing, and the configured wake pose is not taken in
+its place, because the refusal happens downstream of the gaze seam. There are
+two routes. One is a share floor in the Mover's `Settings::of`, which would
+refuse the shipped share. The other is a typed gaze decline for that band,
+which needs a reach bound at the host that does not copy the Mover's share.
+Either route should come with a case that flies a look at ±3141 mrad through
+the shipped Mover configuration and asserts the chosen outcome. Neither route
+clamps the bearing.
+
+Deferral context: The 0.16 rad share is the owner's deliberate retune for a
+slower, more comfortable look. At the earlier 30° share every wire bearing was
+within the body's reach. Today's behaviour is the envelope refusal a look past
+the body's reach has always received: nothing moves, and the story shows the
+refusal. The geometry needs a talker behind a robot that is already turned
+sideways. Choosing between refusing the owner's share and adding a new decline
+path is a design decision. Marked at the share check in `Settings::of`,
+`cogs/motion_cogs.rs`.

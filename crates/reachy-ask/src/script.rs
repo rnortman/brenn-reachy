@@ -92,23 +92,33 @@ mod tests {
             "settle-evidence-2",
             include_str!("../fixtures/settle-evidence-2.json"),
         ),
+    ];
+    const LOOK_SWEEPS: &[(&str, &str)] = &[
         (
-            "settle-evidence-3",
-            include_str!("../fixtures/settle-evidence-3.json"),
+            "look-sweep-1",
+            include_str!("../fixtures/look-sweep-1.json"),
         ),
         (
-            "settle-evidence-4",
-            include_str!("../fixtures/settle-evidence-4.json"),
-        ),
-        (
-            "settle-evidence-5",
-            include_str!("../fixtures/settle-evidence-5.json"),
-        ),
-        (
-            "settle-evidence-6",
-            include_str!("../fixtures/settle-evidence-6.json"),
+            "look-sweep-2",
+            include_str!("../fixtures/look-sweep-2.json"),
         ),
     ];
+
+    /// How long every settle script holds a target once its move's clock has
+    /// run out: the stillness watch's own settle allowance.
+    const HOLD_MS: u64 = 4_000;
+
+    /// The bearings the look sweeps face, degrees.
+    const SWEEP_BEARINGS_DEG: [f64; 13] = [
+        0.0, 15.0, -15.0, 30.0, -30.0, 45.0, -45.0, 60.0, -60.0, 90.0, -90.0, 120.0, -120.0,
+    ];
+
+    /// The talker elevation every sweep look carries, degrees.
+    const SWEEP_ELEVATION_DEG: f64 = 27.0;
+
+    /// The head share the look sweeps' overlay run is flown under, degrees;
+    /// the other run is flown at the shipped `scenario::LOOK_HEAD_SHARE_RAD`.
+    const SWEEP_OVERLAY_SHARE_DEG: f64 = 45.0;
 
     struct Sink {
         lines: Vec<String>,
@@ -271,8 +281,145 @@ mod tests {
         }
     }
 
+    /// `degrees` to the nearest milliradian, the wire's look unit.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "every angle here is at most 120 degrees, about 2094 milliradians"
+    )]
+    fn mrad(degrees: f64) -> i32 {
+        (degrees.to_radians() * 1000.0).round() as i32
+    }
+
+    fn hold_is_the_settle_allowance() {
+        assert_eq!(
+            u128::from(HOLD_MS),
+            reachy_motion::stillness::StillnessConfig::default()
+                .settle
+                .as_millis()
+        );
+    }
+
+    /// The clock the Mover floors a move from `from` to `to` on `pace` to, at
+    /// the shipped configuration, in whole milliseconds rounded up: the longest
+    /// of the head's and the two antennas' clocks.
+    fn clock_ms(
+        from: &reachy_motion::joints::JointTargets,
+        to: &reachy_motion::joints::JointTargets,
+        pace: Duration,
+    ) -> u64 {
+        use reachy_motion::tick::{MotionCommand, default_motion_config, floor_move_clock};
+        use reachy_motion::traj::{MoveDurations, WarpKind};
+        let command = MotionCommand::MoveTo {
+            target: *to,
+            durations: MoveDurations::uniform(pace),
+            warp: WarpKind::MinJerk,
+        };
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the period is 20 ms in nanoseconds, exact in an f64"
+        )]
+        let tick_hz = 1e9 / scenario::PERIOD_NS as f64;
+        let (floored, _) = floor_move_clock(default_motion_config(), from, &command, tick_hz);
+        let MotionCommand::MoveTo { durations, .. } = floored else {
+            panic!("a floored move is a move")
+        };
+        let longest = durations
+            .head
+            .max(durations.antennas[0])
+            .max(durations.antennas[1]);
+        u64::try_from(longest.as_nanos().div_ceil(1_000_000)).expect("a clock in ms")
+    }
+
+    /// Where `step` sends the machine and the pace it asks: a pose's library
+    /// targets and duration, or a look's composition at `head_share` on the
+    /// deployed look clock.
+    fn targets_of(step: &Step, head_share: f64) -> (reachy_motion::joints::JointTargets, Duration) {
+        match step.action.base() {
+            Some(motion_proto::Base::Pose { name, .. }) => scenario::pose_library()
+                .targets(scenario::pose_id(name))
+                .unwrap_or_else(|| panic!("{name} is in the committed pose library")),
+            Some(motion_proto::Base::Look {
+                bearing_mrad,
+                elevation_mrad,
+            }) => (
+                scenario::look_pose_at(*bearing_mrad, *elevation_mrad, head_share),
+                Duration::from_millis(
+                    u64::try_from(scenario::LOOK_HEAD_MS).expect("a positive look clock"),
+                ),
+            ),
+            other => panic!("a settle script steps to a pose or a look, not {other:?}"),
+        }
+    }
+
+    /// The offsets and timeout a settle script's steps must carry: the first
+    /// move at 8 s, each next one when the previous move's floored clock has
+    /// run and the target has been held [`HOLD_MS`], and the timeout when the
+    /// closing stow's clock has run. A move's clock is the longer of its
+    /// floored clocks at the two shares the scripts are flown under, the
+    /// shipped one and [`SWEEP_OVERLAY_SHARE_DEG`], so every hold is at least
+    /// [`HOLD_MS`] at both. Each move starts from the previous step's target at
+    /// the same share, the first from the stow.
+    fn expected_timing(steps: &[Step]) -> (Vec<u64>, u64) {
+        let shares = [
+            scenario::LOOK_HEAD_SHARE_RAD,
+            SWEEP_OVERLAY_SHARE_DEG.to_radians(),
+        ];
+        let mut offsets = Vec::with_capacity(steps.len());
+        let mut from = [scenario::stow_pose(); 2];
+        let mut at = 8_000;
+        let mut last_clock = 0;
+        for step in steps {
+            if !offsets.is_empty() {
+                at += last_clock + HOLD_MS;
+            }
+            offsets.push(at);
+            last_clock = 0;
+            for (start, share) in from.iter_mut().zip(shares) {
+                let (to, pace) = targets_of(step, share);
+                last_clock = last_clock.max(clock_ms(start, &to, pace));
+                *start = to;
+            }
+        }
+        (offsets, at + last_clock)
+    }
+
+    /// The script's own offsets and timeout against [`expected_timing`]'s,
+    /// printing both whole on a mismatch.
+    fn assert_timing(label: &str, script: &MotionScript) {
+        let steps = script.steps();
+        let actual: Vec<u64> = steps.iter().map(|step| step.after_ms).collect();
+        let (expected, timeout) = expected_timing(steps);
+        assert!(
+            (actual.as_slice(), script.timeout_ms()) == (expected.as_slice(), timeout),
+            "{label}: offsets {actual:?}, timeout {}; the rule gives offsets {expected:?}, \
+             timeout {timeout}",
+            script.timeout_ms()
+        );
+    }
+
+    /// The script `body` as the embedded edge accepts it.
+    fn accept(label: &str, body: &str) -> reachy_edge::Accepted {
+        let mut edge = HostEdge::new(
+            EdgeConfig::for_pod(crate::gesture::ASK_POD),
+            crate::gesture::motions().clone(),
+            crate::gesture::poses().clone(),
+        );
+        let mut sink = Sink { lines: Vec::new() };
+        edge.offer(
+            body.as_bytes(),
+            Origin::Local,
+            SyncTime::from_nanos(1_700_000_000_000_000_000),
+            &mut sink,
+        )
+        .unwrap_or_else(|| panic!("{label} refused: {}", sink.lines.join("\n")))
+    }
+
+    /// The two walks hold every committed pose, and step between every ordered
+    /// pair of them, on the timing rule: each move on the clock the Mover floors
+    /// it to, then a 4 s hold.
     #[test]
     fn settle_evidence_walks_are_derived_from_the_committed_pose_table() {
+        hold_is_the_settle_allowance();
         let poses = crate::gesture::poses();
         let by_name: std::collections::BTreeMap<_, _> = poses
             .entries()
@@ -286,11 +433,13 @@ mod tests {
             let steps = script.steps();
             assert!(!steps.is_empty());
             assert_eq!(steps[0].after_ms, 8_000);
-            assert!(steps.iter().all(|step| step.action.base().is_some()));
             assert!(
-                steps
-                    .iter()
-                    .all(|step| { !matches!(step.action, Action::Base(motion_proto::Base::Keep)) })
+                steps.iter().all(|step| step
+                    .action
+                    .base()
+                    .and_then(motion_proto::Base::pose)
+                    .is_some()),
+                "{label}: every step is a pose"
             );
             assert_eq!(
                 steps
@@ -298,40 +447,10 @@ mod tests {
                     .and_then(|step| step.action.base().and_then(motion_proto::Base::pose)),
                 Some(motion_proto::STOW_POSE)
             );
-            for pair in steps.windows(2) {
-                let from = pair[0]
-                    .action
-                    .base()
-                    .and_then(motion_proto::Base::pose)
-                    .expect("base pose");
-                let duration = by_name.get(from).expect("known source pose").duration_ms;
-                assert_eq!(
-                    pair[1].after_ms,
-                    pair[0].after_ms + u64::from(duration) + 1_500
-                );
-            }
-            let last = steps.last().expect("last step");
-            let stow = by_name.get(motion_proto::STOW_POSE).expect("stow");
-            assert_eq!(
-                script.timeout_ms(),
-                last.after_ms + u64::from(stow.duration_ms)
-            );
+            assert_timing(label, &script);
             assert!(steps.len() <= reachy_edge::compile::MAX_STEPS);
 
-            let mut edge = HostEdge::new(
-                EdgeConfig::for_pod(crate::gesture::ASK_POD),
-                crate::gesture::motions().clone(),
-                poses.clone(),
-            );
-            let mut sink = Sink { lines: Vec::new() };
-            let accepted = edge
-                .offer(
-                    body.as_bytes(),
-                    Origin::Local,
-                    SyncTime::from_nanos(1_700_000_000_000_000_000),
-                    &mut sink,
-                )
-                .unwrap_or_else(|| panic!("{label} refused: {}", sink.lines.join("\n")));
+            let accepted = accept(label, body);
             assert_eq!(accepted.message.steps().len(), steps.len());
             assert!(accepted.message.overlays().is_empty());
             for (expected, actual) in steps.iter().zip(accepted.message.steps().iter()) {
@@ -367,7 +486,7 @@ mod tests {
             candidate_counts.push(steps.len() - 1);
         }
 
-        assert_eq!(candidate_counts, vec![10, 12, 14, 14, 14, 14]);
+        assert_eq!(candidate_counts, vec![10, 12]);
         let names: Vec<_> = poses.entries().map(|(name, _)| name.to_owned()).collect();
         let expected: std::collections::BTreeSet<_> = names
             .iter()
@@ -379,5 +498,106 @@ mod tests {
             })
             .collect();
         assert_eq!(pairs, expected);
+    }
+
+    /// The two look sweeps face every bearing from 0° to ±120° at 27°, start
+    /// looks from `neutral`, `hello`, `peek_tilt` and from other looks, and
+    /// hold each target at least 4 s after its move.
+    ///
+    /// The sweeps are flown at the shipped share and at the 45° overlay share.
+    /// Each offset is set by whichever of the two shares floors the previous
+    /// move longer, so every hold is at least 4 s at both shares and exactly
+    /// 4 s at the share that set it.
+    #[test]
+    fn the_look_sweeps_face_every_bearing_from_every_start_and_hold_each() {
+        use brenn_reachy__cogs__schedule_clk_rs::StepKindWire;
+        hold_is_the_settle_allowance();
+        let elevation = mrad(SWEEP_ELEVATION_DEG);
+        let mut bearings_expected: Vec<i32> = SWEEP_BEARINGS_DEG.iter().map(|d| mrad(*d)).collect();
+        bearings_expected.sort_unstable();
+        let mut before_a_look = std::collections::BTreeSet::new();
+
+        for (label, body) in LOOK_SWEEPS {
+            let script = MotionScript::decode(body).expect("look sweep decodes");
+            let steps = script.steps();
+            assert_eq!(steps[0].after_ms, 8_000, "{label}");
+            assert!(
+                steps.iter().all(|step| matches!(
+                    step.action.base(),
+                    Some(motion_proto::Base::Pose { .. } | motion_proto::Base::Look { .. })
+                )),
+                "{label}: every step is a base step and none is a keep"
+            );
+            assert_eq!(
+                steps
+                    .last()
+                    .and_then(|step| step.action.base().and_then(motion_proto::Base::pose)),
+                Some(motion_proto::STOW_POSE),
+                "{label}"
+            );
+            assert!(steps.len() <= reachy_edge::compile::MAX_STEPS, "{label}");
+
+            let looks: Vec<(i32, i32)> = steps
+                .iter()
+                .filter_map(|step| match step.action.base() {
+                    Some(motion_proto::Base::Look {
+                        bearing_mrad,
+                        elevation_mrad,
+                    }) => Some((*bearing_mrad, *elevation_mrad)),
+                    _ => None,
+                })
+                .collect();
+            let mut bearings: Vec<i32> = looks.iter().map(|&(bearing, _)| bearing).collect();
+            bearings.sort_unstable();
+            assert_eq!(bearings, bearings_expected, "{label}");
+            assert!(
+                looks.iter().all(|&(_, e)| e == elevation),
+                "{label}: {looks:?}"
+            );
+            assert_timing(label, &script);
+
+            let mut look_after_look = false;
+            for pair in steps.windows(2) {
+                if let Some(motion_proto::Base::Look { .. }) = pair[1].action.base() {
+                    match pair[0].action.base() {
+                        Some(motion_proto::Base::Look { .. }) => look_after_look = true,
+                        Some(motion_proto::Base::Pose { name, .. }) => {
+                            before_a_look.insert(name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert!(look_after_look, "{label}: a look starts from a look");
+
+            let accepted = accept(label, body);
+            assert_eq!(accepted.message.steps().len(), steps.len(), "{label}");
+            assert!(accepted.message.overlays().is_empty(), "{label}");
+            for (expected, actual) in steps.iter().zip(accepted.message.steps().iter()) {
+                match expected.action.base() {
+                    Some(motion_proto::Base::Look {
+                        bearing_mrad,
+                        elevation_mrad,
+                    }) => {
+                        assert_eq!(actual.kind(), StepKindWire::BASE_LOOK, "{label}");
+                        assert_eq!(actual.bearing_mrad(), *bearing_mrad, "{label}");
+                        assert_eq!(actual.elevation_mrad(), *elevation_mrad, "{label}");
+                    }
+                    Some(motion_proto::Base::Pose { name, .. }) => {
+                        assert_eq!(actual.pose_id(), scenario::pose_id(name), "{label}: {name}");
+                    }
+                    other => panic!("{label}: {other:?}"),
+                }
+                assert_eq!(
+                    actual.after_ms(),
+                    u32::try_from(expected.after_ms).expect("offset"),
+                    "{label}"
+                );
+            }
+        }
+
+        for start in ["neutral", "hello", "peek_tilt"] {
+            assert!(before_a_look.contains(start), "{start}: {before_a_look:?}");
+        }
     }
 }

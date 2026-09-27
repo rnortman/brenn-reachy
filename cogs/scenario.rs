@@ -214,10 +214,11 @@ pub const LEGS_PROFILE_VELOCITY: i64 = 326;
 
 /// The body yaw servo's profile acceleration, register units. Its own pair
 /// because its motor and its load are its own.
-pub const BODY_YAW_PROFILE_ACCELERATION: i64 = 20;
+pub const BODY_YAW_PROFILE_ACCELERATION: i64 = 317;
 
-/// The body yaw servo's profile velocity, register units.
-pub const BODY_YAW_PROFILE_VELOCITY: i64 = 50;
+/// The body yaw servo's profile velocity, register units: the head servos'
+/// Velocity Limit register.
+pub const BODY_YAW_PROFILE_VELOCITY: i64 = 445;
 
 /// The two antennas' profile acceleration, register units. Their own pair: the
 /// antenna servos are a different XL330 variant with a Velocity Limit 3.6x the
@@ -257,12 +258,14 @@ pub const ANTENNAS_FOLLOWING_LAG_US: i64 = 24_000;
 /// processes read.
 pub const TRACKING_ARMED: bool = true;
 
-/// The most of a look's bearing the head carries, radians: 30 degrees, the
-/// share the deployed `MoverParams` ships with.
-pub const LOOK_HEAD_SHARE_RAD: f64 = core::f64::consts::FRAC_PI_6;
+/// The most of a look's bearing the head carries, radians: about 9 degrees,
+/// the share the deployed `MoverParams` ships with.
+pub const LOOK_HEAD_SHARE_RAD: f64 = 0.16;
 
 /// The head group's clock for a look, milliseconds, as the deployed
-/// `MoverParams` states it.
+/// `MoverParams` states it: a lower bound the Mover's floor lengthens for
+/// whichever joint cannot carry its span, which the library pin in this
+/// module's tests holds.
 pub const LOOK_HEAD_MS: i64 = 400;
 
 /// The servos' Bus Watchdog timeout the commissioning sweep arms, in the
@@ -1136,12 +1139,22 @@ pub fn neutral_pose() -> reachy_motion::joints::JointTargets {
 /// composition to the rule rather than to itself.
 #[must_use]
 pub fn look_pose(bearing_mrad: i32, elevation_mrad: i32) -> reachy_motion::joints::JointTargets {
+    look_pose_at(bearing_mrad, elevation_mrad, LOOK_HEAD_SHARE_RAD)
+}
+
+/// Where a look at `bearing_mrad`, `elevation_mrad` puts the machine when the
+/// head carries at most `head_share` radians of the bearing:
+/// `reachy_kin::look::target` at the angles in radians.
+#[must_use]
+pub fn look_pose_at(
+    bearing_mrad: i32,
+    elevation_mrad: i32,
+    head_share: f64,
+) -> reachy_motion::joints::JointTargets {
     let look = reachy_kin::look::target(
         f64::from(bearing_mrad) / 1000.0,
         f64::from(elevation_mrad) / 1000.0,
-        &reachy_kin::LookPolicy {
-            head_share: LOOK_HEAD_SHARE_RAD,
-        },
+        &reachy_kin::LookPolicy { head_share },
     );
     reachy_motion::joints::JointTargets {
         head_pose_body: look.head_pose_body,
@@ -1153,8 +1166,8 @@ pub fn look_pose(bearing_mrad: i32, elevation_mrad: i32) -> reachy_motion::joint
 /// The clocks a look from `from` to `to` runs on: the deployed head clock,
 /// floored the way the mover floors it.
 ///
-/// Assumes the mover clocks a look as it clocks a posture move to the same
-/// targets on the look's head clock.
+/// A look's goal is a target and a pair of clocks, like a pose's, so this is
+/// the mover's own floor over the goal a look dispatches.
 #[must_use]
 pub fn look_clocks(
     from: &reachy_motion::joints::JointTargets,
@@ -1860,6 +1873,198 @@ mod tests {
         head_jam_rows, head_up_travel, jam_on_the_raise, motion_id, motion_table, posture_joints,
         response_delay_cycles, travel_cycles, unjudgeable_step, up_clocks, up_travel, up_walk,
     };
+
+    /// Every look from every committed pose plans to a clock at least the shipped
+    /// look clock and at most the legs' floor plus the body's floor from that
+    /// start, with the antenna pair parted, so no look counts in
+    /// `base_stretched`. No return from a look to any committed pose on its own
+    /// clock is stretched by anything but the body's swing.
+    ///
+    /// This is what keeps `base_stretched` untouched by look traffic and by pose
+    /// returns. A pose or clock that breaks the return half is a configuration
+    /// change, to be sized here first.
+    ///
+    /// Inside the share the body stays at zero, so the grid covers the legs'
+    /// whole range. The bearings past the share are what exercise the body.
+    #[test]
+    fn every_look_the_demo_makes_is_paced_and_every_return_is_carried_or_paced_by_the_body() {
+        use std::time::Duration;
+
+        use reachy_motion::joints::JointTargets;
+        use reachy_motion::tick::{
+            MotionCommand, default_motion_config, dry_pass_peaks, duration_floor_s,
+            floor_move_clock,
+        };
+        use reachy_motion::traj::{MoveDurations, WarpKind};
+
+        const BEARINGS: [i32; 13] = [0, 15, -15, 30, -30, 45, -45, 60, -60, 90, -90, 120, -120];
+        const ELEVATIONS: [i32; 2] = [0, 30];
+
+        let cfg = default_motion_config();
+        let tick_hz = 1e9 / PERIOD_NS as f64;
+        let library = super::pose_library();
+        let poses: Vec<(u16, JointTargets, Duration)> = (0..library.len())
+            .map(|index| {
+                let id = u16::try_from(index).expect("a pose id");
+                let (targets, pace) = library.targets(id).expect("a committed pose");
+                (id, targets, pace)
+            })
+            .collect();
+        let look = |bearing_deg: i32, elevation_deg: i32, share: f64| {
+            let t = reachy_kin::look::target(
+                f64::from(bearing_deg).to_radians(),
+                f64::from(elevation_deg).to_radians(),
+                &reachy_kin::LookPolicy { head_share: share },
+            );
+            JointTargets {
+                head_pose_body: t.head_pose_body,
+                body_yaw: t.body_yaw,
+                antennas: t.antennas,
+            }
+        };
+        let head_clock =
+            Duration::from_millis(u64::try_from(LOOK_HEAD_MS).expect("a positive clock"));
+        let move_to = |target: JointTargets, clock: Duration| MotionCommand::MoveTo {
+            target,
+            durations: MoveDurations::uniform(clock),
+            warp: WarpKind::MinJerk,
+        };
+        let unmeasurable = |failures: &mut Vec<String>,
+                            what: &str,
+                            start: &JointTargets,
+                            command: &MotionCommand,
+                            clock: Duration| {
+            if dry_pass_peaks(cfg, start, command, tick_hz).is_none() {
+                failures.push(format!(
+                    "{what}: unmeasurable, requested {clock:?}, effective {clock:?}"
+                ));
+            }
+        };
+
+        // A look on the shipped clock: measurable, its pair parted, and planned
+        // to no less than the clock and no more than the legs' floor plus the
+        // body's floor from `start`.
+        let forward = |failures: &mut Vec<String>,
+                       what: String,
+                       start: &JointTargets,
+                       target: JointTargets| {
+            let command = move_to(target, head_clock);
+            match floor_move_clock(cfg, start, &command, tick_hz).1 {
+                None => unmeasurable(failures, &what, start, &command, head_clock),
+                Some(s) => {
+                    if s.separation
+                        .is_some_and(|pair| !pair.met(s.separation_required))
+                    {
+                        failures.push(format!(
+                            "{what}: the antenna pair was not parted, separation {:?} against {}",
+                            s.separation, s.separation_required
+                        ));
+                    }
+                    if s.effective.head < head_clock {
+                        failures.push(format!(
+                            "{what}: effective head clock {:?} under the look clock",
+                            s.effective.head
+                        ));
+                    }
+                    if s.span_stretched {
+                        // TODO(efficiency-look-grid-pin-dominates-a-small-test-target): re-floor only when the cheap bound fails.
+                        // The legs' floor: the same move with the body held at
+                        // the start's yaw.
+                        let legs_floor = if target.body_yaw == start.body_yaw {
+                            s.effective.head
+                        } else {
+                            let held = JointTargets {
+                                body_yaw: start.body_yaw,
+                                ..target
+                            };
+                            match floor_move_clock(cfg, start, &move_to(held, head_clock), tick_hz)
+                                .1
+                            {
+                                Some(h) => h.effective.head,
+                                None => head_clock,
+                            }
+                        };
+                        let body_floor = Duration::from_secs_f64(duration_floor_s(
+                            (target.body_yaw - start.body_yaw).abs(),
+                            cfg.max_step.body_yaw,
+                            tick_hz,
+                        ));
+                        if s.effective.head > legs_floor + body_floor {
+                            failures.push(format!(
+                                    "{what}: effective head clock {:?} over the legs' floor {legs_floor:?} plus the body's {body_floor:?}",
+                                    s.effective.head
+                                ));
+                        }
+                    }
+                }
+            }
+        };
+        // A return to a pose on its own clock: nothing but the body's swing
+        // stretches it.
+        let back = |failures: &mut Vec<String>,
+                    what: String,
+                    start: &JointTargets,
+                    target: JointTargets,
+                    clock: Duration| {
+            let command = move_to(target, clock);
+            match floor_move_clock(cfg, start, &command, tick_hz).1 {
+                Some(s) if s.span_stretched && !s.body_paced => failures.push(format!(
+                    "{what}: stretched by more than the body, requested {:?}, effective {:?}",
+                    s.requested, s.effective
+                )),
+                Some(_) => {}
+                None => unmeasurable(failures, &what, start, &command, clock),
+            }
+        };
+
+        let mut failures = Vec::new();
+        let shares = [LOOK_HEAD_SHARE_RAD, reachy_kin::LOOK_HEAD_SHARE_LIMIT];
+        for (id, start, _) in &poses {
+            for bearing in (-54..=54).step_by(3) {
+                for elevation in (0..=30).step_by(3) {
+                    for share in shares {
+                        forward(
+                            &mut failures,
+                            format!(
+                                "pose {id} -> look ({bearing}, {elevation}) at share {share:.4}"
+                            ),
+                            start,
+                            look(bearing, elevation, share),
+                        );
+                    }
+                }
+            }
+            for bearing in BEARINGS {
+                for elevation in ELEVATIONS {
+                    forward(
+                        &mut failures,
+                        format!(
+                            "pose {id} -> look ({bearing}, {elevation}) at share {LOOK_HEAD_SHARE_RAD:.4}"
+                        ),
+                        start,
+                        look(bearing, elevation, LOOK_HEAD_SHARE_RAD),
+                    );
+                }
+            }
+        }
+        for bearing in BEARINGS {
+            for elevation in ELEVATIONS {
+                let from = look(bearing, elevation, LOOK_HEAD_SHARE_RAD);
+                for (id, target, pace) in &poses {
+                    back(
+                        &mut failures,
+                        format!(
+                            "look ({bearing}, {elevation}) at share {LOOK_HEAD_SHARE_RAD:.4} -> pose {id}"
+                        ),
+                        &from,
+                        *target,
+                        *pace,
+                    );
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 
     /// The sidecar the emitter committed is the sidecar the edge's reader parses,
     /// windows and all.

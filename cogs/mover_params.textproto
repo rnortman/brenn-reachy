@@ -22,9 +22,12 @@ period_ns: 20000000
 # configuration says otherwise.
 tracking_armed: true
 
-# A look's head carries up to 30 degrees of the bearing; the body yaw carries the rest.
-look_head_share_rad: 0.5235987755982989
+# A look's head carries up to 0.16 rad (about 9 degrees) of the bearing; the body
+# yaw carries the rest.
+look_head_share_rad: 0.16
 
-# The head's clock for a look. Above the head group's 0.36 s floor; a body swing the step
-# bound will not carry in it is lengthened by the tick's floor.
+# The head's clock for a look, and a lower bound: the tick's floor lengthens it
+# for whichever joint cannot carry its span on it from where the machine stands,
+# so a look runs as fast as the joints allow. 400 ms is the latency a look asks
+# for from a raised head; from the fold the legs need 446-556 ms.
 look_head_ms: 400

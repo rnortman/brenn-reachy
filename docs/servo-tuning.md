@@ -533,14 +533,17 @@ widened.
 **The body yaw's ladder is read off its own probes.** `probe/yaw-step` steps the
 yaw 0.5, 1.0 and 1.5 rad either way from the base and back, each held 1.5 s,
 twelve steps twice. That is 24 goal steps, enough for the capability
-instrument's ramp median and error bands. `probe/yaw-hold` holds it 12 s at the
-base, at 1.0 rad either way, and at the base again: three long holds after a
-full-speed arrival. Each is a sequence of one-frame clips held by the gaps
-between them, since a clip holds at most 1024 frames. A run of either is judged
-under the yaw-probe standard, which prints every body-yaw hold a line each with
-its excursion, mean reversal interval, period, spread and signed mean error. The
-standard judges each hold on the limit cycle's signature, not on the two-count
-bound:
+instrument's ramp median and error bands. On this probe the band table bins each
+goal step's dead time and ramp in the band under its step size and reads them as
+a plateau, so its regime line is not a reading of the yaw
+(`TODO(capability-ramp-bands)`); the ramp median reads the ramp correctly.
+`probe/yaw-hold` holds it 12 s at the base, at 1.0 rad either way, and at the
+base again: three long holds after a full-speed arrival. Each is a sequence of
+one-frame clips held by the gaps between them, since a clip holds at most 1024
+frames. A run of either is judged under the yaw-probe standard, which prints
+every body-yaw hold a line each with its excursion, mean reversal interval,
+period, spread and signed mean error. The standard judges each hold on the limit
+cycle's signature, not on the two-count bound:
 
 - under three counts is quiet whatever the spread;
 - three counts or more with the spread at most the apparent period (twice the
@@ -1143,7 +1146,7 @@ readings go with that:
   a rung on which the machine showed a limit cycle hunts, and the bound is not
   widened to accept one.
 - **The next rung would be a derivative term at a P above the vendor's**,
-  carried as `TODO(body-yaw-gains)`. Its value is a guess today, between the
+  walked in the derivative ladder below. Its value is a guess today, between the
   antennas' 10 and the legs' 300, and the diagnostic long hold arrives on only
   about half the runs, so it needs its own instrument choice: `hold-probe <yaw
   id> --gains P,I,D` for the probe half and a motion run that produces the long
@@ -1152,6 +1155,156 @@ readings go with that:
   following lag while the model carried the generator alone, and the model
   carries a measured lag per class now. What stands between this class and a
   faster pair is its unmeasured motor.
+
+### Body yaw — the derivative ladder, on the yaw probes
+
+A derivative ladder on the body yaw, read off `probe/yaw-step` and
+`probe/yaw-hold` (§2a). The rungs are Y1 `400 / 0 / 200`, Y2 `400 / 0 / 400`,
+Y3 `800 / 0 / 400`, Y4 `800 / 0 / 800` and Y5 `1200 / 0 / 800`, climbed in
+order; Y4 and Y5 were not flown. Y1 flew on the payload built at `55815d3`, Y2
+and Y3 on the working tree at `87a853d`. Every run was armed off the tree's
+`cogs/mover_params.textproto`, with no overlay carrying it; a step probe runs
+armed (§2, "A step probe runs armed"). The gains outside the yaw were the
+tree's, legs `800 / 100 / 300` and antennas `200 / 0 / 0`, and every rung
+overlay ran the yaw's generator at `32767 / 445` with lag 0 (profile digest
+`5c23547d…`). A rung's hold is read from every judged yaw hold on all four of
+its runs, the step probe's opening and closing holds included.
+
+**The capability lines on these runs are not readings.** Every move of
+`probe/yaw-step` is 0.5, 1.0 or 1.5 rad exactly, so each move's dead-time
+period and first ramp period land in the error band just under its step size
+-- 0.4-0.5, 0.9-1.0 and 1.4-1.5 rad -- and those three bands read one speed
+with each other because they are the same ramp. The regime walk reads two
+adjacent readable bands inside `CAPABILITY_PLATEAU_RATIO` as a plateau, so it
+reads the ramp as the motor's ceiling. Y1's `motor-bound ... slowest median 115
+units` came off those bands while its 0.3-0.4 rad band read 224. Y2's re-flown
+step runs read gain-bound because the 0.9-1.0 band held 19 samples, one under
+`CAPABILITY_BIN_MIN_SAMPLES`. Y3 read content-bound because its 0.4-0.5 ramp
+band was readable and its 0.3-0.4 band held 16 and 17. No pair is read from
+any of them; `TODO(capability-ramp-bands)` is the instrument's fix. The hold
+verdicts and the health reads do not use the bands and stand.
+
+One row per run **[A]**. Servo 10 is the body yaw, read first / peak / rise;
+the hold column is the widest judged yaw hold (counts, period, spread, word);
+the residuals are the raise's (pose 1) settled residual per leg, in counts. The
+fold is `skipped: unsettled before clean end` on every run, which is a note.
+Exit 2 is make's for an analyzer finding.
+
+| rung | run | directory | overlay | exit | servo 10 | hottest other | widest yaw hold | regime line | raise residual per leg | settle findings |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Y1 | step | `.local/motion-logs/probe-log-20260927T165916Z/1790528295425213519` | `yaw-Y1-400-0-200/` (gains `289e1eba…`) | 2 | 26 / 27 / +1 C | servo 18, 33 C | 3.0 counts, period 4.5, spread 1.5, hunts | `motor-bound -- the speed stopped rising with the error, plateau 0.40–1.50 rad over 3 band(s), slowest median in it 115 units` — band table binned the goal steps' ramp; not a reading | 5.6, 1.6, 7.4, 7.4, 1.4, 1.4 | none |
+| Y1 | step | `.local/motion-logs/probe-log-20260927T170102Z/1790528401311666818` | `yaw-Y1-400-0-200/` (gains `289e1eba…`) | 0 | 27 / 28 / +1 C | servo 18, 33 C | 2.0 counts, period 10.4, spread 12.6, quiet | `motor-bound -- the speed stopped rising with the error, plateau 0.40–1.50 rad over 3 band(s), slowest median in it 115 units` — band table binned the goal steps' ramp; not a reading | 4.6, 1.4, 6.4, 8.4, 1.6, 0.6 | none |
+| Y1 | hold | `.local/motion-logs/probe-log-20260927T170229Z/1790528476619824652` | `yaw-Y1-400-0-200/` (gains `289e1eba…`) | 0 | 28 / 28 / +0 C | servo 18, 33 C | 1.0 counts, period 4.3, spread 1.7, quiet | `content-bound -- fewer than two readable error bands, so nothing here says whether this class was ever the binding constraint` — band table binned the goal steps' ramp; not a reading | 3.6, 1.4, 5.4, 8.4, 1.6, 1.4 | none |
+| Y1 | hold | `.local/motion-logs/probe-log-20260927T170355Z/1790528562960227215` | `yaw-Y1-400-0-200/` (gains `289e1eba…`) | 0 | 28 / 28 / +0 C | servo 18, 33 C | 1.0 counts, period 8.9, spread 5.8, quiet | `content-bound -- fewer than two readable error bands, so nothing here says whether this class was ever the binding constraint` — band table binned the goal steps' ramp; not a reading | 4.6, 1.6, 6.4, 8.4, 2.6, 1.4 | none |
+| Y2 | step | `.local/motion-logs/probe-log-20260927T171438Z/1790529217719602010` | `yaw-Y2-400-0-400/` (gains `8bab6be7…`) | 0 | 27 / 28 / +1 C | servo 18, 33 C | 2.0 counts, no period, quiet | `motor-bound -- the speed stopped rising with the error, plateau 0.40–1.00 rad over 2 band(s), slowest median in it 122 units` — band table binned the goal steps' ramp; not a reading | 0.6, 8.6, 4.4, 8.4, 4.6, 1.4 | none |
+| Y2 | step | `.local/motion-logs/probe-log-20260927T171608Z/1790529307187683821` | `yaw-Y2-400-0-400/` (gains `8bab6be7…`) | 0 | 27 / 28 / +1 C | servo 18, 33 C | 2.0 counts, period 121.0, spread 59.5, quiet | `gain-bound -- the fastest band left is over 1.15 times the band below it, so the speed was still rising with the error and the motor was never reached, read under 1 band(s) that fell away` — band table binned the goal steps' ramp; not a reading | 4.6, 1.4, 6.4, 8.4, 1.4, 0.6 | none |
+| Y2 | hold | `.local/motion-logs/probe-log-20260927T171736Z/1790529383485966192` | `yaw-Y2-400-0-400/` (gains `8bab6be7…`) | 0 | 28 / 28 / +0 C | servo 18, 33 C | 2.0 counts, period 11.0, spread 4.9, quiet | `content-bound -- fewer than two readable error bands, so nothing here says whether this class was ever the binding constraint` — band table binned the goal steps' ramp; not a reading | 4.6, 0.4, 6.4, 8.4, 1.6, 1.6 | none |
+| Y2 | hold | `.local/motion-logs/probe-log-20260927T171903Z/1790529470685268807` | `yaw-Y2-400-0-400/` (gains `8bab6be7…`) | 0 | 28 / 29 / +1 C | servo 18, 33 C | 2.0 counts, no period, quiet | `content-bound -- fewer than two readable error bands, so nothing here says whether this class was ever the binding constraint` — band table binned the goal steps' ramp; not a reading | 5.6, 1.6, 6.4, 7.4, 1.6, 1.4 | none |
+| Y2 | step, re-flown | `.local/motion-logs/probe-log-20260927T172020Z/1790529559787192809` | `yaw-Y2-400-0-400/` (gains `8bab6be7…`) | 0 | 28 / 29 / +1 C | servo 18, 33 C | 2.0 counts, no period, quiet | `gain-bound -- the fastest band left is over 1.15 times the band below it, so the speed was still rising with the error and the motor was never reached, read under 1 band(s) that fell away` — band table binned the goal steps' ramp; not a reading | 4.6, 1.6, 4.4, 7.4, 1.6, 2.4 | none |
+| Y2 | step, re-flown | `.local/motion-logs/probe-log-20260927T172135Z/1790529635104252268` | `yaw-Y2-400-0-400/` (gains `8bab6be7…`) | 0 | 29 / 29 / +0 C | servo 18, 33 C | 2.0 counts, period 159.0, spread 78.5, quiet | `gain-bound -- the fastest band left is over 1.15 times the band below it, so the speed was still rising with the error and the motor was never reached, read under 1 band(s) that fell away` — band table binned the goal steps' ramp; not a reading | 4.6, 1.4, 6.4, 8.4, 1.4, 2.4 | none |
+| Y3 | step | `.local/motion-logs/probe-log-20260927T172256Z/1790529715432836139` | `yaw-Y3-800-0-400/` (gains `487a0664…`) | 0 | 29 / 29 / +0 C | servo 18, 33 C | 1.0 counts, no period, quiet | `content-bound -- the reading needs two speeds and 1 band(s) above were read past, so this run is not a measurement of this class and offers no candidate` — band table binned the goal steps' ramp; not a reading | 4.6, 2.4, 6.4, 8.4, 1.6, 2.4 | none |
+| Y3 | step | `.local/motion-logs/probe-log-20260927T172407Z/1790529786876170837` | `yaw-Y3-800-0-400/` (gains `487a0664…`) | 0 | 29 / 30 / +1 C | servo 18, 33 C | 2.0 counts, period 7.2, spread 4.1, quiet | `content-bound -- the reading needs two speeds and 1 band(s) above were read past, so this run is not a measurement of this class and offers no candidate` — band table binned the goal steps' ramp; not a reading | 4.6, 1.6, 5.4, 7.4, 1.4, 3.4 | none |
+| Y3 | hold | `.local/motion-logs/probe-log-20260927T172540Z/1790529867233936621` | `yaw-Y3-800-0-400/` (gains `487a0664…`) | 0 | 29 / 30 / +1 C | servo 18, 33 C | 1.0 counts, period 4.6, spread 1.9, quiet | `content-bound -- fewer than two readable error bands, so nothing here says whether this class was ever the binding constraint` — band table binned the goal steps' ramp; not a reading | 4.6, 1.6, 6.4, 8.4, 1.4, 2.4 | none |
+| Y3 | hold | `.local/motion-logs/probe-log-20260927T172703Z/1790529950520793191` | `yaw-Y3-800-0-400/` (gains `487a0664…`) | 0 | 29 / 29 / +0 C | servo 18, 33 C | 1.0 counts, period 4.3, spread 1.8, quiet | `content-bound -- fewer than two readable error bands, so nothing here says whether this class was ever the binding constraint` — band table binned the goal steps' ramp; not a reading | 3.6, 1.4, 6.4, 8.4, 1.4, 1.4 | none |
+
+Every judged yaw hold, by run: start offset, held position, excursion, mean
+reversal interval, period and spread in samples, signed mean error and word
+**[A]**:
+
+- Y1 step `…T165916Z`: +6.12 s, at +0.0000 rad, 3.0 counts, mean interval 2.23 samples, period 4.5, spread 1.5, mean error -0.0002 rad, hunts
+- Y1 step `…T165916Z`: +50.42 s, at +0.0000 rad, 2.0 counts, mean interval 5.12 samples, period 10.2, spread 8.9, mean error -0.0041 rad, quiet
+- Y1 step `…T170102Z`: +6.12 s, at -0.0061 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y1 step `…T170102Z`: +50.44 s, at +0.0000 rad, 2.0 counts, mean interval 5.20 samples, period 10.4, spread 12.6, mean error -0.0029 rad, quiet
+- Y1 hold `…T170229Z`: +6.12 s, at -0.0046 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y1 hold `…T170229Z`: +14.92 s, at +0.0000 rad, 0.0 counts, mean interval none, no period, mean error -0.0015 rad, quiet
+- Y1 hold `…T170229Z`: +27.90 s, at +1.0000 rad, 0.0 counts, mean interval none, no period, mean error -0.0029 rad, quiet
+- Y1 hold `…T170229Z`: +39.92 s, at -1.0000 rad, 0.0 counts, mean interval none, no period, mean error +0.0075 rad, quiet
+- Y1 hold `…T170229Z`: +51.90 s, at +0.0000 rad, 1.0 counts, mean interval 2.13 samples, period 4.3, spread 1.7, mean error -0.0010 rad, quiet
+- Y1 hold `…T170355Z`: +6.14 s, at -0.0015 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y1 hold `…T170355Z`: +14.92 s, at +0.0000 rad, 1.0 counts, mean interval 4.46 samples, period 8.9, spread 5.8, mean error -0.0013 rad, quiet
+- Y1 hold `…T170355Z`: +27.92 s, at +1.0000 rad, 1.0 counts, mean interval 3.97 samples, period 7.9, spread 6.8, mean error -0.0042 rad, quiet
+- Y1 hold `…T170355Z`: +39.90 s, at -1.0000 rad, 0.0 counts, mean interval none, no period, mean error +0.0075 rad, quiet
+- Y1 hold `…T170355Z`: +51.90 s, at +0.0000 rad, 1.0 counts, mean interval none, no period, mean error -0.0015 rad, quiet
+- Y2 step `…T171438Z`: +6.14 s, at +0.0215 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y2 step `…T171438Z`: +50.44 s, at +0.0000 rad, 2.0 counts, mean interval none, no period, mean error -0.0096 rad, quiet
+- Y2 step `…T171608Z`: +6.10 s, at -0.0107 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y2 step `…T171608Z`: +50.40 s, at +0.0000 rad, 2.0 counts, mean interval 60.50 samples, period 121.0, spread 59.5, mean error -0.0096 rad, quiet
+- Y2 hold `…T171736Z`: +6.14 s, at -0.0123 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y2 hold `…T171736Z`: +14.90 s, at +0.0000 rad, 0.0 counts, mean interval none, no period, mean error -0.0046 rad, quiet
+- Y2 hold `…T171736Z`: +27.90 s, at +1.0000 rad, 0.0 counts, mean interval none, no period, mean error -0.0044 rad, quiet
+- Y2 hold `…T171736Z`: +39.92 s, at -1.0000 rad, 0.0 counts, mean interval none, no period, mean error +0.0137 rad, quiet
+- Y2 hold `…T171736Z`: +51.92 s, at +0.0000 rad, 2.0 counts, mean interval 5.50 samples, period 11.0, spread 4.9, mean error -0.0044 rad, quiet
+- Y2 hold `…T171903Z`: +6.16 s, at -0.0061 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y2 hold `…T171903Z`: +14.92 s, at +0.0000 rad, 0.0 counts, mean interval none, no period, mean error -0.0015 rad, quiet
+- Y2 hold `…T171903Z`: +27.92 s, at +1.0000 rad, 0.0 counts, mean interval none, no period, mean error -0.0044 rad, quiet
+- Y2 hold `…T171903Z`: +39.92 s, at -1.0000 rad, 0.0 counts, mean interval none, no period, mean error +0.0137 rad, quiet
+- Y2 hold `…T171903Z`: +51.94 s, at +0.0000 rad, 2.0 counts, mean interval none, no period, mean error -0.0059 rad, quiet
+- Y2 step, re-flown `…T172020Z`: +6.12 s, at -0.0077 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y2 step, re-flown `…T172020Z`: +50.42 s, at +0.0000 rad, 2.0 counts, mean interval none, no period, mean error -0.0102 rad, quiet
+- Y2 step, re-flown `…T172135Z`: +6.14 s, at -0.0123 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y2 step, re-flown `…T172135Z`: +50.42 s, at +0.0000 rad, 2.0 counts, mean interval 79.50 samples, period 159.0, spread 78.5, mean error -0.0095 rad, quiet
+- Y3 step `…T172256Z`: +6.12 s, at -0.0107 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y3 step `…T172256Z`: +50.44 s, at +0.0000 rad, 1.0 counts, mean interval none, no period, mean error -0.0025 rad, quiet
+- Y3 step `…T172407Z`: +6.14 s, at -0.0046 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y3 step `…T172407Z`: +50.42 s, at +0.0000 rad, 2.0 counts, mean interval 3.62 samples, period 7.2, spread 4.1, mean error -0.0024 rad, quiet
+- Y3 hold `…T172540Z`: +6.14 s, at -0.0031 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y3 hold `…T172540Z`: +14.92 s, at +0.0000 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y3 hold `…T172540Z`: +27.92 s, at +1.0000 rad, 1.0 counts, mean interval 2.32 samples, period 4.6, spread 1.9, mean error -0.0004 rad, quiet
+- Y3 hold `…T172540Z`: +39.90 s, at -1.0000 rad, 1.0 counts, mean interval 2.43 samples, period 4.9, spread 2.5, mean error +0.0025 rad, quiet
+- Y3 hold `…T172540Z`: +51.90 s, at +0.0000 rad, 1.0 counts, mean interval 2.07 samples, period 4.1, spread 1.9, mean error -0.0014 rad, quiet
+- Y3 hold `…T172703Z`: +6.12 s, at -0.0031 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y3 hold `…T172703Z`: +14.90 s, at +0.0000 rad, 0.0 counts, mean interval none, no period, mean error +0.0000 rad, quiet
+- Y3 hold `…T172703Z`: +27.90 s, at +1.0000 rad, 1.0 counts, mean interval 2.14 samples, period 4.3, spread 1.8, mean error -0.0007 rad, quiet
+- Y3 hold `…T172703Z`: +39.90 s, at -1.0000 rad, 1.0 counts, mean interval 2.91 samples, period 5.8, spread 2.8, mean error +0.0026 rad, quiet
+- Y3 hold `…T172703Z`: +51.92 s, at +0.0000 rad, 1.0 counts, mean interval 3.96 samples, period 7.9, spread 6.3, mean error -0.0012 rad, quiet
+
+Y3's holds at ±1.0 rad and at the closing zero show a regular one-count
+turning, at periods of 4.1-5.8 samples and 7.9 on the second hold run's
+closing zero, under the three-count arm and quiet by the rule.
+
+Rung verdicts:
+
+- **Y1 hunts**, on step run 1's opening hold (+6.12 s, 3.0 counts, period 4.5,
+  spread 1.5).
+- **Y2 is quiet.**
+- **Y3 is quiet**, at most 2.0 counts, with servo 10 at most 30 C.
+
+**The rung and the pair.** Y3, `800 / 0 / 400`, is chosen: quiet on every
+judged hold over its four runs, cool, and the highest rung flown; with no
+rung's capability line a reading, it is also the highest quiet rung. The
+candidate velocity is the recorded Velocity Limit register, 445 units
+(10.7 rad/s). Every quiet run at Y2 and Y3 was flown with the generator
+wide open, and the shaft cruised at the register: per-period travel
+maxima of 445 and 441 units on Y2's hold runs (`…T171736Z`, `…T171903Z`),
+448 and 451 on Y3's step runs (`…T172256Z`, `…T172407Z`), and single
+samples of 486 and 489 on Y3's hold runs (`…T172540Z`, `…T172703Z`) with
+p90 at 457 and 454 **[A]**. The register is the ceiling, never a figure
+above it, so those single samples commission nothing. The candidate
+acceleration is 317 units, the smaller of Y3's two step runs' ramp
+medians -- 0.049087 rad/period² (328 units) over 21 goal steps and
+0.047553 (317) over 20, 1.035 apart -- rounded down. The three-quarter
+pair is `317 / 333`, with the acceleration held so that the two recordings
+differ in cruise speed alone. What licenses a pair is the chain: one
+`probe/yaw-step` at each pair under Y3's gains for the lag scan, then
+three library tours and a motion run at `317 / 445`. At the first tour
+past 0.4 rad on either side, the chain steps down, confirming in turn at
+`317 / 333`, then at `20 / 50` under Y3's gains, and finally leaving the
+tree's `200 / 0 / 0` at `20 / 50`.
+
+**What was flown, and what shipped.** Both lag-scan probes ran armed under
+Y3's gains and exited clean. At `317 / 445` (`…T194231Z`) the scan's minimum
+sat at 2.0 periods with a gain of 3.85x, and the worst residual was 0.5025 rad
+behind. At `317 / 333` (`…T194353Z`) the minimum was 1.7 periods at 3.18x, and
+the worst 0.3531 rad. Both read motor-bound but not as a following-lag
+instrument, so they do not agree and the lag stays 0. One library tour at
+`317 / 445` (`…T195249Z`) passed: the yaw's worst was 0.2184 rad behind and
+0.0000 ahead, its p99.9 0.1128 rad, with no raise and health flat. The same
+tour read the antennas' p99.9 at 0.2480 rad against their 0.1955-0.1988 floor,
+at an unchanged antenna configuration, which nothing explains yet. The chain
+was stopped there, on the operator's instruction, ahead of a demo. The tree
+ships `317 / 445` on `800 / 0 / 400` from that one tour. The yaw's recorded
+figures (the head pin, the p99.9 floor and the capability pair) are still the
+`20 / 50` configuration's, `TODO(session-servo-profile)`.
 
 ### Capability
 

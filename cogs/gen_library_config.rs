@@ -2413,17 +2413,7 @@ mod tests {
 
     /// The committed pose set, pinned: a document added or removed without
     /// this edit fails the cases that read it.
-    const COMMITTED_POSES: [&str; 9] = [
-        "hello",
-        "look_l30",
-        "look_l60",
-        "look_r30",
-        "look_r60",
-        "neutral",
-        "peek",
-        "peek_tilt",
-        "stow",
-    ];
+    const COMMITTED_POSES: [&str; 5] = ["hello", "neutral", "peek", "peek_tilt", "stow"];
 
     /// The pose documents the cases emit are the committed ones, walked the way
     /// the tool walks them: the drift check is against what `make

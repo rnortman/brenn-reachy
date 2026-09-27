@@ -42,21 +42,31 @@
 //! ## The margin baseline
 //!
 //! Zero margin is an IK-root merge/dead centre. The 0.56 mm floor buys at least
-//! 7.9° at the outer merge and 13.2° at the inner merge. The largest end-of-
-//! move residual over every directed transition among `hello`, `neutral`,
-//! `peek`, `peek_tilt` and `stow`, each at its committed pace, was 17.4
-//! counts: the six per-leg maxima were 16.7, 15.0, 16.1, 17.4, 15.5, and 7.4
-//! counts, with a worst hold-end value of 13.7 counts and an armed-rest value
-//! of 9 counts. The 18-count (1.58°) bound makes the outer clearance five times
-//! the bound. That measurement does not cover the gaze poses (`look_*`); the
-//! `reachy-ask` settle-evidence walks include every transition into and out of
-//! them, for the run that would.
+//! 7.92° at the outer merge and 13.2° at the inner merge. The bound it is sized
+//! against, 25 counts (2.20°), comes off the `reachy-ask` settle-evidence
+//! walks, which make every directed transition among `hello`, `neutral`,
+//! `peek`, `peek_tilt` and `stow` at its committed pace. The floor is held to
+//! at least three times the bound at the outer merge by invariant, and at 25
+//! counts it is 3.6 times it.
 //!
-//! The head was in contact with the body during those runs. No model in this
-//! tree detects that contact, so these are observed residuals of those machine
-//! runs, not a servo positioning-error measurement. Leg positioning error
-//! remains unmeasured. The separate 2-count figure belongs to the antennas'
-//! unloaded loop.
+//! The judged figure includes the arrival overshoot on purpose: a leg past its
+//! goal stands where no check covered, which is the regime the bound exists
+//! for. On 2026-09-27 the walks read per-leg maxima of 22.6, 16.2, 19.6, 24.9,
+//! 16.5 and 11.6 counts, and on their re-fly 22.6, 15.2, 20.1, 24.9, 18.5 and
+//! 10.6; the largest, 24.9, rounded up, is the bound. On 2026-09-20, at the
+//! same servo gains, profile, targets and paces, the same walks read 16.7,
+//! 16.0, 17.1, 17.4, 16.5 and 7.4. Leg 2, which sets `hello`'s 0.781 mm minimum
+//! and stands 9.35° from its outer merge there, arrived at most 16.2 counts off
+//! at `hello`, which put the physical crank 7.93° from that merge, against the
+//! 7.92° the floor guarantees the commanded pose. The walks under
+//! `--settle-evidence` are the bound's tripwire, and a figure past 25 counts is
+//! a finding. That measurement does not cover a look's attitudes; the
+//! `reachy-ask` look-sweep scripts are the run that covers them.
+//!
+//! No model in this tree detects head–body contact, so these are the observed
+//! figures of those runs, not a servo positioning-error measurement. The
+//! two-count rest band is the encoder's own flicker, the stillness watch's
+//! figure.
 //!
 //! The baked rest is the tightest configuration on record at 0.141 mm, but is
 //! outside four crank windows. Normal arming pins those cranks and leaves the

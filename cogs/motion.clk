@@ -503,11 +503,11 @@ cog Mover
         }
 
         // How many base plans the motion library adjusted for a reason that is
-        // not routine: a clock that could not carry its own span inside the
-        // per-tick step bounds, or an antenna pair it could not part. The
-        // configured clocks are policy for every span they carry; a rise says
-        // they are being asked to cover spans they were not sized for, or that
-        // a pair is crossing nearer than the geometry allows.
+        // not routine: a pose move's clock the legs or an antenna could not
+        // carry their span on inside the per-tick step bounds, or an antenna
+        // pair it could not part. The configured clocks are policy for every span they carry; a
+        // rise says they are being asked to cover spans they were not sized
+        // for, or that a pair is crossing nearer than the geometry allows.
         base_stretched: signal UInt64
         {
             post_aggregation: ["final_value"];
@@ -525,12 +525,12 @@ cog Mover
             multi_instance: true;
         }
 
-        // How many look plans were lengthened for their span. Expected nonzero
-        // on any machine that looks wide: a look's clock is sized for the head,
-        // the body's pace is the step floor, and a body swing the head's clock
-        // cannot carry is lengthened by design rather than counted in
+        // How many base plans ran at a joint's pace by policy: a look
+        // lengthened for any joint, since a look's head clock is a lower
+        // bound, or a pose move lengthened for the body yaw's swing alone.
+        // Expected nonzero on any machine that looks; never counted in
         // `base_stretched`.
-        look_paced: signal UInt64
+        base_paced: signal UInt64
         {
             post_aggregation: ["final_value"];
             multi_instance: true;

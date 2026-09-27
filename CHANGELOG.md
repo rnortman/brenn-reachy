@@ -12,24 +12,28 @@ Nothing has been released.
 ### Added
 
 - **The head turns toward whoever said the wake word.** With
-  `--gaze-elevation-deg`, which the launcher passes as 27, the voice host reads
-  the audio device's beam azimuth and the head's pose and raises the head to the
-  nearest of five new library poses, `look_l60`, `look_l30`, `neutral`,
-  `look_r30` and `look_r60`, holding that look through the reply. A wake with no
-  usable reading or pose takes the configured wake pose, and every wake says a
-  `gaze` line with what it chose or why it did not. Four more settle-evidence
-  scripts walk every transition into and out of the new poses. They have not
-  been run on a unit, so the clearance floor's measured residuals still cover
-  only the earlier five poses.
+  `--gaze-elevation-deg`, which the launcher passes as 20, the voice host reads
+  the audio device's beam azimuth and the head's pose and raises the head in a
+  look at the talker — their world bearing, to the milliradian, with the
+  launcher's elevation as the head's pitch — holding it through the reply.
+  `--gaze-elevation-deg` must be within 0°–30° or the host refuses to start. A
+  wake with no usable reading or pose takes the configured wake pose, and every
+  wake says a `gaze` line whose `chosen` is the direction (`bearing_deg`,
+  `elevation_deg`) or why none was chosen. Two settle-evidence scripts,
+  `look-sweep-1` and `-2`, look at thirteen bearings from 0° to ±120° at 27°
+  from `neutral`, `hello`, `peek_tilt` and each other, holding each 4 s; they
+  have not been run on a unit.
 - **A script can ask for a look.** A motion script step may carry `look`, with
   `bearing_mrad` (from the base's forward, positive to the robot's left) and
   `elevation_mrad` (above level), instead of naming a pose. The machine splits the
-  bearing between the head (up to `look_head_share_rad`, 30° in the shipped
+  bearing between the head (up to `look_head_share_rad`, 0.16 rad (about 9°) in the shipped
   `MoverParams`, at most 54°) and the body, pitches the head to the elevation, holds
-  the antennas at `neutral`'s pair, and moves on `look_head_ms` (400 ms), with the
-  body paced by the planner's per-period step bound. A look the envelope refuses is
-  a refused command. A decoder from before this change refuses a script carrying a
-  look whole. Nothing on the voice host sends one yet.
+  the antennas at `neutral`'s pair, and moves on `look_head_ms` (400 ms in the
+  shipped `MoverParams`, a lower bound: the planner lengthens it for whichever
+  joint cannot carry its span inside its per-period step bound, the body's swing
+  among them). Any stretch on a look counts in the Mover's `base_paced` total, not
+  in `base_stretched`. A look the envelope refuses is a refused command. A decoder from before this change refuses a script carrying a
+  look whole.
 - **The voice host knows where the head is.** The control process sends every
   head pose estimate to the voice host on loopback port 7411, and the host keeps
   the newest usable one for choosing where to look. `reachy-kin` gains `mic`,
@@ -85,22 +89,32 @@ Nothing has been released.
 
 ### Changed
 
+- **The body turns as fast as its motor allows.** The body yaw (the
+  rotation of the whole head assembly on the base) is commissioned at its
+  servo's own velocity limit, 10.7 rad/s, where it was 1.2 rad/s, on gains
+  `800 / 0 / 400` (were `200 / 0 / 0`); the profile is `317 / 445`. Moves the
+  machine plans for itself, looks among them, may now step the body up to
+  twice that speed per control period (0.427 rad at 50 Hz, was 0.15 rad), so a
+  60° look turns the body in about 0.1 s of plan. Library content with yaw runs
+  up to the new pace. Operators should know the obstruction detector's limits
+  were sized for the old, slower tuning: one tour at the new tuning raised
+  nothing (worst 0.22 rad against a 0.6 rad screen), but a false raise on
+  healthy content is possible until more readings exist.
 - **Settle evidence reads legs at rest.** The settle report no longer reads each
   leg 24 ms after the last commanded change, which measured the tail of arrival.
   For every base move it now finds when each leg came to rest (two counts for
   200 ms) and reports three figures per leg from there: the settled residual,
   the overshoot past the target, and the signed creep across the hold. The
-  18-count bound judges the larger of the residual and the overshoot. A move
+  25-count bound judges the larger of the residual and the overshoot. A move
   whose legs never come to rest before the hold ends is reported unsettled, and
   fails a `--settle-evidence` run. Look steps are measured beside pose steps and
-  labelled by their direction.
-- **The machine turns its body at the body yaw's own speed.** The per-period
-  step bound on the body yaw, which paces every body swing the machine plans for
-  itself (a look's among them), is now twice the yaw's commissioned speed per
-  period — 0.048 rad at 50 Hz on the shipped pair — instead of 0.15 rad. A
-  planned move that turns the body far enough runs longer: a fold from half a
-  turn now takes about 2.5 s rather than 0.8 s. Clips and other content are not
-  step-guarded and are unchanged.
+  labelled by their direction. The two settle-evidence walks hold every pose 4 s
+  after its move.
+- **The Mover's `body_paced` count is renamed `base_paced`.** It counts every
+  move the planner lengthened on purpose to a joint's pace: a look lengthened
+  for any joint, or a pose move lengthened for the body's swing alone.
+  `base_stretched` now counts only pose moves whose configured duration could
+  not carry their span, and antenna pairs no duration could separate.
 - **The idle loop dances a short, slow set.** Ten gentle clips at half speed
   replace the full 68-clip list, which kept the microphone's voice gate open
   and cost wakes.
@@ -138,7 +152,8 @@ Nothing has been released.
 - **The command clearance floor is derived at 0.56 mm** from the largest
   end-of-move leg residual measured over the committed pose library. Dedicated
   settle-evidence scripts walk every directed transition; the report enforces
-  an inclusive 18-count bound on those residuals per leg. The previous 1.5 mm
+  an inclusive 25-count bound on those residuals per leg, and the floor gives
+  at least three times that bound at the outer merge. The previous 1.5 mm
   figure was a de-torque settle measurement that answered a different question;
   the derivation and evidence are in the source.
 

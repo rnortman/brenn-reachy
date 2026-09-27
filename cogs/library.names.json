@@ -898,44 +898,24 @@
       "pose_id": 0
     },
     {
-      "duration_ms": 600,
-      "name": "look_l30",
-      "pose_id": 1
-    },
-    {
-      "duration_ms": 900,
-      "name": "look_l60",
-      "pose_id": 2
-    },
-    {
-      "duration_ms": 600,
-      "name": "look_r30",
-      "pose_id": 3
-    },
-    {
-      "duration_ms": 900,
-      "name": "look_r60",
-      "pose_id": 4
-    },
-    {
       "duration_ms": 800,
       "name": "neutral",
-      "pose_id": 5
+      "pose_id": 1
     },
     {
       "duration_ms": 800,
       "name": "peek",
-      "pose_id": 6
+      "pose_id": 2
     },
     {
       "duration_ms": 1000,
       "name": "peek_tilt",
-      "pose_id": 7
+      "pose_id": 3
     },
     {
       "duration_ms": 2000,
       "name": "stow",
-      "pose_id": 8
+      "pose_id": 4
     }
   ]
 }

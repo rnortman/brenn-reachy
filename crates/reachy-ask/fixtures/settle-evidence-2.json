@@ -4,18 +4,18 @@
   "seq": 1,
   "steps": [
     {"after_ms": 8000, "pose": "peek"},
-    {"after_ms": 10300, "pose": "neutral"},
-    {"after_ms": 12600, "pose": "stow"},
-    {"after_ms": 16100, "pose": "peek_tilt"},
-    {"after_ms": 18600, "pose": "neutral"},
-    {"after_ms": 20900, "pose": "hello"},
-    {"after_ms": 23400, "pose": "peek_tilt"},
-    {"after_ms": 25900, "pose": "stow"},
-    {"after_ms": 29400, "pose": "hello"},
-    {"after_ms": 31900, "pose": "peek"},
-    {"after_ms": 34200, "pose": "stow"},
-    {"after_ms": 37700, "pose": "neutral"},
-    {"after_ms": 40000, "pose": "stow"}
+    {"after_ms": 12991, "pose": "neutral"},
+    {"after_ms": 17791, "pose": "stow"},
+    {"after_ms": 24279, "pose": "peek_tilt"},
+    {"after_ms": 29279, "pose": "neutral"},
+    {"after_ms": 34079, "pose": "hello"},
+    {"after_ms": 39079, "pose": "peek_tilt"},
+    {"after_ms": 44079, "pose": "stow"},
+    {"after_ms": 50079, "pose": "hello"},
+    {"after_ms": 55079, "pose": "peek"},
+    {"after_ms": 59879, "pose": "stow"},
+    {"after_ms": 66483, "pose": "neutral"},
+    {"after_ms": 71457, "pose": "stow"}
   ],
-  "timeout_ms": 42000
+  "timeout_ms": 73945
 }

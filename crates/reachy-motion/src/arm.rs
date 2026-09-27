@@ -198,8 +198,8 @@ pub type GroupGains = PerGroup<Gains>;
 /// The gains this platform is armed with.
 ///
 /// Tuned on the bench against recorded step responses, and the yaw and the
-/// antennas against recorded holds; both of the latter sit at the value the
-/// vendor's own stack writes at startup, which measurement did not beat.
+/// antennas against recorded holds; the antennas sit at the value the vendor's
+/// own stack writes at startup, which measurement did not beat.
 pub const DEFAULT_GAINS: GroupGains = GroupGains {
     // A proportional term alone cannot hold the head's weight up this linkage:
     // at the vendor's P-only 300 the two most loaded cranks park 3.9–4.3° short
@@ -211,13 +211,15 @@ pub const DEFAULT_GAINS: GroupGains = GroupGains {
         i: 100,
         d: 300,
     },
-    // The vendor's value, and a measured one: the yaw is gain-bound, and a
-    // P-only climb hunts at 400 and at 800 where 200 sits at two counts of
-    // dither.
-    //
-    // TODO(body-yaw-gains): a derivative term is the next rung; headroom,
-    // not a need at the current pair.
-    yaw: Gains { p: 200, i: 0, d: 0 },
+    // The highest quiet rung of a derivative ladder over the body-yaw step and
+    // hold probes: 400 / 0 / 200 hunts, 400 / 0 / 400 and this triple hold
+    // quiet, and at this one the shaft cruises at the Velocity Limit register.
+    // A P-only climb limit-cycles at 400 and at 800.
+    yaw: Gains {
+        p: 800,
+        i: 0,
+        d: 400,
+    },
     // The vendor's own triple, and the measured one: over the antenna step
     // probes, where the servo's own generator makes and stops the whole move,
     // 200 is the proportional bound -- 300 hunts the rest hold, 400 the raised
@@ -2186,19 +2188,18 @@ mod tests {
         }
     }
 
-    /// The legs are tuned harder than the joints carrying nothing, and all
-    /// three cross the boundary as the gain span the wire layer writes.
+    /// Each group carries its own measured triple, and all three cross the
+    /// boundary as the gain span the wire layer writes.
     ///
     /// The legs are the only group with an integral term, and they are the only
     /// group holding a weight up: the measured droop a proportional term alone
     /// leaves is what that term is there to close, so a leg gain set without one
     /// is the configuration that droop was measured on.
     ///
-    /// The other two groups sit at the vendor's own value for reasons of their
-    /// own: the yaw because a P-only climb found nothing quieter, and the
-    /// antennas because a stiffer loop hunts at the rest pose. Each is
-    /// asserted on its own terms, because both classes have a ladder left to
-    /// walk and a rung on one says nothing about the other.
+    /// The yaw runs the highest quiet rung of its derivative ladder, and the
+    /// antennas sit at the vendor's own value because a stiffer loop hunts at
+    /// the rest pose. Each is asserted on its own terms, because a rung on one
+    /// class says nothing about another.
     #[test]
     fn gains_are_per_group() {
         let gains = DEFAULT_GAINS;
@@ -2206,15 +2207,15 @@ mod tests {
         assert_eq!(gains.for_joint(JointRef::BodyYaw), gains.yaw);
         assert_eq!(gains.for_joint(JointRef::AntennaLeft), gains.antennas);
         assert!(gains.legs.p > gains.antennas.p);
-        assert!(gains.legs.p > gains.yaw.p);
         assert_eq!(gains.antennas.d, 0, "a quiet antenna needs no damping");
-        assert_eq!(gains.yaw.d, 0, "the yaw's damping is a rung nobody has run");
+        assert!(gains.yaw.d > 0, "the yaw's quiet rungs are the damped ones");
         assert!(gains.legs.i > 0, "the loaded group integrates its error");
         assert_eq!((gains.yaw.i, gains.antennas.i), (0, 0));
         for group in [gains.legs, gains.yaw, gains.antennas] {
             assert_eq!(group.value(), value::gains(group.p, group.i, group.d));
         }
         assert_eq!(DEFAULT_GAINS.legs.to_string(), "P 800 I 100 D 300");
+        assert_eq!(DEFAULT_GAINS.yaw.to_string(), "P 800 I 0 D 400");
     }
 
     /// The provisional thresholds are the values the comments say they are. A

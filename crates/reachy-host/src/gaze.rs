@@ -1,10 +1,10 @@
 //! Where the head looks when the wake word is heard: the voice host's answer to
 //! the voice pipeline's gaze seam.
 //!
-//! Five steps, each a typed decline when it fails: a reading exists, the
+//! Four steps, each a typed decline when it fails: a reading exists, the
 //! auto-select beam is a copy of a focused beam, a head pose estimate is fresh,
-//! the reading yields a world bearing, and the bearing picks the nearest rung
-//! of [`LADDER`]. Every decision, a choice or a decline, is said as one `gaze`
+//! and the reading yields a world bearing, which with the launcher's elevation
+//! is the look. Every decision, a choice or a decline, is said as one `gaze`
 //! line.
 //!
 //! A world bearing is measured from world x, positive to the robot's left. The
@@ -14,35 +14,33 @@
 //!
 //! The pose estimate used is the newest one within [`MAX_POSE_AGE`] of the
 //! choice, not the one at the reading's own instant. Nothing is clamped: every
-//! outcome is a rung or a typed decline.
+//! outcome is a direction or a typed decline.
 //!
-//! Nothing here moves anything. It names a library pose, which the edge and the
-//! mover screen like any other.
+//! Nothing here moves anything. It hands a direction across, which the wire, the
+//! edge and the Mover screen like any other look.
 
+use core::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clockwork_rs::SyncTime;
 use reachy_edge::{edge_line_with, now};
-use reachy_kin::{MicError, array_axis_world, bearing_from_azimuth, talker_elevation_in_domain};
+use reachy_kin::{MicError, array_axis_world, bearing_from_azimuth};
 use serde_json::{Value, json};
 use speech_pipeline::PodId;
-use speech_surface::{DoaSample, GazePose, WakeGaze};
+use speech_surface::{DoaSample, GazeLook, WakeGaze};
 
 use crate::pose_feed::{HeadAttitude, PoseReader};
 use crate::sinks::Lines;
 use crate::words::GAZE;
 
-/// The ladder: each pose and the world yaw it faces, degrees, positive to the
-/// robot's left. Neutral first and then outward, so a bearing exactly between
-/// two rungs takes the smaller turn.
-pub const LADDER: [(&str, f64); 5] = [
-    ("neutral", 0.0),
-    ("look_l30", 30.0),
-    ("look_r30", -30.0),
-    ("look_l60", 60.0),
-    ("look_r60", -60.0),
-];
+// TODO(quality-elevation-range-stated-twice-without-a-join): the kin envelope sweep repeats this range as a literal; join the two.
+/// The talker elevations a look may carry, degrees: level up to 30°, 5° under
+/// the head's 35° cone limit, so that no accepted value sits on the cone's
+/// rounding edge. `reachy_kin::look`'s
+/// `every_look_in_the_launcher_s_range_passes_the_envelope` sweeps exactly
+/// this range at every head yaw a look's share admits; nose-down is not swept.
+pub const ELEVATION_RANGE_DEG: RangeInclusive<f64> = 0.0..=30.0;
 
 /// How old the head's estimate may be when a gaze is chosen.
 pub const MAX_POSE_AGE: Duration = Duration::from_millis(200);
@@ -63,19 +61,18 @@ impl Elevation {
     /// # Errors
     ///
     /// [`ElevationError::NonFinite`] for NaN or an infinity;
-    /// [`ElevationError::OutOfRange`] for a magnitude of 90 degrees or more.
+    /// [`ElevationError::OutOfRange`] outside [`ELEVATION_RANGE_DEG`].
     pub fn from_degrees(degrees: f64) -> Result<Self, ElevationError> {
         if !degrees.is_finite() {
             return Err(ElevationError::NonFinite);
         }
-        let radians = degrees.to_radians();
-        if !talker_elevation_in_domain(radians) {
+        if !ELEVATION_RANGE_DEG.contains(&degrees) {
             return Err(ElevationError::OutOfRange);
         }
-        Ok(Self(radians))
+        Ok(Self(degrees.to_radians()))
     }
 
-    /// The elevation in radians, strictly between −π/2 and π/2.
+    /// The elevation in radians, in [0, π/6].
     #[must_use]
     pub const fn radians(self) -> f64 {
         self.0
@@ -88,22 +85,39 @@ pub enum ElevationError {
     /// NaN or an infinity.
     #[error("the talker's elevation is not a finite number")]
     NonFinite,
-    /// Outside the elevations the kinematics take: at or past straight up or
-    /// straight down.
-    #[error("the talker's elevation must be strictly between -90 and 90 degrees")]
+    /// Outside [`ELEVATION_RANGE_DEG`]: below level, or past what a look can
+    /// pitch the head to.
+    #[error(
+        "the talker's elevation must be between 0 and 30 degrees, the range a look pitches the head through"
+    )]
     OutOfRange,
 }
 
 /// Where the head looks, and why.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Look {
-    /// The ladder pose chosen.
-    pub pose: &'static str,
-    /// The world bearing it was chosen for, radians in (−π, π].
-    pub bearing: f64,
+    /// The talker's world bearing, from the base's forward (world x), positive
+    /// to the robot's left, rounded to the nearest milliradian: in
+    /// [−3142, 3142]. The two ends are within half a milliradian of straight
+    /// behind and past the wire's ±3141, so the seam refuses them rather than
+    /// anything here narrowing them.
+    pub bearing_mrad: i32,
+    /// The launcher's elevation, the head's pitch, rounded likewise.
+    pub elevation_mrad: i32,
     /// The bearing is the cone's end-fire edge, not a solution (see
     /// [`MicError::BeyondEndfire`]).
     pub end_fire: bool,
+}
+
+/// `radians` to the nearest milliradian. Every angle rounded here is a
+/// bearing in (−π, π] or an elevation in [0, π/6], so the result's magnitude
+/// is at most 3142 and an `i32` holds it exactly.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "every angle rounded here is at most 3142 in magnitude, which an i32 holds"
+)]
+fn mrad(radians: f64) -> i32 {
+    (radians * 1000.0).round() as i32
 }
 
 impl Look {
@@ -174,7 +188,7 @@ pub struct Decision {
     pub outcome: Result<Look, Decline>,
 }
 
-/// The gaze for one wake: the first of the five steps that fails is the
+/// The gaze for one wake: the first of the four steps that fails is the
 /// decline.
 ///
 /// Only the latest reading in `doa` is judged; `attitude` is the head's pose
@@ -211,8 +225,8 @@ pub fn decide(
             &array_axis_world(&attitude.head_quat_body, attitude.body_yaw),
         ))
         .map(|(bearing, end_fire)| Look {
-            pose: rung(bearing),
-            bearing,
+            bearing_mrad: mrad(bearing),
+            elevation_mrad: mrad(elevation.radians()),
             end_fire,
         })
     } else {
@@ -252,29 +266,6 @@ fn from_mic(solved: Result<f64, MicError>) -> Result<(f64, bool), Decline> {
     }
 }
 
-/// The ladder pose nearest `bearing` (radians) by world yaw.
-///
-/// A rung replaces the one held only when strictly nearer, so a bearing exactly
-/// between two takes the earlier one in [`LADDER`], the smaller turn. The
-/// distance is taken in degrees, the unit the rungs are stated in, so those
-/// midpoints are exact. Beyond ±60° the end rung on that side is chosen. No
-/// wrapping is needed: for any bearing in (−π, π] the nearest rung is within
-/// 120°. A NaN bearing is never nearer than anything and yields `neutral`.
-#[must_use]
-pub fn rung(bearing: f64) -> &'static str {
-    let degrees = bearing.to_degrees();
-    let (mut nearest, first) = LADDER[0];
-    let mut distance = (degrees - first).abs();
-    for (name, yaw) in &LADDER[1..] {
-        let this = (degrees - yaw).abs();
-        if this < distance {
-            nearest = name;
-            distance = this;
-        }
-    }
-    nearest
-}
-
 /// The voice host's gaze policy, as the seam the voice pipeline asks.
 pub struct Gaze {
     elevation: Elevation,
@@ -299,7 +290,7 @@ impl Gaze {
 }
 
 impl WakeGaze for Gaze {
-    fn choose(&self, pod: &PodId, doa: &[DoaSample], wake_end_sample: u64) -> Option<GazePose> {
+    fn choose(&self, pod: &PodId, doa: &[DoaSample], wake_end_sample: u64) -> Option<GazeLook> {
         let at = now();
         let attitude = self
             .poses
@@ -308,9 +299,9 @@ impl WakeGaze for Gaze {
         let decision = decide(doa, attitude.as_ref(), self.elevation);
         self.lines
             .say(gaze_line(&pod.0, &decision, doa.len(), wake_end_sample, at));
-        decision.outcome.ok().map(|look| GazePose {
-            name: look.pose.to_owned(),
-            move_ms: None,
+        decision.outcome.ok().map(|look| GazeLook {
+            bearing_mrad: look.bearing_mrad,
+            elevation_mrad: look.elevation_mrad,
         })
     }
 }
@@ -325,6 +316,7 @@ pub fn gaze_line(
     at: SyncTime,
 ) -> String {
     let degrees = |radians: Option<f64>| radians.map_or(Value::Null, |r| json!(r.to_degrees()));
+    let degrees_of = |mrad: i32| (f64::from(mrad) / 1000.0).to_degrees();
     let (chosen, reason, bearing, says) = match &decision.outcome {
         Ok(look) => {
             let edge = if look.end_fire {
@@ -333,13 +325,16 @@ pub fn gaze_line(
                 ""
             };
             (
-                json!(look.pose),
+                json!({
+                    "bearing_deg": degrees_of(look.bearing_mrad),
+                    "elevation_deg": degrees_of(look.elevation_mrad),
+                }),
                 look.word(),
-                Some(look.bearing),
+                Some(f64::from(look.bearing_mrad) / 1000.0),
                 format!(
-                    "the talker is at {:.0}° world, so the head looks with `{}`{edge}",
-                    look.bearing.to_degrees(),
-                    look.pose,
+                    "the talker is at {:.0}° world, so the head looks there, {:.0}° up{edge}",
+                    degrees_of(look.bearing_mrad),
+                    degrees_of(look.elevation_mrad),
                 ),
             )
         }
@@ -401,9 +396,6 @@ mod tests {
                 .collect()
         }
     }
-
-    /// Bearings go through an f32 azimuth, so they agree to this, radians.
-    const TOLERANCE: f64 = 1e-4;
 
     fn elevation() -> Elevation {
         Elevation::from_degrees(27.0).expect("a lawful elevation")
@@ -601,7 +593,7 @@ mod tests {
             elevation(),
         ));
         assert!(end.end_fire, "{end:?}");
-        assert_eq!(end.pose, "look_r60");
+        assert_eq!(end.bearing_mrad, -1571);
         let past = f32::from_bits(PI32.to_bits() + 1);
         assert_eq!(
             decide(&[focused(past)], Some(&attitude(0.0, 0.0)), elevation()).outcome,
@@ -636,26 +628,27 @@ mod tests {
     }
 
     /// A talker at `target_deg` world, heard with the head yawed +20° on a body
-    /// yawed −10°, gets `pose`.
-    fn talker_at(target_deg: f64, pose: &str) {
+    /// yawed −10°, gets a look at their bearing, to the milliradian, at the
+    /// launcher's elevation.
+    fn talker_at(target_deg: f64) {
         let yawed = attitude(20.0, -10.0);
         let chosen = look(&decide(
             &[focused(toward(target_deg, &yawed))],
             Some(&yawed),
             elevation(),
         ));
-        assert_eq!(chosen.pose, pose);
-        assert!(!chosen.end_fire, "{chosen:?}");
         assert!(
-            (chosen.bearing - target_deg.to_radians()).abs() < TOLERANCE,
-            "{chosen:?}"
+            (chosen.bearing_mrad - mrad(target_deg.to_radians())).abs() <= 1,
+            "{target_deg}°: {chosen:?}"
         );
+        assert_eq!(chosen.elevation_mrad, 471, "{chosen:?}");
+        assert!(!chosen.end_fire, "{chosen:?}");
     }
 
     #[test]
-    fn a_talker_at_each_rung_gets_that_rung() {
-        for (pose, yaw) in LADDER {
-            talker_at(yaw, pose);
+    fn a_talker_ahead_gets_their_bearing() {
+        for degrees in [0.0, 15.0, -15.0, 30.0, -30.0, 45.0, -45.0, 60.0, -60.0] {
+            talker_at(degrees);
         }
     }
 
@@ -667,68 +660,53 @@ mod tests {
             Some(&tilted),
             elevation(),
         ));
-        assert_eq!(chosen.pose, "neutral");
-        assert!(chosen.bearing.abs() < TOLERANCE, "{chosen:?}");
+        assert_eq!(chosen.bearing_mrad, 0, "{chosen:?}");
     }
 
     #[test]
-    fn an_end_fire_reading_bins_by_the_edge_not_ninety() {
+    fn an_end_fire_reading_looks_at_the_edge_not_ninety() {
         let turned = look(&decide(
             &[focused(PI32)],
             Some(&attitude(30.0, 20.0)),
             elevation(),
         ));
-        assert_eq!(turned.pose, "look_r30");
+        assert_eq!(turned.bearing_mrad, -698, "{turned:?}");
         assert!(turned.end_fire, "{turned:?}");
-        assert!(
-            (turned.bearing - (-40f64).to_radians()).abs() < TOLERANCE,
-            "{turned:?}"
-        );
         let square = look(&decide(
             &[focused(PI32)],
             Some(&attitude(0.0, 0.0)),
             elevation(),
         ));
-        assert_eq!(square.pose, "look_r60");
+        assert_eq!(square.bearing_mrad, -1571, "{square:?}");
         assert!(square.end_fire, "{square:?}");
-        assert!(
-            (square.bearing - (-90f64).to_radians()).abs() < TOLERANCE,
-            "{square:?}"
-        );
     }
 
     #[test]
-    fn rung_boundaries_take_the_smaller_turn() {
-        for (degrees, pose) in [
-            (15.0, "neutral"),
-            (-15.0, "neutral"),
-            (45.0, "look_l30"),
-            (-45.0, "look_r30"),
-            (16.0, "look_l30"),
-            (46.0, "look_l60"),
-            (120.0, "look_l60"),
-            (-170.0, "look_r60"),
-            (180.0, "look_l60"),
-        ] {
-            assert_eq!(rung(f64::to_radians(degrees)), pose, "{degrees}°");
-        }
-        assert_eq!(rung(f64::NAN), "neutral");
+    fn a_bearing_is_rounded_to_the_nearest_milliradian() {
+        assert_eq!(mrad(1.2344), 1234);
+        assert_eq!(mrad(1.2346), 1235);
+        assert_eq!(mrad(-1.2346), -1235);
+        assert_eq!(mrad(PI), 3142);
+        assert_eq!(mrad(-PI), -3142);
+        assert_eq!(mrad(27f64.to_radians()), 471);
+        assert_eq!(mrad(0.0), 0);
     }
 
     #[test]
-    fn the_elevation_is_refused_outside_the_open_quarter_turn() {
+    fn the_elevation_is_refused_outside_the_launcher_s_range() {
         let lawful = Elevation::from_degrees(27.0).expect("27° is lawful");
         assert!((lawful.radians() - 27f64.to_radians()).abs() < 1e-15);
-        assert!(Elevation::from_degrees(-10.0).is_ok());
-        assert!(Elevation::from_degrees(89.999).is_ok());
-        for degrees in [90.0, -90.0, 120.0] {
+        for degrees in [0.0, 30.0] {
+            assert!(Elevation::from_degrees(degrees).is_ok(), "{degrees}");
+        }
+        for degrees in [-1.0, -10.0, 30.5, 40.0, 90.0] {
             assert_eq!(
                 Elevation::from_degrees(degrees),
                 Err(ElevationError::OutOfRange),
                 "{degrees}"
             );
         }
-        for degrees in [f64::NAN, f64::INFINITY] {
+        for degrees in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert_eq!(
                 Elevation::from_degrees(degrees),
                 Err(ElevationError::NonFinite),
@@ -753,9 +731,9 @@ mod tests {
         let chosen = gaze.choose(&pod(), &[focused(toward(30.0, &level))], 12_345);
         assert_eq!(
             chosen,
-            Some(GazePose {
-                name: "look_l30".to_owned(),
-                move_ms: None
+            Some(GazeLook {
+                bearing_mrad: 524,
+                elevation_mrad: 471
             })
         );
         let lines = said.lines();
@@ -763,13 +741,20 @@ mod tests {
         let line = &lines[0];
         assert_eq!(line["kind"], "gaze");
         assert_eq!(line["pod"], "pod-a");
-        assert_eq!(line["chosen"], "look_l30");
+        let chosen_bearing = line["chosen"]["bearing_deg"]
+            .as_f64()
+            .expect("a numeric chosen bearing");
+        assert!((chosen_bearing - 30.0).abs() < 0.05, "{line}");
+        let chosen_elevation = line["chosen"]["elevation_deg"]
+            .as_f64()
+            .expect("a numeric chosen elevation");
+        assert!((chosen_elevation - 27.0).abs() < 0.05, "{line}");
         assert_eq!(line["reason"], "bearing");
         assert_eq!(line["doa_count"], 1);
         assert_eq!(line["wake_end_sample"], 12_345);
         assert!(line["azimuth_deg"].is_f64(), "{line}");
         let bearing = line["bearing_deg"].as_f64().expect("a numeric bearing");
-        assert!((bearing - 30.0).abs() < 0.01, "{line}");
+        assert!((bearing - 30.0).abs() < 0.05, "{line}");
     }
 
     #[test]

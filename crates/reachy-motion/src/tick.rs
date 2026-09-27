@@ -194,10 +194,12 @@ pub const RECORDED_WORST_ANTENNA_LAG_RAD: f64 = 1.38;
 /// two gives way is a decision for whoever reads that tour, not an edit made to
 /// get the suite green.
 ///
-/// The figure is a body yaw's, at the pair the class still runs and the gains
-/// it still runs — neither moved when the legs were commissioned — so the
-/// confirmation tour cut no head window and this figure is the recorded tours'
-/// as it was. What would move it is a tour that commissions the yaw.
+/// The figure is a body yaw's at `20 / 50` and `200 / 0 / 0`, the
+/// configuration the class ran before it was commissioned at the Velocity
+/// Limit register on `800 / 0 / 400`. One armed library tour at the
+/// commissioned `317 / 445` read the yaw's worst at 0.2184 rad; no kept
+/// fixture holds that tour yet, so the figure here is the older
+/// configuration's until one does.
 ///
 /// The same tours are also recorded per joint group as p99.9 residuals, in the
 /// offline analyzer (`RECORDED_P999_*_RESIDUAL_RAD`, `cogs/pose_reading.rs`),
@@ -206,10 +208,10 @@ pub const RECORDED_WORST_ANTENNA_LAG_RAD: f64 = 1.38;
 /// figures are one configuration's reading, at the pair and the gains the tree
 /// ships that class at, and are re-baked together for that class or not at all:
 /// a fresh worst printed against a noise floor measured under some other
-/// configuration is a comparison of two machines. Every figure is at its class's
-/// shipping configuration; where one is not read over three tours of the
-/// library, its own comment says so — the antennas' p99.9 array, which is a tour
-/// and two sweeps. TODO(session-servo-profile) is the re-bake, and lists the
+/// configuration is a comparison of two machines. Every figure but the body
+/// yaw's is at its class's shipping configuration; where one is not read over
+/// three tours of the library, its own comment says so — the antennas' p99.9
+/// array, which is a tour and two sweeps. TODO(session-servo-profile) is the re-bake, and lists the
 /// set.
 pub const RECORDED_WORST_HEAD_RESIDUAL_RAD: f64 = 0.3884;
 
@@ -2784,23 +2786,41 @@ pub struct ClockStretch {
     /// that reads only `dephased` cannot tell such a move from a pair the pass
     /// merely parted.
     pub span_stretched: bool,
+    // TODO(quality-clock-stretch-bool-pair-admits-invalid-state): body_paced without span_stretched is representable; consider one three-way field.
+    /// Whether the span stretch here is the body yaw's alone: the head clock
+    /// was lengthened, and on the clocks that were asked for the legs and both
+    /// antennas carried their own spans while the body yaw did not. The body's
+    /// pace is the step bound by policy, so such a plan runs at the body's pace
+    /// rather than on a clock that failed to cover a span it was sized for.
+    /// `false` when nothing was lengthened for its span.
+    pub body_paced: bool,
 }
 
 /// The worst per-tick step one dry pass saw, per clock, as a fraction of the
 /// bound the joints on that clock are judged against.
 ///
-/// At or under one is a clock that fits. The head clock drives the body yaw and
-/// the six legs, which are bounded separately and reduced together here because
-/// one duration governs them both; each antenna is its own clock and its own
-/// ratio, so a side asked for a clock too short for its arc stretches without
-/// dragging the other side out with it.
+/// At or under one is a clock that fits. The legs and the body yaw ride one
+/// clock, the head's, and are judged against bounds of their own; their ratios
+/// are kept apart so a caller can say which one set the head clock's floor, and
+/// [`StepRatios::head`] is the clock's ratio. Each antenna is its own clock and
+/// its own ratio, so a side asked for a clock too short for its arc stretches
+/// without dragging the other side out with it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct StepRatios {
-    head: f64,
+    /// The worst crank's step over `max_step.legs`.
+    legs: f64,
+    /// The body yaw's step over `max_step.body_yaw`.
+    body_yaw: f64,
     antennas: [f64; 2],
 }
 
 impl StepRatios {
+    /// The head clock's ratio: the worse of the legs' and the yaw's, because one
+    /// duration governs them both.
+    fn head(self) -> f64 {
+        self.legs.max(self.body_yaw)
+    }
+
     /// Whether every clock carries its span, headroom included.
     ///
     /// The same test a stretch is sized to satisfy. The dry pass walks every
@@ -2808,7 +2828,7 @@ impl StepRatios {
     /// wakes, so a clock is accepted only with the room its own length says the
     /// phases between two fine samples need.
     fn fit(self, durations: MoveDurations, tick_hz: f64) -> bool {
-        carries(self.head, durations.head, tick_hz)
+        carries(self.head(), durations.head, tick_hz)
             && carries(self.antennas[0], durations.antennas[0], tick_hz)
             && carries(self.antennas[1], durations.antennas[1], tick_hz)
     }
@@ -2849,6 +2869,9 @@ impl StepRatios {
 /// `start` is what the accepted trajectory will chain from — the state's last
 /// commanded targets — so a retarget mid-recovery is right-sized for the span
 /// still ahead of it rather than for the one the original command had.
+///
+/// What set a span stretch is read off the first pass, on the clocks that were
+/// asked for. [`ClockStretch::body_paced`] says the body yaw alone overran them.
 #[must_use]
 pub fn floor_move_clock(
     cfg: &MotionConfig,
@@ -2874,13 +2897,13 @@ pub fn floor_move_clock(
     // whose phase means anything, and the fit reached here survives what comes
     // next: the worst step shrinks monotonically as a clock lengthens, and
     // de-phasing only ever lengthens one.
-    let mut measured = false;
+    let mut first: Option<StepRatios> = None;
     for _ in 0..STRETCH_PASSES {
         let Some(ratios) = worst_step_ratios(cfg, start, &resolved, effective, *warp, tick_hz)
         else {
             break;
         };
-        measured = true;
+        first.get_or_insert(ratios);
         if ratios.fit(effective, tick_hz) {
             break;
         }
@@ -2889,7 +2912,7 @@ pub fn floor_move_clock(
         };
         effective = stretched;
     }
-    if !measured {
+    let Some(first) = first else {
         // Nothing about this command could be measured on the clocks it came
         // with, so nothing about it is this pass's to change. The phase walk
         // would still have an answer — it solves no legs, so a path nobody can
@@ -2897,11 +2920,17 @@ pub fn floor_move_clock(
         // be a stretch reported for a move the tick is about to refuse for a
         // reason no clock addresses.
         return (*command, None);
-    }
+    };
 
     // Then the pair's phase, on the clocks the move will run on — measured
     // again after every adjustment, so what is reported is what runs.
     let sized = effective;
+    // Which joint set a span stretch, read on the clocks that were asked for:
+    // the body yaw alone, with the legs and both antennas inside their bounds.
+    let body_paced = sized != requested
+        && carries(first.legs, requested.head, tick_hz)
+        && !carries(first.body_yaw, requested.head, tick_hz)
+        && sized.antennas == requested.antennas;
     let mut separation;
     let mut dephased = false;
     let mut adjustments = 0;
@@ -2939,6 +2968,7 @@ pub fn floor_move_clock(
             separation_required: cfg.phase.separation_rad,
             dephased,
             span_stretched: sized != requested,
+            body_paced,
         }),
     )
 }
@@ -2998,7 +3028,7 @@ fn de_phased(
 /// duration can hold.
 fn stretched(durations: MoveDurations, ratios: StepRatios, tick_hz: f64) -> Option<MoveDurations> {
     Some(MoveDurations {
-        head: scale_past(durations.head, ratios.head, tick_hz)?,
+        head: scale_past(durations.head, ratios.head(), tick_hz)?,
         antennas: [
             scale_past(durations.antennas[0], ratios.antennas[0], tick_hz)?,
             scale_past(durations.antennas[1], ratios.antennas[1], tick_hz)?,
@@ -3060,15 +3090,14 @@ fn worst_step_ratios(
 ) -> Option<StepRatios> {
     let peaks = peaks_of(cfg, start, target, durations, warp, tick_hz)?;
     // Per joint and not per group: the legs and the body yaw ride one clock and
-    // are judged against bounds of their own, so the clock's ratio is the worse
-    // of the two.
+    // are judged against bounds of their own, so each keeps its own ratio.
     let ratio = |step: f64, bound: f64| {
         let ratio = step / bound;
         ratio.is_finite().then_some(ratio)
     };
     Some(StepRatios {
-        head: ratio(peaks.legs, cfg.max_step.legs)?
-            .max(ratio(peaks.body_yaw, cfg.max_step.body_yaw)?),
+        legs: ratio(peaks.legs, cfg.max_step.legs)?,
+        body_yaw: ratio(peaks.body_yaw, cfg.max_step.body_yaw)?,
         antennas: [
             ratio(peaks.antennas[0], cfg.max_step.antennas)?,
             ratio(peaks.antennas[1], cfg.max_step.antennas)?,
@@ -3971,7 +4000,7 @@ mod tests {
             antennas: [secs(0.1), secs(0.15)],
         };
 
-        let yaw_span = 1.0;
+        let yaw_span = 2.5;
         let antenna_span = 3.0;
         // `None` is the head clock; `Some(side)` is that antenna's own.
         for (name, target, span, bound, clock) in [
@@ -4119,10 +4148,10 @@ mod tests {
     /// unattended-at-boot case: nobody is there to catch the head or to restart
     /// the daemon.
     ///
-    /// Half a turn needs about 2.5 s at the yaw's bound, which a calm
+    /// Half a turn needs about 0.28 s at the yaw's bound, which a calm
     /// three-second stow carries outright — asserted here, because it is why the
-    /// fold below is driven at a quick gesture's clock instead: that is the
-    /// clock a half turn does not fit inside.
+    /// fold below is driven at a fifth of a second instead: that is a clock a
+    /// half turn does not fit inside.
     #[test]
     fn a_body_spun_to_the_half_turn_folds_on_a_stretched_clock() {
         let cfg = MotionConfig::default();
@@ -4146,7 +4175,7 @@ mod tests {
             "a calm stow carries the half turn as asked"
         );
 
-        let quick = secs(0.5);
+        let quick = secs(0.2);
         let command = MotionCommand::MoveTo {
             target: stow,
             durations: MoveDurations::uniform(quick),
@@ -4172,7 +4201,7 @@ mod tests {
         let (mut state, pinned) = armed_at(&cfg, &crooked);
         let (floored, stretch) =
             floor_move_clock(&cfg, &last_targets(&state), &command, FLOOR_TICK_HZ);
-        let stretch = stretch.expect("a half turn does not fit a half second clock");
+        let stretch = stretch.expect("a half turn does not fit a fifth of a second");
         let floor = duration_floor_s(core::f64::consts::PI, cfg.max_step.body_yaw, FLOOR_TICK_HZ);
         // The closed form is written from the peak rate, and a whole period's
         // travel is the mean across a window centred there, so a clock measured
@@ -4340,7 +4369,7 @@ mod tests {
         };
         let command = MotionCommand::MoveTo {
             target: stow,
-            durations: MoveDurations::uniform(secs(0.5)),
+            durations: MoveDurations::uniform(secs(0.2)),
             warp: WarpKind::MinJerk,
         };
         let (state, _) = armed_at(&cfg, &crooked);
@@ -4512,8 +4541,8 @@ mod tests {
     fn a_stow_re_commanded_with_a_nanosecond_left_is_floored_to_a_clock_that_carries_it() {
         let cfg = MotionConfig::default();
         // A fold interrupted near its end: the head is already stowed and a
-        // third of a radian of yaw is what remains.
-        let remaining = 0.3;
+        // radian and a half of yaw is what remains.
+        let remaining = 1.5;
         let stowed = JointTargets {
             head_pose_body: reachy_kin::sleep_head_pose(),
             ..JointTargets::default()
@@ -5136,11 +5165,10 @@ mod tests {
     #[test]
     fn a_stretch_follows_the_span_still_ahead() {
         let cfg = MotionConfig::default();
-        let requested = MoveDurations::uniform(secs(0.3));
-        let stow = JointTargets {
-            head_pose_body: reachy_kin::sleep_head_pose(),
-            ..JointTargets::default()
-        };
+        let requested = MoveDurations::uniform(secs(0.1));
+        // The body turned home with the head where it stands: the legs' fold
+        // floors a clock of its own that would hide the body's span.
+        let home = JointTargets::default();
 
         let effective_from = |yaw: f64| {
             let (state, _) = armed_at(
@@ -5151,13 +5179,13 @@ mod tests {
                 },
             );
             let command = MotionCommand::MoveTo {
-                target: stow,
+                target: home,
                 durations: requested,
                 warp: WarpKind::MinJerk,
             };
             floor_move_clock(&cfg, &last_targets(&state), &command, FLOOR_TICK_HZ)
                 .1
-                .expect("three tenths of a second carries neither span")
+                .expect("a tenth of a second carries neither span")
                 .effective
                 .head
                 .as_secs_f64()
@@ -5501,22 +5529,24 @@ mod tests {
     /// Three shapes: a yaw sweep on a clock that cannot carry it, with no pair
     /// to judge; a pair in step on clocks that carry their own arcs, parted and
     /// nothing else; and a pair whose clocks carry neither, which says both.
+    /// The report also says whether the body yaw alone set the stretch.
     #[test]
     fn the_report_says_whether_a_span_was_stretched_or_only_a_pair_parted() {
         let cfg = MotionConfig::default();
         let (state, _) = armed_at(&cfg, &JointTargets::default());
         let yaw = MotionCommand::MoveTo {
             target: JointTargets {
-                body_yaw: 1.0,
+                body_yaw: 2.5,
                 ..JointTargets::default()
             },
-            durations: MoveDurations::uniform(secs(0.2)),
+            durations: MoveDurations::uniform(secs(0.1)),
             warp: WarpKind::MinJerk,
         };
         let (_, stretch) = floor_move_clock(&cfg, &last_targets(&state), &yaw, FLOOR_TICK_HZ);
-        let stretch = stretch.expect("a fifth of a second cannot carry a radian of yaw");
+        let stretch = stretch.expect("a tenth of a second cannot carry 2.5 rad of yaw");
         assert!(stretch.span_stretched, "{stretch:?}");
         assert!(!stretch.dephased, "{stretch:?}");
+        assert!(stretch.body_paced, "{stretch:?}");
 
         let (swept, _) = armed_at(&cfg, &stowed_with(SWEPT_FROM));
         let (_, stretch) = floor_move_clock(
@@ -5528,6 +5558,7 @@ mod tests {
         let stretch = stretch.expect("a pair in step is de-phased");
         assert!(!stretch.span_stretched, "{stretch:?}");
         assert!(stretch.dephased, "{stretch:?}");
+        assert!(!stretch.body_paced, "{stretch:?}");
 
         let (_, stretch) = floor_move_clock(
             &cfg,
@@ -5538,6 +5569,117 @@ mod tests {
         let stretch = stretch.expect("neither side carries its sweep in a twentieth of a second");
         assert!(stretch.span_stretched, "{stretch:?}");
         assert!(stretch.dephased, "{stretch:?}");
+        assert!(!stretch.body_paced, "{stretch:?}");
+    }
+
+    /// A stretch is the body's pace only when the body yaw alone overran the
+    /// clocks asked for. The legs, an antenna, or the legs together with the
+    /// body make it the anomaly.
+    #[test]
+    fn a_stretch_says_whether_the_body_alone_set_it() {
+        let cfg = MotionConfig::default();
+        let floor = |start: &JointTargets, command: &MotionCommand| {
+            floor_move_clock(&cfg, start, command, FLOOR_TICK_HZ).1
+        };
+        let swung = JointTargets {
+            body_yaw: 2.5,
+            ..JointTargets::default()
+        };
+
+        // Body only.
+        let stretch = floor(
+            &JointTargets::default(),
+            &MotionCommand::MoveTo {
+                target: swung,
+                durations: MoveDurations::uniform(secs(0.1)),
+                warp: WarpKind::MinJerk,
+            },
+        )
+        .expect("0.1 s cannot carry 2.5 rad of yaw");
+        assert!(stretch.span_stretched, "{stretch:?}");
+        assert!(stretch.body_paced, "{stretch:?}");
+        assert!(
+            stretch.effective.head > stretch.requested.head,
+            "{stretch:?}"
+        );
+        assert_eq!(
+            stretch.effective.antennas, stretch.requested.antennas,
+            "{stretch:?}"
+        );
+
+        // The fold, set by the legs.
+        let folded = JointTargets {
+            head_pose_body: reachy_kin::sleep_head_pose(),
+            ..JointTargets::default()
+        };
+        let stretch = floor(
+            &folded,
+            &MotionCommand::MoveTo {
+                target: JointTargets::default(),
+                durations: MoveDurations::uniform(secs(0.2)),
+                warp: WarpKind::MinJerk,
+            },
+        )
+        .expect("a fifth of a second cannot carry the fold");
+        assert!(stretch.span_stretched, "{stretch:?}");
+        assert!(!stretch.body_paced, "{stretch:?}");
+
+        // An antenna arc the clock cannot carry, beside a body swing it cannot
+        // carry either: the body is uncarried so the antennas decide.
+        let stretch = floor(
+            &stowed_with(SWEPT_FROM),
+            &MotionCommand::MoveTo {
+                target: swung,
+                durations: MoveDurations {
+                    head: secs(0.1),
+                    antennas: [secs(0.05), secs(0.06)],
+                },
+                warp: WarpKind::MinJerk,
+            },
+        )
+        .expect("neither side carries its sweep in a twentieth of a second");
+        assert!(stretch.span_stretched, "{stretch:?}");
+        assert!(!stretch.body_paced, "{stretch:?}");
+        assert_ne!(
+            stretch.effective.antennas, stretch.requested.antennas,
+            "{stretch:?}"
+        );
+
+        // The legs and the body together, from the fold.
+        let policy = reachy_kin::LookPolicy {
+            head_share: core::f64::consts::FRAC_PI_6,
+        };
+        let look_at = |bearing_deg: f64| {
+            let look =
+                reachy_kin::look::target(bearing_deg.to_radians(), 27_f64.to_radians(), &policy);
+            JointTargets {
+                head_pose_body: look.head_pose_body,
+                body_yaw: look.body_yaw,
+                antennas: look.antennas,
+            }
+        };
+        let look_move = |target: JointTargets| MotionCommand::MoveTo {
+            target,
+            durations: MoveDurations::uniform(secs(0.1)),
+            warp: WarpKind::MinJerk,
+        };
+        // At the share's own bearing the head stands where it does at 120
+        // degrees and the body does not move, so this is the wide look's legs
+        // alone.
+        let legs_only = floor(&folded, &look_move(look_at(30.0)))
+            .expect("0.1 s cannot carry the legs from the fold to a look");
+        assert!(
+            legs_only.span_stretched && !legs_only.body_paced,
+            "premise: the legs alone overrun from the fold, {legs_only:?}"
+        );
+        let wide = look_at(120.0);
+        assert!(
+            duration_floor_s(wide.body_yaw, cfg.max_step.body_yaw, FLOOR_TICK_HZ) > 0.1,
+            "premise: the body alone overruns 0.1 s"
+        );
+        let stretch = floor(&folded, &look_move(wide)).expect("both overrun");
+        assert!(stretch.span_stretched, "{stretch:?}");
+        assert!(!stretch.body_paced, "{stretch:?}");
     }
 
     /// A stagger a floor collapses is caught by the same check, because the
@@ -7215,6 +7357,23 @@ mod tests {
         }
     }
 
+    /// [`armed_shipped`] with the body yaw on the `20 / 50` generator it ran
+    /// before it was commissioned at the register, and the step bound twice
+    /// that generator's speed as it is for any pair.
+    ///
+    /// For the re-raise cadence cases, which need a yaw goal that keeps the
+    /// generator at its cap for three windows. At the shipped pair the yaw
+    /// crosses its whole travel in a dozen periods, so no move inside the
+    /// cap stays saturated that long. What those cases pin is the window's
+    /// arithmetic against a jammed joint, which is the same at any pair.
+    fn armed_on_a_slow_yaw() -> MotionConfig {
+        let mut cfg = armed_shipped();
+        cfg.plant.yaw = PlantModel::from_registers(50, 20, 0, SHIPPED_PERIOD_NS)
+            .expect("the 20 / 50 pair is a model");
+        cfg.max_step.body_yaw = 2.0 * cfg.plant.yaw.v_max;
+        cfg
+    }
+
     /// Whether any row this tick measured stands further off its prediction
     /// than the screen.
     fn past_threshold(cfg: &MotionConfig, out: &TickOutputs) -> bool {
@@ -7439,7 +7598,7 @@ mod tests {
     /// the cadence a fact about the goal rather than about the window.
     #[test]
     fn a_persisting_obstruction_re_raises_every_window() {
-        let cfg = armed_shipped();
+        let cfg = armed_on_a_slow_yaw();
         let ticks = cfg.tracking.ticks;
         let run = re_raises(&cfg, &yaw_move(&cfg, 1.5, 0.5), 20, None, 260);
         let raises = run.raises;
@@ -7498,7 +7657,7 @@ mod tests {
     /// out and sits on a coincidence of the shipped pair; nothing here pins it.
     #[test]
     fn a_release_inside_the_window_ends_the_re_raising() {
-        let cfg = armed_shipped();
+        let cfg = armed_on_a_slow_yaw();
         let ticks = cfg.tracking.ticks;
         let command = yaw_move(&cfg, 1.5, 0.5);
         let recovery = cfg.plant.yaw.pass_cycles(cfg.tracking.progress_min_rad) as u32;
@@ -7566,7 +7725,7 @@ mod tests {
     /// instant.
     #[test]
     fn a_release_after_a_raise_on_a_saturated_move_still_re_raises() {
-        let cfg = armed_shipped();
+        let cfg = armed_on_a_slow_yaw();
         let ticks = cfg.tracking.ticks;
         // Asked for at three times the profile velocity and floored to the
         // step bound, as the Mover floors a wide look: the plan peaks at twice

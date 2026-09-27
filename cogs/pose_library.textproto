@@ -25,14 +25,10 @@
 #
 # pose_id  name
 #   0  hello
-#   1  look_l30
-#   2  look_l60
-#   3  look_r30
-#   4  look_r60
-#   5  neutral
-#   6  peek
-#   7  peek_tilt
-#   8  stow
+#   1  neutral
+#   2  peek
+#   3  peek_tilt
+#   4  stow
 
 # hello
 poses {
@@ -47,66 +43,6 @@ poses {
   antenna_right: -0.8303838173726208
   antenna_left: -0.23610866451374868
   duration_ns: 1000000000
-}
-
-# look_l30
-poses {
-  dx: 0.0
-  dy: 0.0
-  dz: 0.0
-  qw: 0.9659258262890683
-  qx: 0.0
-  qy: 0.0
-  qz: 0.25881904510252074
-  body_yaw: 0.0
-  antenna_right: -0.1745
-  antenna_left: 0.1745
-  duration_ns: 600000000
-}
-
-# look_l60
-poses {
-  dx: 0.0
-  dy: 0.0
-  dz: 0.0
-  qw: 0.9238795325112867
-  qx: 0.0
-  qy: 0.0
-  qz: 0.3826834323650898
-  body_yaw: 0.2617993877991494
-  antenna_right: -0.1745
-  antenna_left: 0.1745
-  duration_ns: 900000000
-}
-
-# look_r30
-poses {
-  dx: 0.0
-  dy: 0.0
-  dz: 0.0
-  qw: 0.9659258262890683
-  qx: 0.0
-  qy: 0.0
-  qz: -0.25881904510252074
-  body_yaw: 0.0
-  antenna_right: -0.1745
-  antenna_left: 0.1745
-  duration_ns: 600000000
-}
-
-# look_r60
-poses {
-  dx: 0.0
-  dy: 0.0
-  dz: 0.0
-  qw: 0.9238795325112867
-  qx: 0.0
-  qy: 0.0
-  qz: -0.3826834323650898
-  body_yaw: -0.2617993877991494
-  antenna_right: -0.1745
-  antenna_left: 0.1745
-  duration_ns: 900000000
 }
 
 # neutral
@@ -170,4 +106,4 @@ poses {
 }
 
 # where the machine rests: the pose named "stow"
-stow: 8
+stow: 4

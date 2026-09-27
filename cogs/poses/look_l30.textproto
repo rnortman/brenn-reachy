@@ -1,9 +1,0 @@
-name: "look_l30"
-description: "Head turned 30 degrees to the robot's left from neutral, a pure yaw about the body's vertical axis, level and at nominal height; body square; antennas as neutral's. Written from the figures, not recorded. A rung of the voice host's gaze ladder: it faces a talker 30 degrees to the left."
-# Head relative to the neutral head pose: metres, unit quaternion [w, x, y, z].
-dt: [0.0, 0.0, 0.0]
-dq: [0.9659258262890683, 0.0, 0.0, 0.25881904510252074]
-body_yaw: 0.0
-# Right, then left; radians, a direction.
-antennas: [-0.1745, 0.1745]
-duration_ms: 600

@@ -142,23 +142,18 @@ drafts a clip, `--as-pose` a pose: `docs/pose-authoring.md`.
 ## Exit codes
 
 - **3**, **4** — `brenn-app.service`, `reachy-motiond.service` holds the bus.
-- **5** — no `provenance.txt` in the payload.
-- **6** — the stamp could not be staged.
-- **7** — a step after the wipe failed; unfetched records are gone.
-- **8** — no launcher config for this run; push again.
 - **9** — no staged `host/speech.toml`.
 - **10** — stdin is not a terminal.
-- **11** — `reachy_host --check` refused the staged configuration.
-- **13** — a speech service the config names is unreachable from the unit.
+- **11** — `reachy_host --check` refused.
+- **13** — a speech service is unreachable from the unit.
 - **14** — no staged `host/speech-record.toml`.
 - **15** — no staged `bench/reachy-bench.toml`.
-- **16** — `speech-record.toml` and `speech.toml` disagree on a shared key.
+- **16** — `speech-record.toml` disagrees with `speech.toml`.
 - **17** — the boot fetch is still retrying.
 - **18** — `brenn-app-resync` failed.
 - **19** — the unit's hostname is not `host_params`' `pod`.
 
-5–8, 13 and 17–19 are the remote chain's: a message and exit 1; past the
-sentinel line, the launcher's.
+13 and 17–19 are the remote chain's; past the sentinel line, the launcher's.
 
 ## Open observations
 
@@ -171,3 +166,8 @@ sentinel line, the launcher's.
   completing each period's step, or servos following clip tremor at half
   frequency. Test `attentive2` at 0.5, legs' acceleration halved
   (`REACHY_EXPERIMENT_DIR`).
+- **The legs' arrival overshoot grew between 2026-09-20 and 2026-09-27** at
+  an unchanged configuration, after two contact holds and a knock that day;
+  figures in `envelope.rs`'s margin paragraph. Unexplained. Tripwire: the
+  settle walks under `SETTLE_EVIDENCE=1` at the 25-count bound. Inspect rod
+  ends, crank horns and fasteners when next at the unit.

@@ -1241,12 +1241,13 @@ mod tests {
     #[test]
     fn strict_policy_does_not_restate_shared_excess_count_finding() {
         let (_, poses) = tables();
-        let excessive = settle_result(true, None, 18.1);
+        let excessive = settle_result(true, None, SETTLE_BOUND_COUNTS + 0.1);
         let mut report = Report::default();
-        report.fail(
-            "base-move settled residual exceeds 18 counts at leg 1: 18.1 counts (pose 0 at 123)"
-                .to_owned(),
-        );
+        report.fail(format!(
+            "base-move settled residual exceeds {:.0} counts at leg 1: {:.1} counts (pose 0 at 123)",
+            SETTLE_BOUND_COUNTS,
+            SETTLE_BOUND_COUNTS + 0.1
+        ));
         let findings_before = report.findings.len();
         strict_settle(&strict_script(), &excessive, 2, &poses, &mut report);
         assert_eq!(
@@ -1333,6 +1334,7 @@ mod tests {
     fn strict_policy_boundary_is_reported_by_settle_once() {
         let (_, poses) = tables();
         let start = 1_700_000_001_000_000_000;
+        let past = format!("{:.1} counts", SETTLE_BOUND_COUNTS + 0.1);
         for (count, expected) in [
             (SETTLE_BOUND_COUNTS, false),
             (SETTLE_BOUND_COUNTS + 0.1, true),
@@ -1373,7 +1375,7 @@ mod tests {
                 report
                     .findings
                     .iter()
-                    .filter(|finding| finding.contains("18.1 counts")
+                    .filter(|finding| finding.contains(&past)
                         && finding.contains("leg 1")
                         && finding.contains("pose 0 at 1700000001500000000")
                         && finding.contains("settled residual exceeds"))

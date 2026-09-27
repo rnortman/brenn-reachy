@@ -1895,9 +1895,8 @@ speech_preflight() {
 	listing=$(bazel_files "$check_target")
 	binary=$(bazel_named_in "$listing" reachy_host)
 	# TODO(quality-gaze-check-bool-threaded-and-unreached-by-deploy): the
-	# launcher also passes the voice host `--idle` and
-	# `--gaze-elevation-deg`, and this check passes neither, so the
-	# playlist and gaze-ladder conclusions are never reached here.
+	# launcher also passes the voice host `--idle`, and this check does not,
+	# so the playlist conclusion is never reached here.
 	(cd "$payload" && "$binary" --speech-config "$config_path" --check) ||
 		refuse "$rc_check_refused" \
 			"the staged speech configuration did not pass ${check_target} --check, so nothing was started." \

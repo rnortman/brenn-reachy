@@ -400,18 +400,8 @@ mod tests {
     fn every_directed_pose_transition_passes() {
         transition_verdict(library(), &tables().1, None)
             .unwrap_or_else(|failure| panic!("directed pose matrix failed: {failure}"));
-        assert_eq!(tables().1.len(), 9);
-        for name in [
-            "neutral",
-            "peek",
-            "peek_tilt",
-            "hello",
-            "stow",
-            "look_l30",
-            "look_l60",
-            "look_r30",
-            "look_r60",
-        ] {
+        assert_eq!(tables().1.len(), 5);
+        for name in ["neutral", "peek", "peek_tilt", "hello", "stow"] {
             assert!(tables().1.resolve(name).is_some(), "{name}");
         }
     }

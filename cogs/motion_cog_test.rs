@@ -56,12 +56,13 @@ use reachy_motion::disarm::{DEFAULT_STOW_DWELL, DEFAULT_STOW_TOLERANCE};
 use reachy_motion::fault;
 use reachy_motion::joints::ROW_COUNT as JOINT_COUNT;
 use reachy_motion::joints::{
-    self, JointGroup, JointRef, Name, ROWS, flags, group_of, row, rows_of, write_rows,
+    self, JointGroup, JointRef, JointTargets, Name, ROWS, flags, group_of, row, rows_of, write_rows,
 };
 use reachy_motion::plant::{ClassProfile, RESPONSE_DEAD_SAMPLES};
 use reachy_motion::record;
 use reachy_motion::snap::PoseSnapshotError;
-use reachy_motion::tick::ResponseKind;
+use reachy_motion::tick::{MotionCommand, ResponseKind, floor_move_clock};
+use reachy_motion::traj::{MoveDurations, WarpKind};
 use reachy_motion::value;
 use reachy_motion::winddown::{Disposition, ending};
 use session_slots::TIMELINE_LEN;
@@ -694,12 +695,16 @@ fn params(period_ns: i64) -> MoverParamsWire {
     message
 }
 
-/// The most of a look's bearing the head carries in these cases, radians: the
-/// deployment's 30 degrees.
+/// The most of a look's bearing the head carries in these cases, radians: 30
+/// degrees. This is the cases' own share, not the deployment's, chosen so that a
+/// wide bearing puts most of its swing on the body.
 const LOOK_SHARE: f64 = core::f64::consts::FRAC_PI_6;
 
-/// The head's clock for a look in these cases, nanoseconds: the deployment's.
-const LOOK_HEAD_NS: i64 = 400_000_000;
+/// The head's clock for a look in these cases, nanoseconds: 100 ms. This is the
+/// cases' own lower bound, not the deployment's clock. It is short enough that
+/// the body-paced cases' swings floor past it, and each of those cases asserts
+/// that premise.
+const LOOK_HEAD_NS: i64 = 100_000_000;
 
 /// The bus rows a look at `bearing_mrad`, `elevation_mrad` resolves to under the
 /// cases' own split: the body yaw, the cranks that hold the composed head, and
@@ -731,6 +736,35 @@ fn look_rows(bearing_mrad: i32, elevation_mrad: i32) -> [f64; JOINT_COUNT] {
     rows[row(JointRef::AntennaRight).expect("a bus row")] = LOOK_ANTENNAS[0];
     rows[row(JointRef::AntennaLeft).expect("a bus row")] = LOOK_ANTENNAS[1];
     rows
+}
+
+/// Where a look at `bearing_mrad`, `elevation_mrad` sends the machine under
+/// the cases' own split, as the targets the floor plans to.
+fn look_targets(bearing_mrad: i32, elevation_mrad: i32) -> JointTargets {
+    let t = reachy_kin::look::target(
+        f64::from(bearing_mrad) / 1000.0,
+        f64::from(elevation_mrad) / 1000.0,
+        &LookPolicy {
+            head_share: LOOK_SHARE,
+        },
+    );
+    JointTargets {
+        head_pose_body: t.head_pose_body,
+        body_yaw: t.body_yaw,
+        antennas: t.antennas,
+    }
+}
+
+/// A look at `target` on the cases' look clock, as the Mover asks for it
+/// before the floor.
+fn look_command(target: JointTargets) -> MotionCommand {
+    MotionCommand::MoveTo {
+        target,
+        durations: MoveDurations::uniform(core::time::Duration::from_nanos(
+            u64::try_from(LOOK_HEAD_NS).expect("a positive clock"),
+        )),
+        warp: WarpKind::MinJerk,
+    }
 }
 
 /// Every row of `found` is the row of `wanted` within `tolerance`, the antennas
@@ -2935,10 +2969,21 @@ fn mode_of(mover: &Mover) -> MotionMode {
 /// and is counted in nothing.
 #[test]
 fn a_look_goes_to_the_direction_it_names_on_the_head_s_clock() {
+    assert_eq!(
+        floor_move_clock(
+            default_motion_config(),
+            &committed_poses::targets("neutral"),
+            &look_command(look_targets(262, 471)),
+            1e9 / PERIOD as f64,
+        )
+        .1,
+        None,
+        "the case needs a look the head's clock carries from neutral"
+    );
     let mut mover = standing_up();
     mover.run(60);
-    // 20 degrees at 27 degrees up: the head carries it all and the body stays.
-    mover.schedule_looks(2, &[(1000, 349, 471)]);
+    // 15 degrees at 27 degrees up: the head carries it all and the body stays.
+    mover.schedule_looks(2, &[(1000, 262, 471)]);
     let head_cycles = usize::try_from(LOOK_HEAD_NS / PERIOD).expect("whole cycles");
     let mut cycles = mover.run(head_cycles - 3);
     assert_eq!(mode_of(&mover), MotionMode::Moving, "the look is under way");
@@ -2950,14 +2995,14 @@ fn a_look_goes_to_the_direction_it_names_on_the_head_s_clock() {
     );
 
     let last = cycles.last().and_then(|cycle| cycle.goal).expect("a goal");
-    assert_rows_at(&last.targets, &look_rows(349, 471), 1e-6, "the look's end");
+    assert_rows_at(&last.targets, &look_rows(262, 471), 1e-6, "the look's end");
     assert!(reports(&cycles).is_empty(), "{:?}", reports(&cycles));
     assert_steps_fit(&cycles, "a look inside the share");
     let state = mover.cog.state_ctrl();
-    assert_eq!(state.look_paced(), 0, "the head's clock carried the look");
+    assert_eq!(state.base_paced(), 0, "the head's clock carried the look");
     assert_eq!(state.base_stretched(), 0);
     assert_eq!(state.desired_kind(), StepKindWire::BASE_LOOK);
-    assert_eq!(state.desired_bearing_mrad(), 349);
+    assert_eq!(state.desired_bearing_mrad(), 262);
     assert_eq!(state.desired_elevation_mrad(), 471);
     assert_eq!(state.desired_pose_id(), 0);
 }
@@ -2967,8 +3012,8 @@ fn a_look_goes_to_the_direction_it_names_on_the_head_s_clock() {
 fn a_second_look_at_the_same_direction_dispatches_nothing_new() {
     let mut mover = standing_up();
     mover.run(60);
-    // The first row lasts 40 cycles from the instant it is published.
-    let first_end = mover.cycles_from_start() + 40;
+    // The first row lasts 60 cycles from the instant it is published.
+    let first_end = mover.cycles_from_start() + 60;
     mover.schedule_looks(2, &[(first_end, 349, 471), (1000, 349, 471)]);
     let answered = mover.cog.state_ctrl().epochs_answered();
     let arriving = usize::try_from(LOOK_HEAD_NS / PERIOD).expect("whole cycles") + 10;
@@ -3003,7 +3048,7 @@ fn a_second_look_at_the_same_direction_dispatches_nothing_new() {
 fn a_look_at_another_direction_dispatches() {
     let mut mover = standing_up();
     mover.run(60);
-    let first_end = mover.cycles_from_start() + 40;
+    let first_end = mover.cycles_from_start() + 60;
     mover.schedule_looks(2, &[(first_end, 349, 471), (1000, -349, 471)]);
     // The last sample inside the first row: the next one is the second row's.
     let rest = usize::try_from(first_end - mover.cycles_from_start()).expect("before the end");
@@ -3049,8 +3094,8 @@ fn a_look_the_head_s_clock_cannot_carry_is_paced_by_the_body_and_counted() {
         1e9 / PERIOD as f64,
     );
     assert!(
-        floor > 0.4,
-        "the case needs a body swing the head's clock cannot carry: {floor} s"
+        floor > LOOK_HEAD_NS as f64 / 1e9,
+        "the case needs a body swing the head's clock of {LOOK_HEAD_NS} ns cannot carry: {floor} s"
     );
     mover.schedule_looks(2, &[(1000, 2618, 471)]);
     let period_s = PERIOD as f64 / 1e9;
@@ -3079,9 +3124,128 @@ fn a_look_the_head_s_clock_cannot_carry_is_paced_by_the_body_and_counted() {
     assert!(reports(&cycles).is_empty(), "{:?}", reports(&cycles));
     assert_steps_fit(&cycles, "a look paced by the body");
     let state = mover.cog.state_ctrl();
-    assert_eq!(state.look_paced(), 1, "the look's pace is counted once");
+    assert_eq!(state.base_paced(), 1, "the look's pace is counted once");
     assert_eq!(state.base_stretched(), 0, "and is not the anomaly");
     assert_eq!(state.base_dephased(), 1, "the antennas did not move");
+}
+
+/// A pose that turns the body back from a wide look runs on the pose's own
+/// clock: at the yaw's commissioned pace the look's body swing fits the look
+/// clock's floor, not the pose's clock, so the look is paced and the return
+/// counts nothing.
+#[test]
+fn a_return_from_a_wide_look_runs_on_the_pose_s_clock() {
+    let mut mover = standing_up();
+    mover.run(60);
+    assert_eq!(
+        mover.cog.state_ctrl().base_dephased(),
+        1,
+        "the stand-up parted the pair"
+    );
+    // 120 degrees at a 30 degree share puts the body at about 90 degrees.
+    mover.schedule_looks(2, &[(1000, 2094, 471)]);
+    let body = look_rows(2094, 471)[row(JointRef::BodyYaw).expect("a bus row")];
+    let floor = reachy_motion::tick::duration_floor_s(
+        body,
+        default_motion_config().max_step.body_yaw,
+        1e9 / PERIOD as f64,
+    );
+    assert!(
+        floor > LOOK_HEAD_NS as f64 / 1e9,
+        "the look needs a body swing the head's clock cannot carry: {floor} s"
+    );
+    assert!(
+        floor < UP_NS as f64 / 1e9,
+        "the pose's clock carries the return's body swing: {floor} s"
+    );
+    let period_s = PERIOD as f64 / 1e9;
+    let leg = ((UP_NS as f64 / 1e9 + 0.2) / period_s).ceil() as usize;
+
+    let mut cycles = mover.run(leg);
+    assert_eq!(mode_of(&mover), MotionMode::Holding, "the look arrived");
+    assert_eq!(mover.cog.state_ctrl().base_paced(), 1, "the look is paced");
+
+    mover.schedule(true, 3, &[(1000, Some(up_pose_id()))]);
+    let back = mover.run(leg);
+    assert_eq!(mode_of(&mover), MotionMode::Holding, "the return arrived");
+    let last = back.last().and_then(|cycle| cycle.goal).expect("a goal");
+    let yaw = last.targets[row(JointRef::BodyYaw).expect("a bus row")];
+    let neutral = committed_poses::targets("neutral").body_yaw;
+    assert!(
+        (yaw - neutral).abs() < 1e-6,
+        "the body turned back to {neutral}, not {yaw}"
+    );
+    cycles.extend(back);
+
+    assert!(reports(&cycles).is_empty(), "{:?}", reports(&cycles));
+    assert_steps_fit(&cycles, "a wide look and the return from it");
+    let state = mover.cog.state_ctrl();
+    assert_eq!(
+        state.base_paced(),
+        1,
+        "the look is paced and the return is not"
+    );
+    assert_eq!(state.base_stretched(), 0, "and neither is the anomaly");
+    assert_eq!(
+        state.base_dephased(),
+        1,
+        "the look holds neutral's pair, so nothing was parted after the stand-up"
+    );
+}
+
+/// A look from the fold is lengthened by the legs, and that is its pace, not
+/// an anomaly.
+#[test]
+fn a_look_from_the_fold_is_paced_by_the_legs_and_counted() {
+    let (_, stretch) = floor_move_clock(
+        default_motion_config(),
+        &committed_poses::targets("stow"),
+        &look_command(look_targets(942, 471)),
+        1e9 / PERIOD as f64,
+    );
+    let stretch = stretch.expect("a look from the fold is lengthened on the look clock");
+    assert!(
+        stretch.span_stretched && !stretch.body_paced,
+        "the legs set it: {stretch:?}"
+    );
+    let longest = stretch
+        .effective
+        .antennas
+        .iter()
+        .fold(stretch.effective.head, |longest, clock| longest.max(*clock))
+        .as_secs_f64();
+    let period_s = PERIOD as f64 / 1e9;
+
+    // Stowed, and this is the first schedule the Mover sees.
+    let mut mover = Mover::new();
+    // 54 degrees at 27 degrees up: the head carries 30 and the body about 24.
+    mover.schedule_looks(1, &[(1000, 942, 471)]);
+    let moving = (longest / period_s) as usize - 3;
+    let mut cycles = mover.run(moving);
+    assert_eq!(
+        mode_of(&mover),
+        MotionMode::Moving,
+        "the legs' pace, not the look clock, sets the arrival"
+    );
+    let arriving = ((longest + 0.2) / period_s).ceil() as usize - moving;
+    cycles.extend(mover.run(arriving));
+    assert_eq!(
+        mode_of(&mover),
+        MotionMode::Holding,
+        "arrived within {longest} s and 0.2 s"
+    );
+    let last = cycles.last().and_then(|cycle| cycle.goal).expect("a goal");
+    assert_rows_at(&last.targets, &look_rows(942, 471), 1e-6, "the look's end");
+    assert!(reports(&cycles).is_empty(), "{:?}", reports(&cycles));
+    assert_steps_fit(&cycles, "a look from the fold");
+    let state = mover.cog.state_ctrl();
+    assert_eq!(state.base_paced(), 1, "the look is paced by the legs");
+    assert_eq!(state.base_stretched(), 0, "and is not the anomaly");
+    assert_eq!(
+        state.base_dephased(),
+        0,
+        "the one plan counts once, in `base_paced`"
+    );
 }
 
 /// A look the envelope refuses is reported and the machine stays where it is.
@@ -4144,8 +4308,8 @@ const START_SKEW_ALLOWANCE_NS: i64 = 1_000_000_000;
 /// file.
 const LEGS_PROFILE_ACCELERATION: u32 = 287;
 const LEGS_PROFILE_VELOCITY: u32 = 326;
-const BODY_YAW_PROFILE_ACCELERATION: u32 = 20;
-const BODY_YAW_PROFILE_VELOCITY: u32 = 50;
+const BODY_YAW_PROFILE_ACCELERATION: u32 = 317;
+const BODY_YAW_PROFILE_VELOCITY: u32 = 445;
 const ANTENNAS_PROFILE_ACCELERATION: u32 = 522;
 const ANTENNAS_PROFILE_VELOCITY: u32 = 640;
 

@@ -273,28 +273,3 @@ rust_test(
         "//crates/reachy-edge:reachy_edge",
     ],
 )
-
-# The committed gaze ladder against the committed library: every rung's
-# document faces the world yaw the policy bins by, level and at nominal height,
-# and the shipped name table holds every rung, so a ladder the host would choose
-# from and a library the unit binds cannot drift apart at commit. Reads files
-# through runfiles, like the playlist's case.
-rust_test(
-    name = "gaze_ladder_test",
-    size = "small",
-    srcs = ["tests/gaze_ladder.rs"],
-    data = [
-        "//cogs:library.names.json",
-        "//cogs:pose_documents",
-    ],
-    edition = "2024",
-    env = {
-        "POSE_DOCUMENTS": "cogs/poses",
-        "CLIP_NAMES": "cogs/library.names.json",
-    },
-    deps = [
-        ":reachy_host_lib",
-        "//crates/reachy-poses:reachy_poses",
-        "@brenn_reachy_crates//:nalgebra",
-    ],
-)

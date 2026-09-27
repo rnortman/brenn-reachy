@@ -24,7 +24,7 @@
 # registers' own units (0.229 rev/min for velocity, 214.577 rev/min² for
 # acceleration).
 #
-# Three pairs across the three classes, and each one a measurement.
+# Three pairs across the three classes, each read off the machine.
 #
 # The legs run their own capability: a tour of the whole clip library at
 # `(32767, 445)` -- the generator wide open, so the motor and not the generator
@@ -44,16 +44,16 @@
 # 0.1913-0.2152 rad ahead against a 0.4 rad bound, and the same tour reads the
 # class motor-bound with a plateau of 675 against the 640 commissioned.
 #
-# The body yaw runs the measured velocity cap of the recorded library tour:
-# every joint class chasing a goal more than 0.1 rad away travels a median of
-# 0.0230-0.0245 rad per 20 ms period, against the 0.023981 rad the velocity 50
-# converts to, and a joint setting off from rest ramps at the acceleration. At
-# that pair the class runs velocity-saturated -- the content asks for 3-20 rad/s
-# against a 1.2 rad/s ceiling -- so the pair is what shapes its motion rather
-# than a backstop under it. It is there because its own capability reading is
-# that pair to within the capability instrument's ratio: what holds the class
-# back is its loop, not its motor. The mark is on the schema's own field in
-# `cogs/config.clk`.
+# The body yaw runs at its motor's own limit: velocity 445 is the head servos'
+# Velocity Limit register, and on the derivative gain ladder's two quiet rungs
+# (800 / 0 / 400 and 400 / 0 / 400, generator wide open) the shaft cruised at
+# that register on every long move -- 441-451 units a period on the step and
+# hold probes. Acceleration 317 is the smaller of the two step probes' ramp
+# medians at 800 / 0 / 400 (317 and 328). A library tour at 317 / 445, armed,
+# read the yaw's worst residual at 0.2184 rad against a 0.4 rad bound, with no
+# raise. The capability instrument's regime lines on the step probes are not
+# what the pair was read from: its band table bins each goal step's ramp,
+# TODO(capability-ramp-bands).
 #
 # The bench's trial-validated figures (400/600, including an 855°/s antenna
 # sweep and the 0.8 s presence gesture) were sized for a host commanding whole
@@ -79,13 +79,13 @@
 # residual by over half. The antennas' 24 000 us is read at gains 200 / 0 / 0
 # off the same day's tours at 522 / 640 and 418 / 512, which minimise at 1.2
 # and 1.3 -- inside the quarter period the agreement rule allows -- for 2.28x
-# and 1.83x. The body yaw is zero because it has no reading: it runs gain-bound
-# on every recording, so no tour holds its motor's own speed to read a loop
-# against, and its scan finds no floor. Zero is the generator alone.
+# and 1.83x. The body yaw is zero because it has no reading: two step probes at
+# 317 / 445 and 317 / 333 read motor-bound but not as a following-lag
+# instrument, so the scans did not agree. Zero is the generator alone.
 legs_profile_acceleration: 287
 legs_profile_velocity: 326
-body_yaw_profile_acceleration: 20
-body_yaw_profile_velocity: 50
+body_yaw_profile_acceleration: 317
+body_yaw_profile_velocity: 445
 antennas_profile_acceleration: 522
 antennas_profile_velocity: 640
 legs_following_lag_us: 24000

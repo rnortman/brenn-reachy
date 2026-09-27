@@ -56,8 +56,8 @@ pub mod words;
 pub use check::{Conclusion, conclusion_line, inspect, name_tables, settled};
 pub use edge::{Console, Speaker, Unspoken};
 pub use gaze::{
-    Decision, Decline, Elevation, ElevationError, Gaze, LADDER, Look, MAX_POSE_AGE, decide,
-    gaze_line, rung,
+    Decision, Decline, ELEVATION_RANGE_DEG, Elevation, ElevationError, Gaze, Look, MAX_POSE_AGE,
+    decide, gaze_line,
 };
 pub use idle::{Idle, IdleError, Playlist, Poll, Verdict};
 pub use intents::{INTENT_BACKLOG, Intents, NotOffered, Waiting, queue};

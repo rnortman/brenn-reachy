@@ -10,6 +10,10 @@ mover moves to over a stated time. The documents live under `cogs/poses/`, one
 `<name>.textproto` each; `cogs/pose_library.textproto` and
 `cogs/library.names.json` are emitted from them and are never hand-edited.
 
+A look — a script step naming a direction, a bearing and an elevation, instead
+of a pose — is not a pose and is not authored: the machine composes its target
+from the direction.
+
 A clip sequence must keep one provenance kind per channel after flattening. A
 channel is either driven by posed clips, whose samples target their declared
 base, or by unposed overlays; masked clips do not vote for channels they do not

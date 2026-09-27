@@ -64,4 +64,9 @@ implementation is `reachy_kin::yaw`, `reachy_kin::envelope` and
 
 - φ is an assumption, not a reading: a standing visitor's mouth above a
   table-top head at a metre or less.
-- 27° is the working figure. The caller supplies it.
+- 20° is the working figure, the one the launcher passes. The caller supplies it.
+- φ is also the pitch a look commands: the head pitches nose-up by φ, the
+  elevation the bearing was solved under.
+- The launcher carries it inside [0°, 30°], level up to 5° under the head's
+  35° cone limit, the range every look is checked against the envelope in.
+  The voice host refuses to start on a `--gaze-elevation-deg` outside it.

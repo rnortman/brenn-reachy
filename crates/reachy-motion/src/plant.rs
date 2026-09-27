@@ -145,21 +145,20 @@ pub type GroupProfiles = PerGroup<ClassProfile>;
 /// Three pairs across the three classes. The legs and the antennas run their
 /// own measured capability, each confirmed at it — the legs on a tour of the
 /// whole clip library, the antennas on a tour read offline under the model plus
-/// six armed runs at the pair; the body yaw runs the measured velocity cap of
-/// the recorded library tour, which is the pair every class started at. The
-/// per-class capability the machine has been measured at is
-/// `cogs/pose_reading.rs`'s `RECORDED_CAPABILITY_*`, and the body yaw's reading
-/// is that pair to within the instrument's own ratio, which is why the class
-/// that is not at its capability is still at the pair it ships.
+/// six armed runs at the pair. The body yaw runs at the head servos' Velocity
+/// Limit register, 445, which the shaft cruised at on every long move of the
+/// step and hold probes at its `800 / 0 / 400` gains, with the ramp median of
+/// those probes' goal steps, 317; one armed library tour at the pair read its
+/// worst residual at 0.2184 rad.
 ///
 /// Two of the three classes carry a following lag, each read by the scan the
 /// header describes over the 2026-09-09 tours and accepted on the agreement of
 /// two recordings at different pairs. The legs read 1.2 periods of the 20 ms
 /// grid at gains `800 / 100 / 300` and the antennas 1.2 and 1.3 at
 /// `200 / 0 / 0`, both minima over twice as deep as the acceptance rule asks
-/// for; the body yaw has no motor-bound recording to read one on, its scan runs
-/// out of grid rather than finding a floor, and it carries the trapezoid alone.
-/// A lag belongs to the loop it was read on, so a gains change re-reads it.
+/// for; the body yaw's two step probes at `317 / 445` and `317 / 333` read no
+/// lag the rule accepts, and it carries the trapezoid alone. A lag belongs to
+/// the loop it was read on, so a gains change re-reads it.
 pub const SHIPPED_PROFILES: GroupProfiles = GroupProfiles {
     legs: ClassProfile {
         acceleration: 287,
@@ -167,8 +166,8 @@ pub const SHIPPED_PROFILES: GroupProfiles = GroupProfiles {
         following_lag_us: 24_000,
     },
     yaw: ClassProfile {
-        acceleration: 20,
-        velocity: 50,
+        acceleration: 317,
+        velocity: 445,
         following_lag_us: 0,
     },
     antennas: ClassProfile {
@@ -558,21 +557,21 @@ mod tests {
         }
     }
 
-    /// The shipped pair the cases pin figures at, with a following lag of
+    /// The `20 / 50` pair the cases pin figures at, with a following lag of
     /// `lag_us` microseconds on top of it.
-    fn shipped_with_lag(lag_us: u32) -> PlantModel {
+    fn slow_with_lag(lag_us: u32) -> PlantModel {
         PlantModel::from_registers(50, 20, lag_us, SHIPPED_PERIOD_NS)
-            .expect("the shipped pair is a model at any lag")
+            .expect("the 20 / 50 pair is a model at any lag")
     }
 
-    /// The model the body yaw and the antennas run on the shipped machine, and
-    /// the pair every figure the cases below pin was read at. The cases are
-    /// about the arithmetic of one generator, so they take one; the legs run
-    /// their own faster pair, and the class-by-class plumbing is what
-    /// `the_shipped_triple_is_the_legs_capability_and_the_tour_cap_on_the_rest`
+    /// The `20 / 50` model, the pair every class ran before any was
+    /// commissioned, and the pair every figure the cases below pin was read at.
+    /// The cases are about the arithmetic of one generator, so they take one;
+    /// the class-by-class plumbing of the shipped pairs is what
+    /// `the_shipped_triple_is_the_measured_capabilities_and_the_register_on_the_yaw`
     /// is for.
-    fn shipped() -> PlantModel {
-        GroupPlants::default().yaw
+    fn slow() -> PlantModel {
+        slow_with_lag(0)
     }
 
     /// The state schema's setpoint ring is exactly as deep as the dead time it
@@ -590,11 +589,11 @@ mod tests {
         assert_eq!(snap.clear_valid().held.len(), RESPONSE_DEAD_SAMPLES);
     }
 
-    /// The shipped model's two figures, to the precision the register units are
-    /// stated to.
+    /// The `20 / 50` model's two figures, to the precision the register units
+    /// are stated to.
     #[test]
-    fn the_shipped_model_is_the_configured_pair_per_period() {
-        let plant = shipped();
+    fn a_model_is_its_pair_per_period() {
+        let plant = slow();
         assert!(
             (plant.v_max - 0.023981).abs() < 5e-6,
             "v_max is {}",
@@ -610,16 +609,16 @@ mod tests {
     /// A step from rest reaches the cap in `⌈v_max / a_max⌉` periods and goes
     /// no faster, however far the target is.
     ///
-    /// Nine periods and not eight at the yaw's and antennas' `20 / 50`, which
-    /// is the pair this case's model carries. The two registers are
+    /// Nine periods and not eight at `20 / 50`, which is the pair this case's
+    /// model carries. The two registers are
     /// scaled in units that are not commensurate — 0.229 rev/min against
     /// 214.577 rev/min² — so the ratio is 8.004 periods rather than a round
     /// eight, and the eighth period ends a thousandth of the cap short of it.
     #[test]
     fn a_move_from_rest_reaches_the_cap_in_the_ramp_and_never_exceeds_it() {
-        let plant = shipped();
+        let plant = slow();
         let ramp = (plant.v_max / plant.a_max).ceil() as usize;
-        assert_eq!(ramp, 9, "the ramp at the yaw's and antennas' 20 / 50");
+        assert_eq!(ramp, 9, "the ramp at 20 / 50");
         let mut state = Predicted::default();
         for period in 1..=ramp {
             plant.step(&mut state, 10.0);
@@ -649,7 +648,7 @@ mod tests {
     /// a period or three early and never late.
     #[test]
     fn a_long_move_takes_the_time_the_profile_implies() {
-        let plant = shipped();
+        let plant = slow();
         for distance in [1.0, 2.875, 2.0 * TAU] {
             let stepped = plant.travel_cycles(distance) - RESPONSE_DEAD_SAMPLES;
             let closed = (distance / plant.v_max + plant.v_max / plant.a_max).ceil() as usize;
@@ -664,7 +663,7 @@ mod tests {
     /// past it.
     #[test]
     fn a_short_move_is_a_triangle_that_does_not_overshoot() {
-        let plant = shipped();
+        let plant = slow();
         let target = 0.05;
         assert!(
             target < plant.v_max * plant.v_max / plant.a_max,
@@ -694,7 +693,7 @@ mod tests {
     /// acceleration and never jumps.
     #[test]
     fn a_target_reversal_decelerates_rather_than_stepping() {
-        let plant = shipped();
+        let plant = slow();
         let mut state = Predicted::default();
         for _ in 0..40 {
             plant.step(&mut state, 10.0);
@@ -732,7 +731,7 @@ mod tests {
     /// here, which is a fifth of the travel this asserts.
     #[test]
     fn a_target_update_mid_move_keeps_the_velocity_it_had() {
-        let plant = shipped();
+        let plant = slow();
         let mut running = Predicted::default();
         for _ in 0..4 {
             plant.step(&mut running, 10.0);
@@ -818,16 +817,16 @@ mod tests {
     }
 
     /// The shipped triple is three pairs and two loops: the legs' and the
-    /// antennas' commissioned capabilities and the pair the body yaw still
-    /// runs, with the measured following lag on the two classes a scan has read
-    /// one for and zero on the body yaw, which has no motor-bound recording to
-    /// read. Per class, because the whole point of the plumbing is that a class
+    /// antennas' commissioned capabilities and the body yaw at the head
+    /// servos' Velocity Limit register, with the measured following lag on the
+    /// two classes a scan has read one for and zero on the body yaw, whose
+    /// scans did not agree. Per class, because the whole point of the plumbing is that a class
     /// judged against another class's generator is judged against a trajectory
     /// nothing runs, and all three fields, because a lag that went missing
     /// between the file and the model would be a class judged against a loop it
     /// does not have.
     #[test]
-    fn the_shipped_triple_is_the_measured_capabilities_and_the_tour_cap_on_the_yaw() {
+    fn the_shipped_triple_is_the_measured_capabilities_and_the_register_on_the_yaw() {
         assert_eq!(
             SHIPPED_PROFILES.legs,
             ClassProfile {
@@ -836,7 +835,7 @@ mod tests {
                 following_lag_us: 24_000,
             }
         );
-        assert_eq!(SHIPPED_PROFILES.yaw, pair(20, 50));
+        assert_eq!(SHIPPED_PROFILES.yaw, pair(317, 445));
         assert_eq!(
             SHIPPED_PROFILES.antennas,
             ClassProfile {
@@ -848,16 +847,16 @@ mod tests {
         let plants = GroupPlants::default();
         let legs = PlantModel::from_registers(326, 287, 24_000, SHIPPED_PERIOD_NS)
             .expect("the legs' pair is a model");
-        let yaw = PlantModel::from_registers(50, 20, 0, SHIPPED_PERIOD_NS)
-            .expect("the tour's cap is a model");
+        let yaw = PlantModel::from_registers(445, 317, 0, SHIPPED_PERIOD_NS)
+            .expect("the register on the yaw is a model");
         let antennas = PlantModel::from_registers(640, 522, 24_000, SHIPPED_PERIOD_NS)
             .expect("the antennas' capability under their own loop is a model");
         assert_eq!(plants.legs, legs);
         assert_eq!(plants.yaw, yaw);
         assert_eq!(plants.antennas, antennas);
         assert!(
-            legs.v_max > yaw.v_max && legs.a_max > yaw.a_max,
-            "the legs' generator is faster than the yaw's"
+            yaw.v_max > legs.v_max && yaw.a_max > legs.a_max,
+            "the yaw's generator, at the register, is faster than the loaded legs'"
         );
         assert!(
             antennas.v_max > legs.v_max && antennas.a_max > legs.a_max,
@@ -937,7 +936,7 @@ mod tests {
     /// the same loop the function runs would assert that the loop is itself.
     #[test]
     fn travel_cycles_is_the_period_the_model_stands_on_the_target() {
-        let plant = shipped();
+        let plant = slow();
         for (distance, periods) in [(0.01, 5), (0.1, 12), (1.0, 49), (12.56, 531)] {
             assert_eq!(plant.travel_cycles(distance), periods, "{distance} rad");
         }
@@ -958,8 +957,8 @@ mod tests {
     /// as of the pair.
     #[test]
     fn a_lagged_arrival_is_the_generators_plus_the_decay() {
-        let plain = shipped();
-        let lagged = shipped_with_lag(30_000);
+        let plain = slow();
+        let lagged = slow_with_lag(30_000);
         assert_eq!(plain.travel_cycles(2.875), 128);
         assert_eq!(lagged.travel_cycles(2.875), 134);
     }
@@ -975,7 +974,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "is not a distance this servo crosses")]
     fn a_travel_the_model_never_finishes_is_a_model_and_not_a_move() {
-        let _ = shipped_with_lag(3_600_000_000).travel_cycles(2.875);
+        let _ = slow_with_lag(3_600_000_000).travel_cycles(2.875);
     }
 
     /// The same guard on the other walk, whose caller is the tracking window's
@@ -983,7 +982,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "is not one this servo passes")]
     fn a_distance_the_model_never_passes_is_a_model_and_not_a_move() {
-        let _ = shipped_with_lag(3_600_000_000).pass_cycles(2.875);
+        let _ = slow_with_lag(3_600_000_000).pass_cycles(2.875);
     }
 
     /// `pass_cycles` is the ramp alone, and it is not `travel_cycles`.
@@ -993,7 +992,7 @@ mod tests {
     /// of them plus the dead time a commanded arrival takes to be read.
     #[test]
     fn pass_cycles_is_the_ramp_and_not_the_travel() {
-        let plant = shipped();
+        let plant = slow();
         for (distance, periods) in [(0.01, 3), (0.1, 8), (1.0, 46), (2.875, 124), (12.56, 528)] {
             assert_eq!(plant.pass_cycles(distance), periods, "{distance} rad");
             assert_eq!(
@@ -1010,7 +1009,7 @@ mod tests {
         assert_eq!(plant.travel_cycles(0.01), 5);
         // A loop behind its generator passes the distance later than the
         // generator did.
-        assert_eq!(shipped_with_lag(30_000).pass_cycles(0.01), 4);
+        assert_eq!(slow_with_lag(30_000).pass_cycles(0.01), 4);
     }
 
     /// A zero lag is the trapezoid alone: the output is the generator on every
@@ -1018,7 +1017,7 @@ mod tests {
     /// this deployment has always run.
     #[test]
     fn a_zero_lag_puts_the_output_on_the_generator_every_period() {
-        let plant = shipped();
+        let plant = slow();
         assert_eq!(plant.lag_alpha, 1.0);
         let mut state = Predicted::default();
         for target in [1.0, 1.0, -0.5, -0.5, 0.02] {
@@ -1038,7 +1037,7 @@ mod tests {
     #[test]
     fn a_cruise_settles_a_lag_of_travel_behind_the_generator() {
         for (lag_us, lag_periods) in [(30_000, 1.5), (20_000, 1.0), (9_000, 0.45)] {
-            let plant = shipped_with_lag(lag_us);
+            let plant = slow_with_lag(lag_us);
             let mut state = Predicted::default();
             for _ in 0..400 {
                 plant.step(&mut state, 100.0);
@@ -1060,7 +1059,7 @@ mod tests {
     /// of travel it means are the microseconds divided by the period.
     #[test]
     fn a_lag_in_microseconds_is_periods_of_travel_at_the_grid() {
-        let on_20ms = shipped_with_lag(30_000);
+        let on_20ms = slow_with_lag(30_000);
         assert!(
             (on_20ms.lag_alpha - 1.0 / 2.5).abs() < 1e-15,
             "30 000 us on the 20 ms grid is 1.5 periods: {}",
@@ -1079,7 +1078,7 @@ mod tests {
     /// toward it for ever, and it does so inside half an encoder count.
     #[test]
     fn a_stopped_generator_is_arrived_at_and_not_approached_for_ever() {
-        let plant = shipped_with_lag(30_000);
+        let plant = slow_with_lag(30_000);
         let target = 0.4;
         let mut state = Predicted::default();
         let mut snapped = None;

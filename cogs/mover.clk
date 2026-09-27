@@ -167,16 +167,18 @@ schema MoverState
         #19 refused_base: UInt64;
 
         // How many base plans the motion library had to adjust for a reason
-        // that is not routine, all run: a clock lengthened to carry its own
-        // span inside the per-tick step bounds, or an antenna pair the pass
-        // could not part to the separation that keeps their tips clear. A
-        // duration is configuration, sized for the spans an ordinary command
-        // covers; where the machine physically stands is not, so a plan over a
-        // span the configured clock cannot carry is lengthened rather than
-        // refused. Zero on a healthy machine is the invariant this field exists
-        // to make legible; the de-phasing every base move asks for is
-        // routine and is counted next door, in `base_dephased`, and a look's
-        // span stretch is its pace and is counted in `look_paced`.
+        // that is not routine, all run: a pose move's clock lengthened because
+        // the legs or an antenna could not carry their own span inside the
+        // per-tick step bounds, or an antenna pair the pass could not part to
+        // the separation that keeps their tips clear. A duration is
+        // configuration, sized for the spans an ordinary command covers; where
+        // the machine physically stands is not, so a plan over a span the
+        // configured clock cannot carry is lengthened rather than refused. Zero
+        // on a healthy machine is the invariant this field exists to make
+        // legible. The de-phasing every base move asks for is routine and is
+        // counted next door, in `base_dephased`; a stretch on a look, whichever
+        // joint set it, and one on a pose move that the body yaw's swing alone
+        // set, run at a joint's pace by policy and are counted in `base_paced`.
         #20 base_stretched: UInt64;
 
         // How many base plans were adjusted only to de-phase the antenna pair,
@@ -209,15 +211,13 @@ schema MoverState
         // Its elevation, milliradians; zero otherwise.
         #25 desired_elevation_mrad: Int32;
 
-        // How many look plans were lengthened for their span, all run. A look's
-        // configured clock is sized for the head, and the body's pace is the
-        // step floor, so a look whose body swing the head's clock cannot carry
-        // is lengthened by design and counts here rather than in
-        // `base_stretched`, which stays zero on a healthy machine. Nearly
-        // always the stretch is for the body's span; a look from far off the
-        // leg travel (from `stow`, say) may also be lengthened for the legs,
-        // and counts here the same way.
-        #26 look_paced: UInt64;
+        // How many base plans ran at a joint's pace rather than on their
+        // configured clock, by policy, all run: a look lengthened for its
+        // legs, its antennas or its body -- a look's head clock is a lower
+        // bound -- or a pose move lengthened for the body yaw's swing alone,
+        // the body's pace being the step bound. Expected nonzero on any
+        // machine that looks, and not the anomaly `base_stretched` counts.
+        #26 base_paced: UInt64;
     }
     history
     {

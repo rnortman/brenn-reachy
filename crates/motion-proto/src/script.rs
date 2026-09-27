@@ -80,6 +80,7 @@ pub const MOTION_SCRIPT_TYPE: &str = "motion-script";
 /// takes a single synthesized clip over ten minutes long.
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
+// TODO(reuse-wire-mrad-conversions-hand-rolled): the look's radian <-> milliradian encode and decode belong here, beside the wire's range.
 /// The largest bearing a look may carry, milliradians either side of the
 /// base's forward: the representable half turn, 3141 < 1000·π.
 ///

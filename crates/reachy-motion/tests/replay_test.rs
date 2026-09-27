@@ -534,8 +534,8 @@ fn tour_plant(name: &str) -> GroupPlants {
     tour_plant_of(&profiles)
 }
 
-/// The two antenna confirmation fixtures were cut at the profile the tree
-/// ships, and the pins read off them are what the shipped screen is sized on.
+/// The two antenna confirmation fixtures were cut at the legs' and the
+/// antennas' shipping pairs, and the pins read off them are what the shipped screen is sized on.
 ///
 /// The coupling the fixture rows used to carry by aliasing the shipped constant,
 /// stated where it can fail in its own words. The rows themselves cannot follow
@@ -544,8 +544,14 @@ fn tour_plant(name: &str) -> GroupPlants {
 /// not an edit to these two rows.
 #[test]
 fn the_antenna_confirmation_is_still_the_shipping_profile() {
+    // The legs and the antennas, whose figures these two fixtures pin. No pin
+    // here is the body yaw's.
     assert_eq!(
-        CONFIRM_ANTENNA_PROFILE, SHIPPED_PROFILES,
+        (
+            CONFIRM_ANTENNA_PROFILE.legs,
+            CONFIRM_ANTENNA_PROFILE.antennas
+        ),
+        (SHIPPED_PROFILES.legs, SHIPPED_PROFILES.antennas),
         "the antennas' confirmation runs are no longer at the shipping profile: the pins read \
          off `trace-probe-antenna-sweep` and `trace-probe-antenna-step-a` are readings at a \
          profile the tree has stopped shipping. Run the confirmation at the new pair, cut its \

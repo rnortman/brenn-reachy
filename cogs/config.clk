@@ -64,9 +64,12 @@ schema MoverParams
         // carries every bearing.
         #5 look_head_share_rad: Float64;
 
-        // The head group's clock for a look, milliseconds. Positive. The body's
-        // pace is the tick's step floor, which lengthens this clock for a body
-        // swing it cannot carry.
+        // The head group's clock for a look, milliseconds. Positive. A lower
+        // bound rather than a clock sized to cover a span: the tick's step
+        // floor lengthens it for whichever joint -- a leg, an antenna or the
+        // body yaw -- cannot carry its span on it from where the machine
+        // stands, and every such plan counts in the Mover's `base_paced`
+        // total. The figure is the latency a look asks for from a raised head.
         #6 look_head_ms: UInt32;
     }
     history
@@ -198,7 +201,8 @@ schema ServoProfile
         // The six platform servos' profile acceleration, in the register's own
         // units of 214.577 rev/min². This class and the antennas below are
         // commissioned at their own measured capability, each confirmed at the
-        // pair; the body yaw is not, for a reason of its own:
+        // pair; the body yaw runs at its Velocity Limit register, licensed on
+        // one tour, and its recorded figures are not yet re-read at it:
         // TODO(session-servo-profile)
         #2 legs_profile_acceleration: UInt32;
 

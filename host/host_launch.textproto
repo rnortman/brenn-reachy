@@ -34,7 +34,7 @@
 # repo path, so it is always there. This entry is merged into the production
 # config only, so the harness and recording configs run no loop.
 #
-# `--gaze-elevation-deg 27` turns the head toward whoever said the wake word. 27
+# `--gaze-elevation-deg 20` turns the head toward whoever said the wake word. 20
 # is the talker's assumed elevation above the head's horizontal, in degrees: a
 # standing visitor's mouth above a table-top head at a metre or less. The array
 # reports no elevation, so the figure is a site's assumption, not a reading.
@@ -59,5 +59,5 @@ app {
   args: "--idle"
   args: "cogs/idle.json"
   args: "--gaze-elevation-deg"
-  args: "27"
+  args: "20"
 }

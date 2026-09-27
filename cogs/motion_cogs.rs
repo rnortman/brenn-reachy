@@ -822,6 +822,7 @@ impl Settings {
             params.look_head_ms != 0,
             "a look's head clock must be a length of time, not 0 ms"
         );
+        // TODO(correctness-look-share-0-16-leaves-bearings-past-169-deg-unreachable): a share under about 0.349 rad (20°) leaves wire bearings past pi less the share minus the 160° body cap refused by the envelope; decide between a share floor here and a decline the gaze can fall back from.
         let share = params.look_head_share_rad;
         assert!(
             (0.0..=reachy_kin::LOOK_HEAD_SHARE_LIMIT).contains(&share),
@@ -1015,6 +1016,7 @@ impl Desired {
                 kind: GoalKind::Base,
             }))
         } else if self.kind == StepKindWire::BASE_LOOK {
+            // TODO(reuse-look-composition-hand-rolled-four-more-times): one LookTargets -> JointTargets conversion, shared with scenario::look_pose_at.
             let t = reachy_kin::look::target(
                 f64::from(self.bearing_mrad) / 1000.0,
                 f64::from(self.elevation_mrad) / 1000.0,
@@ -1506,11 +1508,14 @@ counters! {
         /// Base plans this cog could not make or could not read back.
         refused_base / set_refused_base,
         /// Base plans the library adjusted for a reason that is not routine: a
-        /// clock that could not carry its own span, or a pair it could not part.
+        /// pose move's clock the legs or an antenna could not carry, or a pair
+        /// it could not part.
         base_stretched / set_base_stretched,
         /// Base plans adjusted only to part the antenna pair at their crossing.
         base_dephased / set_base_dephased,
-        /// Look plans lengthened for their span: a look's pace, not an anomaly.
-        look_paced / set_look_paced,
+        /// Base plans that ran at a joint's pace by policy: a look lengthened
+        /// for any joint, or a pose move lengthened for the body yaw's swing
+        /// alone.
+        base_paced / set_base_paced,
     }
 }

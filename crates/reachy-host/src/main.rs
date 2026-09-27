@@ -137,16 +137,16 @@ fn usage() -> String {
          exit.\n\
          \n\
          With --gaze-elevation-deg, a wake the voice pipeline hears turns the head toward\n\
-         whoever said it: the array's reading, the head's pose off the pose feed, and the\n\
-         talker's assumed elevation in degrees choose one of five library poses, and every\n\
-         wake says a `gaze` line with what it chose or why it did not. Without it, or when\n\
-         no reading or pose is usable, the wake takes the configured wake pose.\n\
+         whoever said it: the array's reading and the head's pose off the pose feed give the\n\
+         talker's bearing, the head looks there pitched up by the talker's assumed elevation\n\
+         in degrees (0 to 30, or the host refuses to start), and every wake says a `gaze`\n\
+         line with what it chose or why it did not. Without it, or when no reading or pose\n\
+         is usable, the wake takes the configured wake pose.\n\
          \n\
          With --check the process instead loads both configurations and the playlist, where\n\
          one is named, looks for every file they name relative to the working directory,\n\
          prints one line of JSON per conclusion and exits: zero when everything loaded and\n\
-         every file is there, and, with --gaze-elevation-deg, whether the library holds the\n\
-         five poses the gaze chooses among. It binds nothing and prints no file's contents.\n\
+         every file is there. It binds nothing and prints no file's contents.\n\
          \n\
          Nothing is retried and nothing is persisted. A configuration that does not parse,\n\
          a clip name table that is not there and a reports port already held are each a\n\
@@ -233,7 +233,7 @@ fn path_once(flag: &str, value: Option<String>, given: &mut bool) -> Result<Stri
 }
 
 /// A flag's elevation in degrees, refused if the flag carried none, was given
-/// before, is not a number, or is not strictly between -90 and 90.
+/// before, is not a number, or is outside 0 to 30 degrees.
 ///
 /// The value is taken before the repeat is refused, as [`path_once`] does.
 fn elevation_once(
@@ -284,7 +284,6 @@ fn write_check(out: &mut impl io::Write, options: &Options, base: &Path) -> bool
         &options.config,
         options.speech_config.as_deref(),
         options.idle.as_deref(),
-        options.gaze.is_some(),
         base,
     );
     let at = now();
@@ -1593,13 +1592,16 @@ mod tests {
 
     #[test]
     fn a_gaze_elevation_can_be_named() {
-        assert_eq!(
-            parsed(&["--gaze-elevation-deg", "27"]),
-            Ok(Options {
-                gaze: Some(Elevation::from_degrees(27.0).expect("a lawful elevation")),
-                ..Options::default()
-            }),
-        );
+        for (word, degrees) in [("27", 27.0), ("0", 0.0), ("30", 30.0)] {
+            assert_eq!(
+                parsed(&["--gaze-elevation-deg", word]),
+                Ok(Options {
+                    gaze: Some(Elevation::from_degrees(degrees).expect("a lawful elevation")),
+                    ..Options::default()
+                }),
+                "{word}",
+            );
+        }
     }
 
     #[test]
@@ -1609,8 +1611,10 @@ mod tests {
         assert!(bare.contains("needs a number"), "{bare}");
         let word = refused(&["--gaze-elevation-deg", "up"]);
         assert!(word.contains("`up`"), "{word}");
-        let vertical = refused(&["--gaze-elevation-deg", "90"]);
-        assert!(vertical.contains("-90 and 90"), "{vertical}");
+        for outside in ["-1", "40", "90"] {
+            let message = refused(&["--gaze-elevation-deg", outside]);
+            assert!(message.contains("between 0 and 30"), "{message}");
+        }
         refused(&["--gaze-elevation-deg", "NaN"]);
         let twice = refused(&["--gaze-elevation-deg", "27", "--gaze-elevation-deg", "27"]);
         assert!(twice.contains("given twice"), "{twice}");
@@ -1779,45 +1783,34 @@ mod tests {
     }
 
     #[test]
-    fn the_preflight_looks_for_the_ladder_when_a_gaze_elevation_is_given() {
-        // The fixture's name table carries `neutral` and `stow` only, so every
-        // `look_*` rung is missing.
+    fn a_gaze_elevation_adds_no_conclusion_to_the_preflight() {
+        // The argument parser screens the elevation at start, so the preflight
+        // has nothing to say about it: the same host checks the same with the
+        // flag or without it.
         let dir = scratch_dir("reachy-host-checked-gaze");
         let config = checkable(dir.as_ref());
-        let options = Options {
-            config,
+        let options = |gaze| Options {
+            config: config.clone(),
             speech_config: None,
             idle: None,
-            gaze: Some(Elevation::from_degrees(27.0).expect("a lawful elevation")),
+            gaze,
             check: true,
         };
 
-        let (settled, lines) = checked_lines(&options, dir.as_ref());
-        assert!(!settled, "{lines:?}");
-        let objects: Vec<serde_json::Value> = lines
-            .iter()
-            .map(|line| {
-                serde_json::from_str::<serde_json::Value>(line)
-                    .unwrap_or_else(|_| panic!("one line of JSON: {line}"))
-            })
-            .collect();
-        let gaze: Vec<&serde_json::Value> = objects
-            .iter()
-            .filter(|object| object["subject"] == "gaze poses")
-            .collect();
-        assert_eq!(gaze.len(), 1, "{lines:?}");
-        assert_eq!(gaze[0]["kind"], "gaze", "{lines:?}");
-        assert_eq!(gaze[0]["held"], false, "{lines:?}");
-        assert!(
-            gaze[0]["says"]
-                .as_str()
-                .expect("a sentence")
-                .contains("`look_l30`"),
-            "{lines:?}",
+        let (settled_with, with) = checked_lines(
+            &options(Some(
+                Elevation::from_degrees(27.0).expect("a lawful elevation"),
+            )),
+            dir.as_ref(),
         );
-        let verdict = objects.last().expect("a verdict");
-        assert_eq!(verdict["kind"], "checked", "{lines:?}");
-        assert_eq!(verdict["held"], false, "{lines:?}");
+        let (settled_without, without) = checked_lines(&options(None), dir.as_ref());
+        assert_eq!(settled_with, settled_without, "{with:?} / {without:?}");
+        assert_eq!(with.len(), without.len(), "{with:?} / {without:?}");
+        for line in &with {
+            let object = serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|_| panic!("one line of JSON: {line}"));
+            assert_ne!(object["kind"], "gaze", "{with:?}");
+        }
     }
 
     #[test]

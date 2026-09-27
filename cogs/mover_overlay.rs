@@ -57,17 +57,20 @@ pub struct Goal {
     /// How long each mechanical group takes to get there, as configured. Only
     /// ever lengthened from here, never shortened.
     pub durations: MoveDurations,
-    /// What the plan is for, which decides the total an adjusted clock counts
-    /// in.
+    /// What asked for it, which is what says whether a clock the floor
+    /// lengthened is the plan's pace or an anomaly.
     pub kind: GoalKind,
 }
 
-/// What a base plan is for, which decides the total an adjusted clock counts in.
+/// What a base plan is for, as far as counting what the floor did to its
+/// clocks goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GoalKind {
-    /// A pose, a hold where the base stands, or a carry-on along the move it is on.
+    /// A pose, a hold where the base stands, or a carry-on: a plan on a clock
+    /// configured to cover its span.
     Base,
-    /// A look: the head's clock is configured and the body's is the step floor.
+    /// A look, whose head clock is a lower bound the floor lengthens for
+    /// whichever joint cannot carry its span on it.
     Look,
 }
 
@@ -447,11 +450,14 @@ pub(crate) fn release(state: &mut MoverStateWire, now_ns: i64) {
 /// where the machine physically stands is not, and a fixed clock over a span it
 /// was never sized for steps past the per-tick guard partway through and
 /// abandons the move. The pair's phase is the second thing a clock has to carry,
-/// and the same pass asks for it. Both are reported rather than silent, in the
-/// totals `count_adjustment` tells apart: a span being lengthened is
-/// configuration that no longer describes the move, unless the move is a look,
-/// whose body is paced by the floor on purpose; and a pair being parted is the
-/// geometry doing what it is there for.
+/// and the same pass asks for it. Both are reported rather than silent.
+/// `count_adjustment` sorts them into totals:
+///
+/// - A span a pose move's legs or an antenna could not carry is configuration
+///   that no longer describes the move.
+/// - A span set by the body's swing alone, or any span on a look, is the
+///   plan's pace.
+/// - A pair being parted is the geometry doing what it is there for.
 fn planned(
     cfg: &MotionConfig,
     start: &JointTargets,
@@ -526,18 +532,27 @@ pub fn floored_clocks(
     }
 }
 
-/// Count what the library did to a plan's clocks, in the one of the three
-/// totals that says what it means.
+/// Count what the library did to a plan's clocks, in the one of three totals
+/// that says what it means.
 ///
-/// `base_stretched` is the anomaly: a pair no clock could part, whatever the
-/// plan was for, or a base plan whose clock could not carry its own span. A
-/// look's span stretch, parted or not, is its pace -- its clock is sized for
-/// the head and the body is paced by the floor -- and counts in `look_paced`.
-/// A plan that was only de-phased counts in `base_dephased`, for a look as for
-/// a pose: that is what the pair's own geometry asks for on every move that
-/// sweeps both antennas between the stow and the working posture, so counting
-/// it beside the anomalies would leave `base_stretched` climbing on a perfectly
-/// healthy machine and saying nothing. Each plan counts in exactly one.
+/// `base_stretched` is the anomaly. It counts two things: a pair no clock could
+/// part, whatever else the pass did, and a pose move's clock lengthened because
+/// the legs or an antenna could not carry their span on it. A configured pose
+/// clock is sized to cover its span, and that plan is the configuration failing
+/// to.
+///
+/// `base_paced` counts plans that ran at a joint's pace by policy. A look's head
+/// clock is a lower bound, so any span stretch on a `Look` goal counts here,
+/// whichever joint set it. On a pose move only a stretch the body yaw's swing
+/// alone set counts here, because the body's pace is the step bound on every
+/// plan. On a pose move the bucket is decided by the joint that set the floor;
+/// on a look, by the plan's kind.
+///
+/// A plan that was only de-phased counts in `base_dephased`. The pair's own
+/// geometry asks for that on every move that sweeps both antennas between the
+/// stow and the working posture.
+///
+/// Each plan counts in exactly one.
 fn count_adjustment(stretch: Option<ClockStretch>, kind: GoalKind, counters: &mut MoverCounters) {
     let Some(stretch) = stretch else {
         return;
@@ -545,10 +560,12 @@ fn count_adjustment(stretch: Option<ClockStretch>, kind: GoalKind, counters: &mu
     let unmet = stretch
         .separation
         .is_some_and(|pair| !pair.met(stretch.separation_required));
-    if unmet || (stretch.span_stretched && kind == GoalKind::Base) {
+    if unmet {
         counters.base_stretched += 1;
+    } else if stretch.span_stretched && (stretch.body_paced || kind == GoalKind::Look) {
+        counters.base_paced += 1;
     } else if stretch.span_stretched {
-        counters.look_paced += 1;
+        counters.base_stretched += 1;
     } else {
         counters.base_dephased += 1;
     }
@@ -829,7 +846,12 @@ mod tests {
         span_stretched: bool,
         dephased: bool,
         separation: Option<PhaseSeparation>,
+        body_paced: bool,
     ) -> ClockStretch {
+        assert!(
+            !body_paced || span_stretched,
+            "only a span stretch is body-paced"
+        );
         let requested = MoveDurations::uniform(Duration::from_millis(800));
         ClockStretch {
             requested,
@@ -845,18 +867,19 @@ mod tests {
             separation_required: SEPARATION,
             dephased,
             span_stretched,
+            body_paced,
         }
     }
 
     /// Which of the three totals a report on a plan of `kind` lands in:
-    /// `(base_stretched, base_dephased, look_paced)`.
+    /// `(base_stretched, base_dephased, base_paced)`.
     fn counted(stretch: Option<ClockStretch>, kind: GoalKind) -> (u64, u64, u64) {
         let mut counters = MoverCounters::default();
         count_adjustment(stretch, kind, &mut counters);
         (
             counters.base_stretched,
             counters.base_dephased,
-            counters.look_paced,
+            counters.base_paced,
         )
     }
 
@@ -871,65 +894,116 @@ mod tests {
     /// figure that is expected to climb.
     #[test]
     fn a_pair_nothing_could_part_is_an_anomaly_and_a_parted_one_is_not() {
-        let base = GoalKind::Base;
         assert_eq!(
-            counted(None, base),
+            counted(None, GoalKind::Base),
             (0, 0, 0),
             "nothing to say is nothing to count"
         );
         assert_eq!(
-            counted(Some(stretch(false, true, Some(parted(0.61)))), base),
+            counted(
+                Some(stretch(false, true, Some(parted(0.61)), false)),
+                GoalKind::Base
+            ),
             (0, 1, 0),
             "a pair parted at its crossing is the geometry working"
         );
         assert_eq!(
-            counted(Some(stretch(true, false, None)), base),
+            counted(Some(stretch(true, false, None, false)), GoalKind::Base),
             (1, 0, 0),
             "a clock that could not carry its own span is news"
         );
         assert_eq!(
-            counted(Some(stretch(true, true, Some(parted(0.61)))), base),
+            counted(
+                Some(stretch(true, true, Some(parted(0.61)), false)),
+                GoalKind::Base
+            ),
             (1, 0, 0),
             "a span stretched and then parted is still a span anomaly"
         );
         assert_eq!(
-            counted(Some(stretch(false, false, Some(parted(0.09)))), base),
+            counted(
+                Some(stretch(false, false, Some(parted(0.09)), false)),
+                GoalKind::Base
+            ),
             (1, 0, 0),
             "a pair the pass could not part is the anomaly this total is for"
         );
     }
 
-    /// A look's clock is sized for the head and its body is paced by the
-    /// floor, so a span stretch on a look is its pace and lands in
-    /// `look_paced`; a de-phasing on a look is routine as on any move, and a
-    /// pair nothing could part is the anomaly whatever the plan was for.
+    /// Which total a stretch lands in: on a look, the plan's kind; on a pose
+    /// move, the joint that set the floor; an unparted pair is the anomaly on
+    /// either.
     #[test]
     fn a_look_s_span_stretch_is_its_pace_and_not_an_anomaly() {
-        let look = GoalKind::Look;
         assert_eq!(
-            counted(Some(stretch(true, false, None)), look),
+            counted(Some(stretch(true, false, None, false)), GoalKind::Look),
             (0, 0, 1),
-            "a look lengthened for its span is paced, not stretched"
+            "a look the legs lengthened runs at their pace"
         );
         assert_eq!(
-            counted(Some(stretch(true, true, Some(parted(0.61)))), look),
+            counted(Some(stretch(true, false, None, true)), GoalKind::Look),
             (0, 0, 1),
-            "a look lengthened and then parted is still its pace"
+            "a look the body lengthened runs at its pace"
         );
         assert_eq!(
-            counted(Some(stretch(false, true, Some(parted(0.61)))), look),
+            counted(
+                Some(stretch(true, true, Some(parted(0.61)), false)),
+                GoalKind::Look
+            ),
+            (0, 0, 1),
+            "a look stretched and parted is still its pace"
+        );
+        assert_eq!(
+            counted(Some(stretch(true, false, None, false)), GoalKind::Base),
+            (1, 0, 0),
+            "a pose clock that did not cover its span is the anomaly"
+        );
+        assert_eq!(
+            counted(Some(stretch(true, false, None, true)), GoalKind::Base),
+            (0, 0, 1),
+            "a pose move the body alone lengthened is paced, not stretched"
+        );
+        assert_eq!(
+            counted(
+                Some(stretch(true, false, Some(parted(0.09)), false)),
+                GoalKind::Look
+            ),
+            (1, 0, 0),
+            "an unparted pair is the anomaly on a look"
+        );
+        assert_eq!(
+            counted(
+                Some(stretch(true, false, Some(parted(0.09)), true)),
+                GoalKind::Base
+            ),
+            (1, 0, 0),
+            "an unparted pair is the anomaly on a body-paced pose move"
+        );
+        assert_eq!(
+            counted(
+                Some(stretch(false, true, Some(parted(0.61)), false)),
+                GoalKind::Look
+            ),
             (0, 1, 0),
             "a look only de-phased is the geometry working"
         );
         assert_eq!(
-            counted(Some(stretch(false, false, Some(parted(0.09)))), look),
-            (1, 0, 0),
-            "an unparted pair is the anomaly on a look too"
+            counted(
+                Some(stretch(false, true, Some(parted(0.61)), false)),
+                GoalKind::Base
+            ),
+            (0, 1, 0),
+            "a pose move only de-phased is the geometry working"
         );
         assert_eq!(
-            counted(None, look),
+            counted(None, GoalKind::Look),
             (0, 0, 0),
-            "nothing to say is nothing to count"
+            "nothing to say on a look is nothing to count"
+        );
+        assert_eq!(
+            counted(None, GoalKind::Base),
+            (0, 0, 0),
+            "nothing to say on a pose move is nothing to count"
         );
     }
 

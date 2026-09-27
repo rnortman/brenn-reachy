@@ -1,0 +1,24 @@
+{
+  "type": "motion-script",
+  "pod": "reachy-ask",
+  "seq": 1,
+  "steps": [
+    {"after_ms": 8000, "pose": "peek_tilt"},
+    {"after_ms": 13000, "look": {"bearing_mrad": 785, "elevation_mrad": 471}},
+    {"after_ms": 17464, "look": {"bearing_mrad": -785, "elevation_mrad": 471}},
+    {"after_ms": 21864, "look": {"bearing_mrad": 2094, "elevation_mrad": 471}},
+    {"after_ms": 26264, "look": {"bearing_mrad": -2094, "elevation_mrad": 471}},
+    {"after_ms": 30664, "look": {"bearing_mrad": 1571, "elevation_mrad": 471}},
+    {"after_ms": 35064, "look": {"bearing_mrad": -1571, "elevation_mrad": 471}},
+    {"after_ms": 39464, "look": {"bearing_mrad": 1047, "elevation_mrad": 471}},
+    {"after_ms": 43864, "look": {"bearing_mrad": -1047, "elevation_mrad": 471}},
+    {"after_ms": 48264, "pose": "neutral"},
+    {"after_ms": 53064, "look": {"bearing_mrad": 524, "elevation_mrad": 471}},
+    {"after_ms": 57464, "look": {"bearing_mrad": -524, "elevation_mrad": 471}},
+    {"after_ms": 61864, "look": {"bearing_mrad": 262, "elevation_mrad": 471}},
+    {"after_ms": 66264, "look": {"bearing_mrad": -262, "elevation_mrad": 471}},
+    {"after_ms": 70664, "look": {"bearing_mrad": 0, "elevation_mrad": 471}},
+    {"after_ms": 75064, "pose": "stow"}
+  ],
+  "timeout_ms": 77552
+}
