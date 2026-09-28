@@ -260,7 +260,7 @@ crate.spec(
 # read.
 BRENN_POD_GIT = "https://github.com/rnortman/brenn-pod.git"
 
-BRENN_POD_REV = "be2c43a0faf94225595e2d5da4c999befece5ff6"
+BRENN_POD_REV = "a93c8f068bca6e00ddd7576de720c363ae225b1f"
 
 # Developing a seam that lands on both sides of this dependency arrow: replace
 # each spec's `git`/`rev` pair with `path = "../brenn-pod/<crate path>"` to

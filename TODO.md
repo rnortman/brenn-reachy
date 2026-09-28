@@ -1480,3 +1480,26 @@ refusal. The geometry needs a talker behind a robot that is already turned
 sideways. Choosing between refusing the owner's share and adding a new decline
 path is a design decision. Marked at the share check in `Settings::of`,
 `cogs/motion_cogs.rs`.
+
+## `clock-step-forward`
+
+Make the motion loop tolerate a `CLOCK_REALTIME` step forward. The session's
+watchdog and every deadline (`silent_for`, `overdue_release`, the stow budget,
+the script horizon in `cogs/session_ladder.rs`) and the driver's grid,
+dead-man and confirmation pass are differences on the clock NTP steps; the
+driver notices only the backward case (`reanchor` in
+`crates/reachy-motord/src/loop_ctl.rs`). Two shapes to choose between: a
+monotonic time base for the grid, the samples' `nominal_time` and the cogs'
+`now`; or the driver detecting the step (the realtime-minus-monotonic offset
+changing between chunks) and publishing it, so the session re-anchors and the
+machine goes to the MRC as it does for a backward step. Either comes with a
+scenario in the deterministic suite that steps the clock. Done = a forward step
+during `starting` leaves the session unparked, and a step while engaged is
+answered as a loss of time base.
+
+Deferral context: until then the payload's `run` waits, bounded, for the
+boot's first time sync. That covers a baked boot on a networked unit and
+nothing else: a unit that gets its network after the launcher starts still
+parks at the first sync. The fix touches the schema, the driver, the session
+and the scenario suite, which is a design cycle. Marked at the wait in
+`tools/payload-run.sh` and at `silent_for` in `cogs/session_ladder.rs`.

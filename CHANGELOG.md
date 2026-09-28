@@ -94,6 +94,14 @@ Nothing has been released.
 
 ### Changed
 
+- **The brenn-pod pin advances to `a93c8f0`.** brenn-pod is the voice
+  stack this repo builds against. A wake stays open for a command for
+  `[wake] command_wait_ms`; a declined command can be repeated
+  without a second wake word; the head comes down when the window closes.
+  Log lines: new `wake_restored` and `wake_expired`; `wake_held` on every
+  detection with `speaking`; `arm_expired` gains `candidate_minted` and
+  `cause`. The re-resolution moved no third-party crate.
+
 - **The body turns as fast as its motor allows.** The body yaw (the
   rotation of the whole head assembly on the base) is commissioned at its
   servo's own velocity limit, 10.7 rad/s, where it was 1.2 rad/s, on gains
@@ -204,6 +212,16 @@ Nothing has been released.
 
 - **`make speech-provision`, `tools/provision-speech.sh`, and the speech run's
   exit 12.** The audio device's link now travels in the payload.
+
+### Fixed
+
+- **A baked boot no longer parks at the first time sync.** The payload's
+  `run` waits up to 60 s for the boot's first NTP sync before starting the
+  launcher, because the motion stack measures every silence and deadline on
+  the real-time clock and the first sync's forward step read to the session
+  as the driver gone silent (`bus_failure`, parked, "My head motion has
+  stopped"). An offline unit waits the cap and starts as before; a unit whose
+  network arrives after the launcher started still parks at that sync.
 
 ### Added
 

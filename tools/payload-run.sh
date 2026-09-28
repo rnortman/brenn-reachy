@@ -8,7 +8,9 @@
 # fails), starts the production launcher, whose voice host dances the idle
 # playlist until the run is stopped, and exits 0 whatever the launcher
 # returned: a restart onto whatever survived a crash would re-arm the bus five
-# seconds after the control process fell over.
+# seconds after the control process fell over. Before starting the launcher it
+# waits, up to a minute, for the boot's first time sync; a stop during that
+# wait starts nothing.
 #
 # A launcher that has gone leaves the robot still until a power cycle; nothing
 # here restarts it.
@@ -34,17 +36,47 @@ for f in cogs/servo_profile.textproto cogs/servo_gains.textproto cogs/mover_para
 	cp -- "$f" "$logs/motion/config/$f" || { echo "run: no $f in the payload"; exit 0; }
 done
 launcher=''
+stopped=''
 # TERM to the launcher by PID, whether the signal came from systemd or from
 # outside it. TERM and not INT: a child started with & by a non-interactive sh
-# begins with SIGINT ignored, and reachy_motord de-torques on either.
+# begins with SIGINT ignored, and reachy_motord de-torques on either. A stop
+# that arrives before the launcher exists is remembered, so the wait below ends
+# and nothing is started.
 # Invoked by the trap below, which the linter does not follow.
 # shellcheck disable=SC2329
 forward() {
+	stopped=1
 	[ -n "$launcher" ] && kill -TERM "$launcher" 2>/dev/null
 }
 trap forward TERM INT
+# Every silence and deadline in the motion stack is measured on CLOCK_REALTIME.
+# A baked boot starts on the image's floor clock, and the boot's first time
+# sync steps it forward, which the session reads as the driver gone silent and
+# parks. So the launcher waits, up to the cap, for the marker timesyncd creates
+# at the boot's first sync and keeps until reboot. An offline unit pays the cap
+# and starts on the boot clock; a unit whose network arrives after the launcher
+# started still parks at that sync. The two variables exist for the self-test.
+# TODO(clock-step-forward)
+sync_mark="${BRENN_CLOCK_SYNC_MARK:-/run/systemd/timesync/synchronized}"
+sync_wait="${BRENN_CLOCK_SYNC_WAIT_S:-60}"
+waited=0
+while [ ! -e "$sync_mark" ] && [ -z "$stopped" ] && [ "$waited" -lt "$sync_wait" ]; do
+	sleep 1
+	waited=$((waited + 1))
+done
+if [ -n "$stopped" ]; then
+	echo "run: stopped before the launcher started"
+	exit 0
+fi
+if [ -e "$sync_mark" ]; then
+	echo "run: clock synced; waited ${waited}s"
+else
+	echo "run: clock not synced after ${sync_wait}s; starting on the boot clock"
+fi
 ./simplelaunch robotcpu.textproto --logdir "$logs/launch" &
 launcher=$!
+# A stop between the check above and the launch had no PID to reach.
+[ -n "$stopped" ] && kill -TERM "$launcher" 2>/dev/null
 wait "$launcher"
 rc=$?
 # A trapped signal returns wait early with the launcher still winding down;

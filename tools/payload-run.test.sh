@@ -15,7 +15,10 @@
 # that the production launcher is started on `robotcpu.textproto`; that `run`
 # exits 0 whatever the launcher returned, which is what keeps the service from
 # restarting onto a crashed stack; that a TERM or an INT to `run` reaches the
-# launcher as TERM; and that nothing is written outside TMPDIR.
+# launcher as TERM; that `run` waits, by default up to a minute, for the marker
+# timesyncd creates at `/run/systemd/timesync/synchronized` before starting the
+# launcher, and a stop during that wait starts nothing; and that nothing is
+# written outside TMPDIR.
 #
 # Run as a plain program; exits 0 on pass, non-zero on failure.
 
@@ -60,6 +63,14 @@ exit "${STUB_LAUNCH:-0}"
 STUB
 chmod 0755 -- "${payload}/simplelaunch"
 
+# The boot's first time sync has happened, unless a case says otherwise.
+sync_mark="${work}/clock-synced"
+touch -- "$sync_mark"
+
+# The hermetic environment every run of the subject starts from; a case's
+# own assignments come after it and override it.
+payload_env=(-u BRENN_CA_FILE -u SSL_CERT_FILE TMPDIR="$scratch" BRENN_CLOCK_SYNC_MARK="$sync_mark")
+
 # A fresh scratch space for each case, as a boot gives the service.
 fresh() {
 	if [ -d "$scratch" ]; then
@@ -70,11 +81,12 @@ fresh() {
 }
 
 # The subject from the payload root, with no trust anchor unless a case names
-# one. Extra arguments are environment assignments for this run.
+# one and the time-sync marker present unless a case names its own. Extra
+# arguments are environment assignments for this run.
 run_payload() {
 	local out status=0
 	out=$(cd -- "$payload" &&
-		env -u BRENN_CA_FILE -u SSL_CERT_FILE TMPDIR="$scratch" "$@" ./run 2>&1) || status=$?
+		env "${payload_env[@]}" "$@" ./run 2>&1) || status=$?
 	printf '%s\n---status %s\n' "$out" "$status"
 }
 
@@ -197,6 +209,64 @@ assert_eq "and its status is the last line" \
 	"run: launcher exited 7" "$(last_line "$result")"
 
 # ---------------------------------------------------------------------------
+# The boot's first time sync
+# ---------------------------------------------------------------------------
+
+fresh
+result=$(run_payload)
+assert_eq "with the clock synced, run says so and starts the launcher at once" \
+	$'run: clock synced; waited 0s\nrun: launcher exited 0' "$(output_of "$result")"
+assert_file "and the launcher is started" "${scratch}/stub-launch.args"
+
+fresh
+result=$(run_payload BRENN_CLOCK_SYNC_MARK="${scratch}/never" BRENN_CLOCK_SYNC_WAIT_S=1)
+assert_status "with no sync by the cap, run exits 0" 0 "$(status_of "$result")"
+assert_contains "and says it starts on the boot clock" "$(output_of "$result")" \
+	"run: clock not synced after 1s; starting on the boot clock"
+assert_file "and starts the launcher" "${scratch}/stub-launch.args"
+assert_eq "and reports the launcher's own status last" \
+	"run: launcher exited 0" "$(last_line "$result")"
+
+fresh
+(
+	sleep 1
+	touch -- "${scratch}/late"
+) &
+helper=$!
+result=$(run_payload BRENN_CLOCK_SYNC_MARK="${scratch}/late" BRENN_CLOCK_SYNC_WAIT_S=3)
+wait "$helper" || true
+assert_contains "a sync during the wait ends it" "$(output_of "$result")" "run: clock synced; waited"
+assert_lacks "and is not reported as the cap" "$(output_of "$result")" "not synced"
+assert_file "and the launcher is started" "${scratch}/stub-launch.args"
+
+# A TERM to run itself during the wait; run is started in the background with
+# exec so its PID is the job's. TERM only: a background job in a
+# non-interactive shell starts with INT ignored.
+fresh
+(
+	cd -- "$payload" &&
+		exec env "${payload_env[@]}" \
+			BRENN_CLOCK_SYNC_MARK="${scratch}/never" BRENN_CLOCK_SYNC_WAIT_S=3 \
+			./run >"${work}/term-wait.out" 2>&1
+) &
+pid=$!
+# The copies are done just before the trap is set; give it a moment more.
+i=0
+while [ ! -s "${scratch}/logs/motion/config/cogs/mover_params.textproto" ] && [ "$i" -lt 100 ]; do
+	sleep 0.05
+	i=$((i + 1))
+done
+sleep 0.3
+kill -TERM "$pid"
+status=0
+wait "$pid" || status=$?
+assert_status "a TERM during the wait: exit 0" 0 "$status"
+assert_no_file "a TERM during the wait starts no launcher" "${scratch}/stub-launch.args"
+assert_contains "a TERM during the wait says so" "$(cat -- "${work}/term-wait.out")" \
+	"run: stopped before the launcher started"
+rm -f -- "${work}/term-wait.out"
+
+# ---------------------------------------------------------------------------
 # Signals reach the launcher as TERM
 # ---------------------------------------------------------------------------
 
@@ -268,6 +338,14 @@ assert_eq "run names its log roots under TMPDIR" 'logs="${TMPDIR:?}/logs"' "$log
 assert_eq "and under the service's TMPDIR its motion root is the logger's root" \
 	"$log_root" \
 	"$(TMPDIR=/run/brenn-app/scratch sh -c "${logs_line}; printf '%s' \"\${logs}/motion\"")"
+# shellcheck disable=SC2016
+assert_eq "run waits on the marker timesyncd creates at the boot's first sync" \
+	'sync_mark="${BRENN_CLOCK_SYNC_MARK:-/run/systemd/timesync/synchronized}"' \
+	"$(grep '^sync_mark=' -- "$subject")"
+# shellcheck disable=SC2016
+assert_eq "and waits for it up to a minute" \
+	'sync_wait="${BRENN_CLOCK_SYNC_WAIT_S:-60}"' \
+	"$(grep '^sync_wait=' -- "$subject")"
 
 # ---------------------------------------------------------------------------
 

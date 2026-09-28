@@ -416,6 +416,9 @@ pub fn note_sample(slot: &mut SessionStateWire, nominal_ns: i64) {
 /// sample to measure from. Idle once parked -- the machine is latched and the
 /// response has been taken, and a second declaration would answer a condition
 /// already answered.
+///
+/// TODO(clock-step-forward): the silence is a difference on the real-time
+/// clock, so a forward step reads as the stream gone silent.
 #[must_use]
 pub fn silent_for(slot: &SessionStateWire, now_ns: i64, budgets: &Budgets) -> Option<i64> {
     if matches!(slot.phase(), SessionPhaseWire::PARKED) {
