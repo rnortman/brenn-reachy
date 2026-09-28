@@ -80,6 +80,11 @@ pub const IDLE_PARKED: &str = "idle_parked";
 /// script, or the script could not be sent to the control process.
 pub const IDLE_REFUSED: &str = "idle_refused";
 
+/// Speech's bare stow, from the sender that owns the head, read as speech being
+/// done with it now. The loop's `idle_resumed`, when it can send, follows on the
+/// same pass.
+pub const IDLE_BARE_STOW: &str = "idle_bare_stow";
+
 /// A stale stow from a sender that no longer owns the head, not offered.
 pub const IDLE_DROPPED_STOW: &str = "idle_dropped_stow";
 

@@ -16,8 +16,10 @@
 //! but `stow` — takes the head for speech once the edge has accepted it; a
 //! script whose last step is a future `stow` says when speech is done with it,
 //! and the `resting` that ends the session running it hands it back; a body
-//! the session holds across a `resting` keeps the head through that one. The
-//! loop owns it otherwise. A body the edge refused never ran and changes
+//! the session holds across a `resting` keeps the head through that one. A bare
+//! stow from the sender that owns the head says it is done with it now, and the
+//! loop's replacement, sent on the same pass, pre-empts that stow. The loop
+//! owns it otherwise. A body the edge refused never ran and changes
 //! nothing. A bare stow from a sender that no longer owns the head is stale,
 //! and the loop has it dropped rather than offered: it would fold a head that is dancing.
 //!
@@ -72,8 +74,8 @@ use brenn_reachy__motion__reports_clk_rs::ReportKind;
 use brenn_reachy__motion__timeline_clk_rs::TimelineEntryWire;
 
 use crate::words::{
-    IDLE_BACKOFF, IDLE_DROPPED_STOW, IDLE_NO_STORY, IDLE_OPENED, IDLE_PARKED, IDLE_REFUSED,
-    IDLE_REPLACED, IDLE_RESUMED, IDLE_SUSPENDED,
+    IDLE_BACKOFF, IDLE_BARE_STOW, IDLE_DROPPED_STOW, IDLE_NO_STORY, IDLE_OPENED, IDLE_PARKED,
+    IDLE_REFUSED, IDLE_REPLACED, IDLE_RESUMED, IDLE_SUSPENDED,
 };
 
 /// The pose every loop script opens on: a resting head is raised to it, and a
@@ -626,6 +628,22 @@ impl Idle {
         };
         self.speech_mark = Some(script.seq());
         if bare_stow(&script) {
+            // A bare stow from the sender that owns the head is speech saying
+            // it is done with it now: the loop resumes at once, and its
+            // replacement, sent on this same pass, pre-empts the stow the
+            // session was just handed, as the replacement at `resume_at`
+            // pre-empts a closing script's stow.
+            // TODO(cued-motion-stow-handoff): the scripter should say it is done
+            // with the head without asking for a stow it does not mean.
+            if self.owner == Owner::Speech {
+                surface.say(edge_line_with(
+                    IDLE_BARE_STOW,
+                    arrival,
+                    "speech's bare stow says it is done with the head; the loop takes it back on this pass if it can",
+                    &[],
+                ));
+                self.resume_at = Some(arrival);
+            }
             return;
         }
         self.speech_held = matches!(
@@ -2140,27 +2158,112 @@ mod tests {
     }
 
     #[test]
-    fn an_accepted_bare_stow_changes_nothing() {
-        for speech_first in [false, true] {
-            let mut rig = active_loop();
-            if speech_first {
-                rig.accept(&closing(8_000), 1_500);
-            }
-            let before = (
-                rig.idle.owner,
-                rig.idle.standing,
-                rig.idle.resume_at,
-                rig.surface.lines.len(),
-            );
-            rig.accept(&bare_stow_body(), 1_600);
-            let after = (
-                rig.idle.owner,
-                rig.idle.standing,
-                rig.idle.resume_at,
-                rig.surface.lines.len(),
-            );
-            assert_eq!(before, after);
-        }
+    fn an_accepted_bare_stow_from_a_stale_sender_changes_nothing() {
+        let mut rig = active_loop();
+        let before = (
+            rig.idle.owner,
+            rig.idle.standing,
+            rig.idle.resume_at,
+            rig.surface.lines.len(),
+        );
+        rig.accept(&bare_stow_body(), 1_600);
+        let after = (
+            rig.idle.owner,
+            rig.idle.standing,
+            rig.idle.resume_at,
+            rig.surface.lines.len(),
+        );
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn an_accepted_bare_stow_from_speech_resumes_at_once() {
+        let mut rig = active_loop();
+        rig.accept(&closing(8_000), 1_500);
+        assert_eq!(rig.idle.resume_at, Some(t(1_500 + 8_000 - SEAM_LEAD_MS)));
+        rig.accept(&bare_stow_body(), 9_500);
+        assert_eq!(rig.idle.resume_at, Some(t(9_500)));
+        assert_eq!(rig.idle.owner, Owner::Speech);
+        assert_eq!(rig.surface.count(IDLE_BARE_STOW), 1);
+        let (_, script) = rig.send(9_500);
+        assert_shape(&script, SEAM_PLAY_MS);
+        assert_eq!(rig.surface.count(IDLE_RESUMED), 1);
+        assert_eq!(rig.idle.owner, Owner::Loop);
+    }
+
+    #[test]
+    fn a_bare_stow_while_a_body_is_held_opens_at_the_resting_that_follows() {
+        let mut rig = active_loop();
+        rig.rows(vec![phase(
+            SessionPhaseWire::STOPPING,
+            SessionPhaseWire::ACTIVE,
+            30_000,
+        )]);
+        rig.accept(&hold(), 30_500);
+        rig.accept(&numbered(2, vec![Step::new(0, STOW_POSE)], 3_000), 30_800);
+        assert_eq!(rig.idle.resume_at, Some(t(30_800)));
+        assert!(rig.idle.speech_held);
+        rig.quiet(30_900);
+        rig.rows(vec![
+            ended(1, 31_000),
+            phase(
+                SessionPhaseWire::RESTING,
+                SessionPhaseWire::STOPPING,
+                31_001,
+            ),
+        ]);
+        assert_eq!(rig.idle.owner, Owner::Speech);
+        assert_eq!(rig.idle.resume_at, Some(t(30_800)));
+        assert!(!rig.idle.speech_held);
+        let (_, script) = rig.send(31_001);
+        assert_shape(&script, OPEN_PLAY_MS);
+        assert_eq!(rig.idle.owner, Owner::Loop);
+        assert_eq!(rig.surface.count(IDLE_RESUMED), 0);
+    }
+
+    /// A speech script shaped like the scripter's while a cued motion plays:
+    /// a pose, the clip, and no stow.
+    fn cued_motion() -> Vec<u8> {
+        body(
+            vec![
+                Step::new(0, "listen"),
+                Step::play(1, Play::at_speed("a/two", 1.0)),
+            ],
+            10_000,
+        )
+    }
+
+    #[test]
+    fn a_bare_stow_after_a_cued_motion_resumes_the_loop_at_once() {
+        let mut rig = active_loop();
+        rig.accept(&cued_motion(), 1_500);
+        assert_eq!(rig.quiet(6_000).due, None);
+        rig.accept(&bare_stow_body(), 6_100);
+
+        assert_eq!(rig.surface.count(IDLE_BARE_STOW), 1);
+        let (_, script) = rig.send(6_100);
+        assert_shape(&script, SEAM_PLAY_MS);
+        assert_eq!(rig.surface.count(IDLE_RESUMED), 1);
+        assert_eq!(rig.surface.count(IDLE_OPENED), 1);
+        assert_eq!(rig.idle.owner, Owner::Loop);
+        assert_eq!(
+            rig.standing_due(),
+            6_100 + SEAM_PLAY_MS + clip_wall_ms(window(motion(&script)), speed_of(motion(&script)))
+                - SEAM_LEAD_MS
+        );
+    }
+
+    #[test]
+    fn a_bare_stow_while_the_loop_is_halted_leaves_it_halted() {
+        let mut rig = active_loop();
+        rig.rows(vec![refused_row(1, 1, 1_200)]);
+        assert!(rig.idle.halted);
+        rig.accept(&cued_motion(), 1_500);
+        rig.accept(&bare_stow_body(), 6_100);
+        assert_eq!(rig.idle.resume_at, Some(t(6_100)));
+        assert_eq!(rig.quiet(6_100).due, None);
+        assert!(rig.idle.halted);
+        assert_eq!(rig.surface.count(IDLE_RESUMED), 0);
     }
 
     #[test]

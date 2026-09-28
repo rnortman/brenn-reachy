@@ -811,7 +811,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use clockwork_rs::{SyncTime, blob_as_bytes, blob_from_bytes};
-    use motion_proto::{MotionScript, STOW_POSE, Step, unix_millis};
+    use motion_proto::{MotionScript, Play, STOW_POSE, Step, unix_millis};
     use pose_fixture::{NEUTRAL_POSE, poses};
     use reachy_edge::{
         Alert, Author, EdgeConfig, HostEdge, LOOPBACK, MotionTable, Origin, POLL, PoseTable,
@@ -1496,6 +1496,51 @@ mod tests {
             1,
             "the edge never saw the body, so nothing else mentions it: {:?}",
             said.lines,
+        );
+    }
+
+    #[test]
+    fn a_bare_stow_after_a_cued_motion_reaches_the_edge_and_the_loop_follows_it() {
+        // Speech owns the head through the cued motion, so its bare stow is
+        // offered and sent, and the same pass's poll takes the head back.
+        let reports = reports_port();
+        let control = control_port();
+        let destination = control.local_addr().expect("a bound port");
+        let cued = speech_body(
+            POD,
+            vec![
+                Step::new(0, NEUTRAL_POSE),
+                Step::play(1, Play::at_speed("a/two", 1.0)),
+            ],
+        );
+        let stow = speech_body_numbered(POD, 2, vec![Step::new(0, STOW_POSE)]);
+
+        let (said, _) = drive_idle(
+            &reports,
+            destination,
+            Some(&resting_story()),
+            &[cued, stow],
+            idle_for(POD),
+        );
+        let scripts = received(&control);
+        assert_eq!(scripts.len(), 3, "{:?}", said.lines);
+        assert_eq!(scripts[0].script_id(), 1, "the cued motion went first");
+        assert_eq!(scripts[0].overlays().len(), 1, "the cued clip");
+        assert_eq!(scripts[1].script_id(), 2, "then the stow");
+        assert_eq!(scripts[1].steps().len(), 1, "the stow alone");
+        assert!(scripts[1].overlays().is_empty(), "a stow plays nothing");
+        assert_loop_script(&scripts[2]);
+        assert_eq!(
+            of_kind(&said, "idle_bare_stow").len(),
+            1,
+            "{:?}",
+            said.lines
+        );
+        assert_eq!(of_kind(&said, "idle_opened").len(), 1, "{:?}", said.lines);
+        assert!(
+            of_kind(&said, "idle_dropped_stow").is_empty(),
+            "{:?}",
+            said.lines
         );
     }
 

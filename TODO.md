@@ -1503,3 +1503,18 @@ nothing else: a unit that gets its network after the launcher starts still
 parks at the first sync. The fix touches the schema, the driver, the session
 and the scenario suite, which is a design cycle. Marked at the wait in
 `tools/payload-run.sh` and at `silent_for` in `cogs/session_ladder.rs`.
+
+## `cued-motion-stow-handoff`
+
+When a cued motion outlives the reply's audio, the speech scripter withholds
+the stow while the motion plays and then publishes a bare, immediate stow at
+the lift. The idle loop reads that bare stow as the hand-back and pre-empts
+it with its replacement on the same pass, which sends the session a stow and
+a retarget a few milliseconds apart. The scripter should say when it is done
+with the head without first asking for a stow it does not mean — a stow
+dated at the lift inside the motion-restating script, or an explicit
+hand-back — and the loop's bare-stow branch then goes.
+
+Deferral context: the scripter is in brenn-pod, behind a published pin; the
+loop-side reading was the change that fit the day. Which of the two
+spellings the scripter adopts is a design decision across both repos.

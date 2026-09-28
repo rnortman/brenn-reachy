@@ -215,6 +215,12 @@ Nothing has been released.
 
 ### Fixed
 
+- **No more stow-and-reopen pause when a cued motion outlasts the reply.**
+  When a motion cued by a reply ran past the end of the speech, the head
+  stowed, disarmed and re-engaged before the idle loop (the between-replies
+  animation) picked up again, a pause of about four seconds. The loop now
+  takes the head back the moment the motion ends. A `idle_bare_stow` log line
+  marks each such hand-back.
 - **A baked boot no longer parks at the first time sync.** The payload's
   `run` waits up to 60 s for the boot's first NTP sync before starting the
   launcher, because the motion stack measures every silence and deadline on
