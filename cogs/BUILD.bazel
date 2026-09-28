@@ -1385,7 +1385,6 @@ merge_simplelaunch_config(
         "@clockwork//clockwork/launch:clockwork_prelaunch.textproto",
     ],
     data = [
-        "brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon",
         "brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon",
         "system_robot.motion_robot.RobotCpu_channel_allocations.csv",
         "system_robot.motion_robot.RobotCpu_channel_spy_config.tachyon",
@@ -1438,7 +1437,6 @@ merge_simplelaunch_config(
         "@clockwork//clockwork/launch:clockwork_prelaunch.textproto",
     ],
     data = [
-        "brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon",
         "brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon",
         "system_robot.motion_robot.RobotCpu_channel_allocations.csv",
         "system_robot.motion_robot.RobotCpu_channel_spy_config.tachyon",
@@ -2482,7 +2480,6 @@ clk(
     name = "system_robot_clk",
     srcs = ["system_robot.clk"],
     outs = [
-        "brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon",
         "brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon",
         "system_robot.motion_robot.RobotCpu_channel_allocations.csv",
         "system_robot.motion_robot.RobotCpu_channel_spy_config.tachyon",

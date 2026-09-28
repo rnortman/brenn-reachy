@@ -388,11 +388,4 @@ box System
 
     apply HostProcess(process=proc) in box;
     apply HostCpuDomain(cpu_domain=RobotCpu) to proc;
-
-    new logger_box: RobotLogger;
-
-    new logger_proc: Process(executable=robot_clk_exe);
-
-    apply HostProcess(process=logger_proc) in logger_box;
-    apply HostCpuDomain(cpu_domain=RobotCpu) to logger_proc;
 }

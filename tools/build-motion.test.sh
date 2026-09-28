@@ -107,7 +107,6 @@ outs="${repo}/bazel-out/bin"
 mkdir -p -- "$outs"
 
 generated_files=(
-	brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon
 	brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon
 	system_robot.motion_robot.RobotCpu_event_logger_config.tachyon
 	system_robot.motion_robot.RobotCpu_channel_allocations.csv
@@ -275,10 +274,6 @@ app {
   executable: "cogs/robot_clk_exe"
 }
 app {
-  name: "logger_proc"
-  executable: "cogs/robot_clk_exe"
-}
-app {
   name: "motord"
   executable: "reachy_motord"
 }
@@ -321,10 +316,6 @@ CONFIG
 		cat >bazel-out/bin/robotcpu_harness.textproto <<CONFIG
 app {
   name: "${APP_CONTROL:-proc}"
-  executable: "cogs/robot_clk_exe"
-}
-app {
-  name: "logger_proc"
   executable: "cogs/robot_clk_exe"
 }
 app {
@@ -766,7 +757,7 @@ assert_file "the writer's channel set is staged" \
 	"${payload}/cogs/system_robot.motion_robot.RobotCpu_event_logger_config.tachyon"
 assert_file "the control process description is staged" \
 	"${payload}/cogs/brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon"
-assert_file "the logger process description is staged" \
+assert_no_file "no logger process description is staged" \
 	"${payload}/cogs/brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon"
 
 # What the push cannot work out for itself: the commit these binaries came out
@@ -2432,9 +2423,9 @@ APP_CONTROL=control_proc
 result=$(build)
 assert_status "a launcher config that renamed a process refuses" 1 "$(status_of "$result")"
 assert_contains "the refusal lists what the config names" "$(output_of "$result")" \
-	"names the apps 'control_proc logger_proc motord pod voice_host'"
+	"names the apps 'control_proc motord pod voice_host'"
 assert_contains "and what the run needs" "$(output_of "$result")" \
-	"needs 'logger_proc motord pod proc voice_host'"
+	"needs 'motord pod proc voice_host'"
 assert_contains "and says which config it read" "$(output_of "$result")" \
 	"robotcpu.textproto names the apps"
 assert_contains "and says why the names matter" "$(output_of "$result")" \
@@ -2487,9 +2478,9 @@ assert_status "a harness twin that names the host refuses" 1 "$(status_of "$resu
 assert_contains "the refusal names the twin" "$(output_of "$result")" \
 	"robotcpu_harness.textproto names the apps"
 assert_contains "and lists the host among what it found" "$(output_of "$result")" \
-	"'logger_proc motord proc voice_host'"
+	"'motord proc voice_host'"
 assert_contains "and what a harness run needs instead" "$(output_of "$result")" \
-	"needs 'logger_proc motord proc'"
+	"needs 'motord proc'"
 assert_unstaged "a twin naming the host stages nothing"
 HARNESS_HOST=""
 
@@ -2505,7 +2496,7 @@ result=$(build)
 assert_status "a harness twin that names the audio device refuses" 1 \
 	"$(status_of "$result")"
 assert_contains "and lists the pod among what it found" "$(output_of "$result")" \
-	"'logger_proc motord pod proc'"
+	"'motord pod proc'"
 assert_unstaged "a twin naming the pod stages nothing"
 HARNESS_POD=""
 

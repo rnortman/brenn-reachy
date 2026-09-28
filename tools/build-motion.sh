@@ -38,7 +38,7 @@
 #     conf/audio.conf                                   the audio device's link, composed by brenn-pod's writer
 #     cogs/*.textproto                                  the cogs' configuration
 #     cogs/*_event_logger_config.tachyon                which channels are written
-#     cogs/*.proc.tachyon, *.logger_proc.tachyon        the two process descriptions
+#     cogs/*.proc.tachyon                               the control process description
 #
 # The launcher paths are not this script's choice: the rendered launcher config
 # spells every executable and argument as a path relative to the launcher's
@@ -242,14 +242,13 @@ link_conf_composed="${payload}.audio.conf"
 speech_source=
 link_pod_id=
 
-# The generated files a process reads, by basename: two process descriptions and
-# the writer's channel set. Everything else the system target emits is for the
+# The generated files staged under `cogs/`, by basename: the control process's
+# description and the writer's channel set. Everything else the system target emits is for the
 # channel spy or the diagnostics database, neither of which this payload starts;
 # the launcher's own config is not in this list because it is not staged under
 # `cogs/` -- the launcher is started from the payload root and its config is
 # named there.
 generated_files=(
-	brenn_reachy.cogs.system_robot.motion_robot.logger_proc.tachyon
 	brenn_reachy.cogs.system_robot.motion_robot.proc.tachyon
 	system_robot.motion_robot.RobotCpu_event_logger_config.tachyon
 )
@@ -266,8 +265,7 @@ logger_config=cogs/robot_logger.textproto
 #
 # The launcher writes each app's console into `<logdir>/<name>_<run>.log`, and
 # those are the files an operator tails and the runbook names one by one. The
-# names are the compositions' -- `proc` and `logger_proc` from the `Process`
-# names, and `motord`, `voice_host` and `pod` from the apps merged in through
+# names are the compositions' -- `proc` from the `Process` name, and `motord`, `voice_host` and `pod` from the apps merged in through
 # `simplelaunch_src` -- so a rename in a `.clk` file would leave the documented
 # tails naming files that never appear.
 # This is the join: the names are pinned here against the config actually built,
@@ -285,9 +283,9 @@ logger_config=cogs/robot_logger.textproto
 # can arm a servo. Asserted per config below, so an app merged into the wrong one
 # by accident is a refused build rather than a bind race, or a torque-on path, on
 # a powered unit.
-launcher_apps=(logger_proc motord pod proc voice_host)
+launcher_apps=(motord pod proc voice_host)
 
-harness_apps=(logger_proc motord proc)
+harness_apps=(motord proc)
 
 # The safety-critical list: nothing in a recording session can arm a servo.
 record_apps=(pod recorder voice_host)
