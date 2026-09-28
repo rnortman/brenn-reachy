@@ -54,7 +54,7 @@ fn the_committed_playlist_loads_against_the_committed_table() {
 fn no_entry_is_a_probe_or_bench_motion_or_listed_twice() {
     // The loader already enforces both; this says it about this file.
     let (list, _) = loaded();
-    let names: Vec<&str> = list.entries().map(|(name, _)| name).collect();
+    let names: Vec<&str> = list.entries().map(|listed| listed.name.as_str()).collect();
     for name in &names {
         assert!(
             !EXCLUDED_PREFIXES
@@ -70,10 +70,11 @@ fn no_entry_is_a_probe_or_bench_motion_or_listed_twice() {
 #[test]
 fn every_entry_blends_out() {
     let (list, _) = loaded();
-    for (name, entry) in list.entries() {
+    for listed in list.entries() {
         assert!(
-            entry.window.blend_out_ms > 0,
-            "{name} has no blend-out, and the seam arithmetic assumes a ramp-out",
+            listed.entry.window.blend_out_ms > 0,
+            "{} has no blend-out, and the seam arithmetic assumes a ramp-out",
+            listed.name,
         );
     }
 }
@@ -88,7 +89,7 @@ fn the_body_diving_clips_are_absent() {
             "{name} is not in the name table; the exclusion no longer names a clip",
         );
         assert!(
-            list.entries().all(|(listed, _)| listed != name),
+            list.entries().all(|listed| listed.name != name),
             "{name} drives the head into the body and is in the playlist",
         );
     }

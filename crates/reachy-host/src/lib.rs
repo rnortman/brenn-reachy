@@ -59,7 +59,7 @@ pub use gaze::{
     Decision, Decline, ELEVATION_RANGE_DEG, Elevation, ElevationError, Gaze, Look, MAX_POSE_AGE,
     decide, gaze_line,
 };
-pub use idle::{Idle, IdleError, Playlist, Poll, Verdict};
+pub use idle::{Idle, IdleError, Playlist, PlaylistEntry, Poll, Verdict};
 pub use intents::{INTENT_BACKLOG, Intents, NotOffered, Waiting, queue};
 pub use params::{HostSettings, ParamsError, ParamsErrorKind, load, parse};
 pub use pose_feed::{HeadAttitude, LastPose, PoseFeed, PoseReader, WrongSize};

@@ -21,8 +21,9 @@
 //! nothing. A bare stow from a sender that no longer owns the head is stale,
 //! and the loop has it dropped rather than offered: it would fold a head that is dancing.
 //!
-//! Every clip plays at the playlist's one `speed`, and the seam and the stow are
-//! timed on the clock that speed runs.
+//! Each entry plays at its own speed, the file's `speed` the default for any
+//! that names none, and the seam and the stow are timed on the clock that
+//! clip's speed runs. The pick is weighted by each entry's `weight`.
 //!
 //! The loop reads three row kinds — `phase_changed`, `session_ended` and
 //! `script_refused` — and waits on none of them. The story can lose rows, and a
@@ -123,12 +124,25 @@ pub const DEFAULT_SPEED: f64 = 1.0;
 
 /// The motions the loop picks from, checked against the deployed name table.
 ///
-/// File order is kept. At least two entries, no duplicates, none excluded, and
-/// one speed the wire admits.
+/// File order is kept. At least two entries, no duplicates, none excluded,
+/// every speed one the wire admits and every weight positive.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Playlist {
-    entries: Vec<(String, MotionEntry)>,
-    speed: f64,
+    entries: Vec<PlaylistEntry>,
+    default_speed: f64,
+}
+
+/// One motion the loop picks from: its resolved clip, the speed it plays at and its pick weight.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaylistEntry {
+    /// The library name.
+    pub name: String,
+    /// What the name resolved to.
+    pub entry: MotionEntry,
+    /// The multiplier on its clock: its own, else the file's default.
+    pub speed: f64,
+    /// How many draws it gets relative to a weight-1 entry; never zero.
+    pub weight: u32,
 }
 
 /// The playlist file's one shape. A misspelt field is refused rather than read
@@ -136,10 +150,46 @@ pub struct Playlist {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlaylistFile {
-    playlist: Vec<String>,
-    /// The multiplier on every clip's clock; absent is [`DEFAULT_SPEED`].
+    playlist: Vec<EntryFile>,
+    /// The default speed of every entry naming none; absent is [`DEFAULT_SPEED`].
     #[serde(default)]
     speed: Option<f64>,
+}
+
+/// One playlist entry as written: a bare name, or an object naming its own speed or weight.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EntryFile {
+    Name(String),
+    Object(EntryObject),
+}
+
+impl EntryFile {
+    /// The name, and the speed and weight it names, if any.
+    fn into_parts(self) -> (String, Option<f64>, Option<u32>) {
+        match self {
+            Self::Name(name) => (name, None, None),
+            Self::Object(EntryObject {
+                name,
+                speed,
+                weight,
+            }) => (name, speed, weight),
+        }
+    }
+}
+
+/// An entry written as an object. A misspelt field is refused rather than
+/// dropped.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntryObject {
+    name: String,
+    /// The multiplier on this clip's clock; absent is the file's default.
+    #[serde(default)]
+    speed: Option<f64>,
+    /// How many draws it gets against a weight-1 entry; absent is 1.
+    #[serde(default)]
+    weight: Option<u32>,
 }
 
 impl Playlist {
@@ -147,48 +197,69 @@ impl Playlist {
     ///
     /// # Errors
     ///
-    /// [`IdleError::Malformed`] for text that is not `{"playlist": [..]}`; for
-    /// the first name that is excluded, repeated or not in `table`,
+    /// [`IdleError::Malformed`] for text that is not `{"playlist": [..]}`;
+    /// [`IdleError::Speed`] for a default speed a play step cannot carry; for
+    /// the first entry naming a speed a play step cannot carry or weighted
+    /// zero, [`IdleError::EntrySpeed`] or [`IdleError::EntryWeight`]; for the
+    /// first name that is excluded, repeated or not in `table`,
     /// [`IdleError::Excluded`], [`IdleError::Duplicate`] or
-    /// [`IdleError::UnknownMotion`]; [`IdleError::TooFew`] for fewer than two;
-    /// [`IdleError::Speed`] for a speed a play step cannot carry.
+    /// [`IdleError::UnknownMotion`]; [`IdleError::TooFew`] for fewer than two.
     pub fn parse(text: &str, table: &MotionTable) -> Result<Self, IdleError> {
         let file: PlaylistFile =
             serde_json::from_str(text).map_err(|error| IdleError::Malformed {
                 detail: error.to_string(),
             })?;
-        let speed = file.speed.unwrap_or(DEFAULT_SPEED);
-        if !speed_is_carried(speed) {
-            return Err(IdleError::Speed { speed });
+        let default_speed = file.speed.unwrap_or(DEFAULT_SPEED);
+        if !speed_is_carried(default_speed) {
+            return Err(IdleError::Speed {
+                speed: default_speed,
+            });
         }
-        let mut entries: Vec<(String, MotionEntry)> = Vec::with_capacity(file.playlist.len());
-        for name in file.playlist {
+        let mut entries: Vec<PlaylistEntry> = Vec::with_capacity(file.playlist.len());
+        for listed in file.playlist {
+            let (name, speed, weight) = listed.into_parts();
+            let speed = speed.unwrap_or(default_speed);
+            if !speed_is_carried(speed) {
+                return Err(IdleError::EntrySpeed { name, speed });
+            }
+            let weight = weight.unwrap_or(1);
+            if weight == 0 {
+                return Err(IdleError::EntryWeight { name });
+            }
             if EXCLUDED_PREFIXES
                 .iter()
                 .any(|prefix| name.starts_with(prefix))
             {
                 return Err(IdleError::Excluded { name });
             }
-            if entries.iter().any(|(seen, _)| *seen == name) {
+            if entries.iter().any(|seen| seen.name == name) {
                 return Err(IdleError::Duplicate { name });
             }
             let Some(entry) = table.resolve(&name) else {
                 return Err(IdleError::UnknownMotion { name });
             };
-            entries.push((name, entry));
+            entries.push(PlaylistEntry {
+                name,
+                entry,
+                speed,
+                weight,
+            });
         }
         if entries.len() < 2 {
             return Err(IdleError::TooFew {
                 count: entries.len(),
             });
         }
-        Ok(Self { entries, speed })
+        Ok(Self {
+            entries,
+            default_speed,
+        })
     }
 
-    /// The multiplier every clip plays at.
+    /// The speed an entry naming none plays at.
     #[must_use]
-    pub fn speed(&self) -> f64 {
-        self.speed
+    pub fn default_speed(&self) -> f64 {
+        self.default_speed
     }
 
     /// How many motions the playlist holds.
@@ -204,10 +275,8 @@ impl Playlist {
     }
 
     /// The motions, in file order.
-    pub fn entries(&self) -> impl Iterator<Item = (&str, MotionEntry)> {
-        self.entries
-            .iter()
-            .map(|(name, entry)| (name.as_str(), *entry))
+    pub fn entries(&self) -> impl Iterator<Item = &PlaylistEntry> {
+        self.entries.iter()
     }
 }
 
@@ -222,8 +291,10 @@ pub enum IdleError {
         /// What the read said.
         detail: String,
     },
-    /// The text is not `{"playlist": [string, …]}`.
-    #[error("the playlist is not {{\"playlist\": [name, …]}}: {detail}")]
+    /// The text is not `{"playlist": [entry, …]}`.
+    #[error(
+        "the playlist is not {{\"playlist\": [name or {{\"name\", \"speed\", \"weight\"}}, …]}}: {detail}"
+    )]
     Malformed {
         /// What the parser said.
         detail: String,
@@ -257,6 +328,20 @@ pub enum IdleError {
     Speed {
         /// The speed it asks for.
         speed: f64,
+    },
+    /// An entry naming a speed a play step cannot carry: refused, never narrowed.
+    #[error("the playlist asks for speed {speed} for {name}, and a play step carries {min}..={max}", min = MIN_SPEED, max = MAX_SPEED)]
+    EntrySpeed {
+        /// The entry's name.
+        name: String,
+        /// The speed it asks for.
+        speed: f64,
+    },
+    /// An entry weighted zero: one that could never be drawn.
+    #[error("the playlist weights {name} 0, and a weight is how many draws it gets, at least 1")]
+    EntryWeight {
+        /// The entry's name.
+        name: String,
     },
 }
 
@@ -574,22 +659,22 @@ impl Idle {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        let Some((name, entry)) = self.playlist.entries.get(pending.index) else {
+        let Some(listed) = self.playlist.entries.get(pending.index) else {
             return;
         };
+        let (name, motion_id, speed, wall) = (
+            listed.name.clone(),
+            listed.entry.motion_id,
+            listed.speed,
+            clip_wall_ms(listed.entry.window, listed.speed),
+        );
         let play = play_ms(pending.shape);
         self.standing = Some(Standing {
             script_id,
-            motion_id: entry.motion_id,
-            due: minus_ms(
-                plus_ms(
-                    arrival,
-                    play.saturating_add(clip_wall_ms(entry.window, self.playlist.speed)),
-                ),
-                SEAM_LEAD_MS,
-            ),
+            motion_id,
+            due: minus_ms(plus_ms(arrival, play.saturating_add(wall)), SEAM_LEAD_MS),
         });
-        self.last_motion = Some(entry.motion_id);
+        self.last_motion = Some(motion_id);
         self.resume_at = None;
         if pending.resume {
             self.owner = Owner::Loop;
@@ -609,7 +694,11 @@ impl Idle {
             word,
             arrival,
             &says,
-            &[("motion", json!(name)), ("script_id", json!(script_id))],
+            &[
+                ("motion", json!(name)),
+                ("speed", json!(speed)),
+                ("script_id", json!(script_id)),
+            ],
         ));
     }
 
@@ -773,8 +862,8 @@ impl Idle {
             .min()
     }
 
-    /// The next playlist index: uniform over every entry but the last motion
-    /// sent, drawn with xorshift64*.
+    /// The next playlist index: weighted by each entry's `weight` over
+    /// every entry but the last motion sent, drawn with xorshift64*.
     fn pick(&mut self) -> usize {
         let mut x = self.rng;
         x ^= x >> 12;
@@ -782,25 +871,32 @@ impl Idle {
         x ^= x >> 27;
         self.rng = x;
         let out = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
-        let candidates: Vec<usize> = self
+        let candidates: Vec<(usize, u64)> = self
             .playlist
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, (_, entry))| Some(entry.motion_id) != self.last_motion)
-            .map(|(index, _)| index)
+            .filter(|(_, listed)| Some(listed.entry.motion_id) != self.last_motion)
+            .map(|(index, listed)| (index, u64::from(listed.weight)))
             .collect();
         // Never empty: `Playlist::parse` admits at least two distinct names, and
         // `MotionTable` refuses two names over one motion id, so excluding the
-        // last motion leaves at least one.
+        // last motion leaves at least one. Every weight is positive
+        // (`Playlist::parse` refuses 0), so the total is never zero.
         assert!(
             !candidates.is_empty(),
             "a parsed playlist always leaves a candidate"
         );
-        let len = u64::try_from(candidates.len()).expect("a candidate count fits in u64");
-        let at =
-            usize::try_from(out % len).expect("an index below the candidate count fits in usize");
-        candidates[at]
+        let total: u64 = candidates.iter().map(|&(_, weight)| weight).sum();
+        let draw = out % total;
+        let mut running = 0u64;
+        for &(index, weight) in &candidates {
+            running += weight;
+            if draw < running {
+                return index;
+            }
+        }
+        unreachable!("the draw is below the total of the weights");
     }
 
     /// The script for playlist entry `index` in `shape`, numbered at `now`.
@@ -810,15 +906,17 @@ impl Idle {
         shape: Shape,
         now: SyncTime,
     ) -> Result<MotionScript, motion_proto::ScriptError> {
-        let (name, entry) = &self.playlist.entries[index];
-        let speed = self.playlist.speed;
+        let listed = &self.playlist.entries[index];
+        let name = listed.name.clone();
+        let speed = listed.speed;
+        let window = listed.entry.window;
         let play = play_ms(shape);
         let stow_at = play
-            .saturating_add(entry.window.span_ms(speed))
+            .saturating_add(window.span_ms(speed))
             .saturating_add(STOW_MARGIN_MS);
         let steps = vec![
             Step::new(0, NEUTRAL_POSE),
-            Step::play(play, Play::at_speed(name.clone(), speed)),
+            Step::play(play, Play::at_speed(name, speed)),
             Step::new(stow_at, STOW_POSE),
         ];
         // The edge's mark is shared with speech, so the loop numbers above the
@@ -930,11 +1028,12 @@ mod tests {
 
     const POD: &str = "fixture-reachy";
 
-    /// The speed the fixture playlist names.
+    /// The default speed the fixture playlist names.
     const SPEED: f64 = 0.5;
 
     /// The fixture playlist's text.
-    const PLAYLIST: &str = r#"{"playlist":["a/one","a/two","a/three"],"speed":0.5}"#;
+    const PLAYLIST: &str =
+        r#"{"playlist":["a/one",{"name":"a/two","speed":1.0},"a/three"],"speed":0.5}"#;
 
     /// A round epoch the fixture's instants are counted from.
     const T0_MS: u64 = 1_800_000_000_000;
@@ -975,6 +1074,15 @@ mod tests {
 
     fn playlist() -> Playlist {
         Playlist::parse(PLAYLIST, &table()).expect("the fixture playlist")
+    }
+
+    /// The speed the fixture playlist plays `name` at.
+    fn speed_of(name: &str) -> f64 {
+        playlist()
+            .entries()
+            .find(|listed| listed.name == name)
+            .expect("a fixture entry")
+            .speed
     }
 
     /// A surface that keeps its lines.
@@ -1080,12 +1188,13 @@ mod tests {
         assert_eq!(script.pod(), POD);
         let name = motion(script);
         let w = window(name);
-        let stow = play + w.span_ms(SPEED) + STOW_MARGIN_MS;
+        let speed = speed_of(name);
+        let stow = play + w.span_ms(speed) + STOW_MARGIN_MS;
         assert_eq!(
             script.steps(),
             &[
                 Step::new(0, NEUTRAL_POSE),
-                Step::play(play, Play::at_speed(name, SPEED)),
+                Step::play(play, Play::at_speed(name, speed)),
                 Step::new(stow, STOW_POSE),
             ],
         );
@@ -1277,12 +1386,15 @@ mod tests {
     fn a_good_playlist_keeps_file_order() {
         let playlist = Playlist::parse(r#"{"playlist":["a/three","a/one"]}"#, &table())
             .expect("a good playlist");
-        let names: Vec<&str> = playlist.entries().map(|(name, _)| name).collect();
+        let names: Vec<&str> = playlist
+            .entries()
+            .map(|listed| listed.name.as_str())
+            .collect();
         assert_eq!(names, ["a/three", "a/one"]);
         assert_eq!(playlist.len(), 2);
         assert!(!playlist.is_empty());
         assert_eq!(
-            playlist.entries().next().map(|(_, entry)| entry),
+            playlist.entries().next().map(|listed| listed.entry),
             Some(entry(12, 1500, 400))
         );
     }
@@ -1383,6 +1495,28 @@ mod tests {
         assert_eq!(rig.surface.count(IDLE_REPLACED), 1);
     }
 
+    #[test]
+    fn the_loops_rows_name_the_speed_they_sent() {
+        fn assert_speed(rows: &[Value]) {
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(
+                row["speed"],
+                json!(speed_of(row["motion"].as_str().expect("a motion name")))
+            );
+        }
+        let mut rig = active_loop();
+        assert_speed(&rig.surface.of(IDLE_OPENED));
+        assert_ne!(
+            rig.surface.of(IDLE_OPENED)[0]["speed"],
+            json!(SPEED),
+            "the seed opens on the entry at its own speed"
+        );
+        let due = rig.standing_due();
+        rig.send(due);
+        assert_speed(&rig.surface.of(IDLE_REPLACED));
+    }
+
     /// The two poses the loop names, the stow at the deployed library's own
     /// budget: the loop sizes every timeout on it, and the edge refuses a
     /// timeline that leaves no room for the stow.
@@ -1423,14 +1557,27 @@ mod tests {
     fn the_due_is_the_clip_end_less_the_lead() {
         let mut rig = resting_loop();
         let (_, opening) = rig.send(0);
+        assert_ne!(
+            speed_of(motion(&opening)),
+            SPEED,
+            "the seed opens on the entry at its own speed"
+        );
         rig.engage(0);
-        let due = OPEN_PLAY_MS + clip_wall_ms(window(motion(&opening)), SPEED) - SEAM_LEAD_MS;
+        let due = OPEN_PLAY_MS + clip_wall_ms(window(motion(&opening)), speed_of(motion(&opening)))
+            - SEAM_LEAD_MS;
         assert_eq!(rig.poll(1_000).due, Some(t(due)));
 
         rig.quiet(due - 1);
         let (_, replacement) = rig.send(due);
-        let next =
-            due + SEAM_PLAY_MS + clip_wall_ms(window(motion(&replacement)), SPEED) - SEAM_LEAD_MS;
+        assert_eq!(
+            speed_of(motion(&replacement)),
+            SPEED,
+            "the seed replaces it with an entry at the default"
+        );
+        let next = due
+            + SEAM_PLAY_MS
+            + clip_wall_ms(window(motion(&replacement)), speed_of(motion(&replacement)))
+            - SEAM_LEAD_MS;
         assert_eq!(rig.poll(due).due, Some(t(next)));
         rig.quiet(next - 1);
         assert!(rig.poll(next).send.is_some());
@@ -1748,7 +1895,10 @@ mod tests {
         let next = rig.standing_due();
         assert_eq!(
             next,
-            resume + SEAM_PLAY_MS + clip_wall_ms(window(motion(&script)), SPEED) - SEAM_LEAD_MS
+            resume
+                + SEAM_PLAY_MS
+                + clip_wall_ms(window(motion(&script)), speed_of(motion(&script)))
+                - SEAM_LEAD_MS
         );
         rig.quiet(next - 1);
         rig.send(next);
@@ -1804,12 +1954,138 @@ mod tests {
     fn a_playlist_naming_no_speed_plays_at_the_recorded_pace() {
         let playlist = Playlist::parse(r#"{"playlist":["a/one","a/two","a/three"]}"#, &table())
             .expect("a playlist naming no speed");
-        assert_eq!(playlist.speed(), DEFAULT_SPEED);
+        assert_eq!(playlist.default_speed(), DEFAULT_SPEED);
     }
 
     #[test]
-    fn a_named_speed_is_read() {
-        assert_eq!(playlist().speed(), 0.5);
+    fn a_bare_entry_takes_the_default_speed_and_weight_one() {
+        let playlist = playlist();
+        assert_eq!(playlist.default_speed(), SPEED);
+        let one = playlist
+            .entries()
+            .find(|listed| listed.name == "a/one")
+            .expect("a/one");
+        assert_eq!(one.speed, SPEED);
+        assert_eq!(one.weight, 1);
+    }
+
+    #[test]
+    fn an_object_entry_carries_its_own_speed_and_weight() {
+        let playlist = Playlist::parse(
+            r#"{"playlist":["a/one",{"name":"a/two","speed":1.5,"weight":3},{"name":"a/three"}],"speed":0.5}"#,
+            &table(),
+        )
+        .expect("a playlist of object entries");
+        let of = |name: &str| {
+            playlist
+                .entries()
+                .find(|listed| listed.name == name)
+                .map(|listed| (listed.speed, listed.weight))
+                .expect("a listed entry")
+        };
+        assert_eq!(of("a/two"), (1.5, 3));
+        assert_eq!(of("a/three"), (0.5, 1));
+    }
+
+    #[test]
+    fn an_entry_speed_the_wire_cannot_carry_is_refused() {
+        for speed in [0.2, 2.5] {
+            let text = format!(r#"{{"playlist":["a/one",{{"name":"a/two","speed":{speed:?}}}]}}"#);
+            assert_eq!(
+                Playlist::parse(&text, &table()),
+                Err(IdleError::EntrySpeed {
+                    name: "a/two".into(),
+                    speed
+                }),
+                "{speed}"
+            );
+        }
+        for speed in [MIN_SPEED, MAX_SPEED] {
+            let text = format!(r#"{{"playlist":["a/one",{{"name":"a/two","speed":{speed:?}}}]}}"#);
+            let playlist =
+                Playlist::parse(&text, &table()).expect("a bound is admitted on an entry");
+            assert_eq!(
+                playlist
+                    .entries()
+                    .find(|listed| listed.name == "a/two")
+                    .expect("a/two")
+                    .speed,
+                speed
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_weighted_zero_is_refused() {
+        assert_eq!(
+            Playlist::parse(
+                r#"{"playlist":["a/one",{"name":"a/two","weight":0}]}"#,
+                &table()
+            ),
+            Err(IdleError::EntryWeight {
+                name: "a/two".into()
+            })
+        );
+    }
+
+    #[test]
+    fn an_entry_with_an_unknown_field_is_malformed() {
+        let text = r#"{"playlist":["a/one",{"name":"a/two","sped":1.0}]}"#;
+        assert!(
+            matches!(
+                Playlist::parse(text, &table()),
+                Err(IdleError::Malformed { .. })
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_entry_of_the_wrong_shape_is_malformed() {
+        for text in [
+            r#"{"playlist":["a/one",{"name":"a/two","weight":-1}]}"#,
+            r#"{"playlist":["a/one",{"name":"a/two","weight":1.5}]}"#,
+            r#"{"playlist":["a/one",{"speed":1.0}]}"#,
+            r#"{"playlist":["a/one",42]}"#,
+        ] {
+            assert!(
+                matches!(
+                    Playlist::parse(text, &table()),
+                    Err(IdleError::Malformed { .. })
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pick_is_weighted_and_never_repeats() {
+        let table = MotionTable::of([
+            ("w/heavy".to_owned(), entry(30, 1000, 200)),
+            ("w/one".to_owned(), entry(31, 1000, 200)),
+            ("w/two".to_owned(), entry(32, 1000, 200)),
+            ("w/three".to_owned(), entry(33, 1000, 200)),
+            ("w/four".to_owned(), entry(34, 1000, 200)),
+        ]);
+        let list = Playlist::parse(
+            r#"{"playlist":[{"name":"w/heavy","weight":10},"w/one","w/two","w/three","w/four"]}"#,
+            &table,
+        )
+        .expect("a weighted playlist");
+        let mut idle = Idle::new(list, POD, SEED);
+        let mut counts = [0u32; 5];
+        let mut previous = None;
+        for _ in 0..600 {
+            let index = idle.pick();
+            let motion_id = idle.playlist.entries[index].entry.motion_id;
+            assert_ne!(Some(motion_id), previous, "a motion picked twice in a row");
+            previous = Some(motion_id);
+            idle.last_motion = Some(motion_id);
+            counts[index] += 1;
+        }
+        for light in &counts[1..] {
+            assert!(counts[0] > 2 * light, "{counts:?}");
+        }
     }
 
     #[test]
@@ -1824,7 +2100,7 @@ mod tests {
         }
         for speed in [MIN_SPEED, MAX_SPEED] {
             let playlist = Playlist::parse(&text(speed), &table()).expect("a bound is admitted");
-            assert_eq!(playlist.speed(), speed);
+            assert_eq!(playlist.default_speed(), speed);
         }
         // JSON has no NaN, so a non-finite speed is refused as text and never
         // reaches the range check as a number.

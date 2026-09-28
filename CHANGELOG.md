@@ -43,9 +43,14 @@ Nothing has been released.
 - **A mirrored greeting.** `hello_wave_mirror` waves the other antenna with
   the head tilted the other way, written by a new authoring tool,
   `//cogs:mirror_clip`, that mirrors any clip document left for right.
-- **The idle playlist names its speed.** `cogs/idle.json` takes a top-level
-  `speed`, default 1.0; a speed outside 0.25–2.0 keeps the voice host from
-  starting rather than being narrowed.
+- **The idle playlist names speeds and pick weights.** `cogs/idle.json` takes
+  a top-level `speed` (default 1.0), and each entry is either a clip name or
+  `{"name", "speed", "weight"}`: its own speed overrides the default, and
+  `weight` (default 1) is how many draws it gets against a weight-1 entry. A
+  speed outside 0.25–2.0 or a weight of 0 keeps the voice host from starting
+  rather than being narrowed. The committed playlist is now forty clips chosen
+  in a review of the motion library, each at the speed that reads best, with
+  both hello waves weighted 4.
 - **A power-cycled unit hears without being provisioned.** The motion payload
   (the bundle a unit fetches and runs) now carries the audio device's link
   configuration, `conf/audio.conf`, built from the speech configuration, and

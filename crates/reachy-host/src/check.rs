@@ -374,16 +374,25 @@ fn playlist(host: Option<&params::HostSettings>, path: &Path, base: &Path) -> Co
     };
     let at = base.join(path);
     match Idle::load(&at, &table) {
-        Ok(list) => conclusion(
-            true,
-            format!(
-                "{} is a playlist of {} motions played at speed {}, every one in the name table \
-                 and none a probe or bench motion",
-                at.display(),
-                list.len(),
-                list.speed()
-            ),
-        ),
+        Ok(list) => {
+            let own = list
+                .entries()
+                .filter(|listed| listed.speed != list.default_speed())
+                .count();
+            let weighted = list.entries().filter(|listed| listed.weight > 1).count();
+            conclusion(
+                true,
+                format!(
+                    "{} is a playlist of {} motions, default speed {}, {} at their own speed, \
+                     {} weighted, every one in the name table and none a probe or bench motion",
+                    at.display(),
+                    list.len(),
+                    list.default_speed(),
+                    own,
+                    weighted
+                ),
+            )
+        }
         Err(error) => conclusion(false, one_line(&error.to_string())),
     }
 }
@@ -1683,7 +1692,8 @@ mod tests {
             r#"{
   "motions": [
     {"motion_id": 1, "name": "a/one", "duration_ms": 2000, "blend_out_ms": 200},
-    {"motion_id": 2, "name": "a/two", "duration_ms": 3000, "blend_out_ms": 200}
+    {"motion_id": 2, "name": "a/two", "duration_ms": 3000, "blend_out_ms": 200},
+    {"motion_id": 3, "name": "a/three", "duration_ms": 1500, "blend_out_ms": 200}
   ],
   "poses": [
     {"pose_id": 0, "name": "neutral", "duration_ms": 800},
@@ -1722,7 +1732,34 @@ mod tests {
         assert!(conclusion.held, "{conclusion:?}");
         assert_eq!(conclusion.subject, "idle");
         assert!(conclusion.says.contains("2 motions"), "{conclusion:?}");
+        assert!(
+            conclusion
+                .says
+                .contains("default speed 1, 0 at their own speed, 0 weighted"),
+            "{conclusion:?}"
+        );
         assert!(settled(&found), "{found:?}");
+    }
+
+    #[test]
+    fn a_playlist_counts_its_own_speed_and_weighted_entries() {
+        let dir = scratch_dir("reachy-host-check-idle-counts");
+        let config = idle_names(dir.as_ref(), "names.json");
+        playlist_file(
+            dir.as_ref(),
+            r#"{"speed": 0.5, "playlist": [{"name": "a/one", "speed": 0.5, "weight": 4}, {"name": "a/two", "speed": 1.0}, {"name": "a/three", "weight": 2}]}"#,
+        );
+
+        let found = inspect(&config, None, Some(Path::new("idle.json")), dir.as_ref());
+        let conclusion = idle(&found);
+        assert!(conclusion.held, "{conclusion:?}");
+        assert!(conclusion.says.contains("3 motions"), "{conclusion:?}");
+        assert!(
+            conclusion
+                .says
+                .contains("default speed 0.5, 1 at their own speed, 2 weighted"),
+            "{conclusion:?}"
+        );
     }
 
     #[test]
